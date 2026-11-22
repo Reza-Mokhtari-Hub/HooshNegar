@@ -1,35 +1,138 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { neon } from '@neondatabase/serverless';
+import { neon, Pool } from '@neondatabase/serverless';
 import { drizzle as drizzleNeon } from 'drizzle-orm/neon-http';
+import { drizzle as drizzleNeonServerless } from 'drizzle-orm/neon-serverless';
+import { drizzle as drizzlePgProxy } from 'drizzle-orm/pg-proxy';
 import { PGlite } from '@electric-sql/pglite';
 import { drizzle as drizzlePglite, type PgliteDatabase } from 'drizzle-orm/pglite';
 import { isCloudflareWorker } from '../server/config/env.ts';
 import * as schema from './schema.ts';
 
 export type AppDatabase = PgliteDatabase<typeof schema>;
+export type DatabaseMode = 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite';
+
+export interface CloudflareSqlExecutor {
+  execSql(
+    queryString: string,
+    params: unknown[],
+    method: string,
+    txToken?: string,
+  ): Promise<{ rows: unknown[][] }>;
+  beginTx(): Promise<string>;
+  endTx(txToken: string): Promise<void>;
+}
 
 declare global {
   var _hooshnegarDb: AppDatabase | undefined;
   var _hooshnegarPglite: PGlite | undefined;
-  var _hooshnegarDbMode: 'neon_postgres' | 'embedded_pglite' | undefined;
+  var _hooshnegarDbMode: DatabaseMode | undefined;
+  var _hooshnegarCfSqlExecutor: CloudflareSqlExecutor | undefined;
 }
 
-function createDatabaseInstance(): { db: AppDatabase; mode: 'neon_postgres' | 'embedded_pglite' } {
+export function setCloudflareSqlExecutor(executor: CloudflareSqlExecutor | undefined): void {
+  global._hooshnegarCfSqlExecutor = executor;
+}
+
+export function hasCloudflareSqlExecutor(): boolean {
+  return Boolean(global._hooshnegarCfSqlExecutor);
+}
+
+function createCloudflareDurableObjectDb(): AppDatabase {
+  const getLiveExecutor = (): CloudflareSqlExecutor => {
+    const exec = global._hooshnegarCfSqlExecutor;
+    if (!exec) {
+      throw new Error(
+        'Cloudflare Durable Object STATE_DB executor is not initialized for this request.',
+      );
+    }
+    return exec;
+  };
+
+  const createScopedDb = (txToken?: string) =>
+    drizzlePgProxy(
+      async (queryString, params, method) => {
+        return getLiveExecutor().execSql(queryString, params, method, txToken);
+      },
+      { schema },
+    );
+
+  const rootDb = createScopedDb();
+
+  (
+    rootDb as unknown as {
+      transaction: <T>(
+        callback: (tx: unknown) => Promise<T>,
+        config?: Record<string, unknown>,
+      ) => Promise<T>;
+    }
+  ).transaction = async <T>(
+    callback: (tx: unknown) => Promise<T>,
+    _config?: Record<string, unknown>,
+  ): Promise<T> => {
+    const executor = getLiveExecutor();
+    const txToken = await executor.beginTx();
+    const txDb = createScopedDb(txToken);
+    try {
+      return await callback(txDb);
+    } finally {
+      await executor.endTx(txToken).catch(() => {});
+    }
+  };
+
+  return rootDb as unknown as AppDatabase;
+}
+
+function createDatabaseInstance(): { db: AppDatabase; mode: DatabaseMode } {
   const databaseUrl = process.env.DATABASE_URL?.trim();
 
   if (databaseUrl && databaseUrl.startsWith('postgres')) {
     const sqlClient = neon(databaseUrl);
     const neonDb = drizzleNeon(sqlClient, { schema });
+
+    // neon-http is stateless (ideal for Cloudflare Workers across requests) but does not support
+    // interactive BEGIN/COMMIT transactions. Delegate db.transaction() to an ephemeral per-call
+    // WebSocket Pool (drizzle-orm/neon-serverless) and close it immediately in finally so we get
+    // real PostgreSQL ACID transactions with zero cross-request I/O leaks on Cloudflare Workers.
+    (
+      neonDb as unknown as {
+        transaction: <T>(
+          callback: (tx: unknown) => Promise<T>,
+          config?: Record<string, unknown>,
+        ) => Promise<T>;
+      }
+    ).transaction = async <T>(
+      callback: (tx: unknown) => Promise<T>,
+      config?: Record<string, unknown>,
+    ): Promise<T> => {
+      const pool = new Pool({ connectionString: databaseUrl });
+      try {
+        const txDb = drizzleNeonServerless(pool, { schema });
+        return (await txDb.transaction(
+          callback as Parameters<typeof txDb.transaction>[0],
+          config as Parameters<typeof txDb.transaction>[1],
+        )) as T;
+      } finally {
+        await pool.end().catch(() => {});
+      }
+    };
+
     return {
       db: neonDb as unknown as AppDatabase,
       mode: 'neon_postgres',
     };
   }
 
+  if (global._hooshnegarCfSqlExecutor) {
+    return {
+      db: createCloudflareDurableObjectDb(),
+      mode: 'cloudflare_durable_object',
+    };
+  }
+
   if (isCloudflareWorker()) {
     throw new Error(
-      'DATABASE_URL (Neon PostgreSQL) is required on Cloudflare Workers. Add it in Cloudflare Dashboard → Workers → Settings → Variables and Secrets.',
+      'Cloudflare Durable Object STATE_DB binding is missing and DATABASE_URL is not set.',
     );
   }
 
@@ -53,6 +156,16 @@ function createDatabaseInstance(): { db: AppDatabase; mode: 'neon_postgres' | 'e
 }
 
 export function getDb(): AppDatabase {
+  // Always refresh DB handle inside Cloudflare Workers if executor or env changed between invocations
+  if (
+    global._hooshnegarDb &&
+    global._hooshnegarCfSqlExecutor &&
+    global._hooshnegarDbMode !== 'cloudflare_durable_object' &&
+    !process.env.DATABASE_URL?.trim()
+  ) {
+    global._hooshnegarDb = undefined;
+  }
+
   if (!global._hooshnegarDb) {
     const created = createDatabaseInstance();
     global._hooshnegarDb = created.db;
@@ -61,7 +174,7 @@ export function getDb(): AppDatabase {
   return global._hooshnegarDb;
 }
 
-export function getDatabaseMode(): 'neon_postgres' | 'embedded_pglite' {
+export function getDatabaseMode(): DatabaseMode {
   if (!global._hooshnegarDbMode) {
     getDb();
   }

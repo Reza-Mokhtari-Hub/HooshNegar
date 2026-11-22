@@ -17,7 +17,6 @@ describe('Runtime Self-Diagnostics', () => {
       'DATABASE_URL',
       'ENCRYPTION_MASTER_KEY',
       'SESSION_SECRET',
-      'APP_URL',
     ]);
     expect(report.probableCause).toContain('Build');
     expect(report.fixSteps.length).toBeGreaterThanOrEqual(2);
@@ -79,5 +78,24 @@ describe('Runtime Self-Diagnostics', () => {
 
     const sslErr = classifyDatabaseError('connection requires SSL');
     expect(sslErr.hint).toContain('sslmode=require');
+  });
+
+  it('marks Cloudflare Worker ready with Cloudflare Durable Object SQLite even when DATABASE_URL is absent', () => {
+    const report = buildRuntimeDiagnostics({
+      envMap: {
+        ENCRYPTION_MASTER_KEY: 'b'.repeat(64),
+        SESSION_SECRET: 's'.repeat(40),
+      },
+      isCloudflare: true,
+      isProduction: true,
+      hasDurableObjectStore: true,
+      boundEnvKeys: ['ASSETS', 'STATE_DB'],
+      dbProbe: { ok: true, latencyMs: 3 },
+    });
+
+    expect(report.ready).toBe(true);
+    expect(report.databaseMode).toBe('cloudflare_durable_object');
+    expect(report.missingRequiredVars).toEqual([]);
+    expect(report.probableCause).toBeNull();
   });
 });

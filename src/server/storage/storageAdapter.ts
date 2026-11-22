@@ -9,12 +9,27 @@ import { storedFiles } from '../../db/schema.ts';
 import { getR2Config, isCloudflareWorker } from '../config/env.ts';
 import type { CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
 
+export interface CloudflareBlobStore {
+  putBlob(
+    objectKey: string,
+    mimeType: string,
+    dataBase64: string,
+    expiresAtIso: string,
+  ): Promise<void>;
+  deleteBlob(objectKey: string): Promise<void>;
+}
+
 declare global {
   var _hooshnegarCfR2Bucket: CloudflareR2Bucket | undefined;
+  var _hooshnegarCfBlobStore: CloudflareBlobStore | undefined;
 }
 
 export function setCloudflareR2Bucket(bucket: CloudflareR2Bucket | undefined): void {
   global._hooshnegarCfR2Bucket = bucket;
+}
+
+export function setCloudflareBlobStore(store: CloudflareBlobStore | undefined): void {
+  global._hooshnegarCfBlobStore = store;
 }
 
 export interface StoredObjectResult {
@@ -253,13 +268,99 @@ class CloudflareNativeR2BindingAdapter implements StorageAdapter {
   }
 }
 
+class CloudflareDurableObjectBlobAdapter implements StorageAdapter {
+  readonly providerName = 'local_temp' as const;
+
+  private getStore(): CloudflareBlobStore {
+    const store = global._hooshnegarCfBlobStore;
+    if (!store) {
+      throw new Error('Cloudflare Durable Object STATE_DB blob store is not available for this request.');
+    }
+    return store;
+  }
+
+  async putObject(input: StoragePutInput): Promise<StoredObjectResult> {
+    const objectKey = buildObjectKey(input.prefix, input.extension);
+    const ttlHours = input.ttlHours ?? (input.prefix === 'temp-uploads' ? 2 : 72);
+    const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+
+    await this.getStore().putBlob(
+      objectKey,
+      input.mimeType,
+      input.buffer.toString('base64'),
+      expiresAt.toISOString(),
+    );
+
+    const db = getDb();
+    const [row] = await db
+      .insert(storedFiles)
+      .values({
+        userId: input.userId ?? null,
+        requestId: input.requestId ?? null,
+        jobId: input.jobId ?? null,
+        storageProvider: 'local_temp',
+        objectKey,
+        mimeType: input.mimeType,
+        fileSizeBytes: input.buffer.byteLength,
+        expiresAt,
+      })
+      .returning({ id: storedFiles.id });
+
+    return {
+      id: row?.id ?? objectKey,
+      storageProvider: 'local_temp',
+      objectKey,
+      mimeType: input.mimeType,
+      fileSizeBytes: input.buffer.byteLength,
+      signedUrl: null,
+      localPath: null,
+      expiresAt,
+    };
+  }
+
+  async getSignedDownloadUrl(_objectKey: string): Promise<string | null> {
+    return null;
+  }
+
+  async deleteObject(objectKey: string): Promise<void> {
+    await this.getStore().deleteBlob(objectKey);
+  }
+
+  async cleanupExpiredFiles(): Promise<number> {
+    const db = getDb();
+    const now = new Date();
+    const expired = await db
+      .select()
+      .from(storedFiles)
+      .where(
+        and(eq(storedFiles.storageProvider, 'local_temp'), isNull(storedFiles.deletedAt), lte(storedFiles.expiresAt, now)),
+      )
+      .limit(100);
+
+    let cleaned = 0;
+    for (const file of expired) {
+      try {
+        await this.deleteObject(file.objectKey);
+        await db
+          .update(storedFiles)
+          .set({ deletedAt: now })
+          .where(eq(storedFiles.id, file.id));
+        cleaned += 1;
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+    return cleaned;
+  }
+}
+
 class LocalTempStorageAdapter implements StorageAdapter {
   readonly providerName = 'local_temp' as const;
 
   async putObject(input: StoragePutInput): Promise<StoredObjectResult> {
     if (isCloudflareWorker()) {
       throw new Error(
-        'Cloudflare R2 storage is required on Cloudflare Workers. Bind MEDIA_BUCKET in wrangler.jsonc or set R2_* secrets.',
+        'Cloudflare R2 or STATE_DB Durable Object storage is required on Cloudflare Workers.',
       );
     }
     const objectKey = buildObjectKey(input.prefix, input.extension);
@@ -346,6 +447,9 @@ export function getStorageAdapter(): StorageAdapter {
       cachedAdapter = new CloudflareR2StorageAdapter();
     }
     return cachedAdapter;
+  }
+  if (global._hooshnegarCfBlobStore) {
+    return new CloudflareDurableObjectBlobAdapter();
   }
   if (!cachedAdapter || cachedAdapter.providerName !== 'local_temp') {
     cachedAdapter = new LocalTempStorageAdapter();

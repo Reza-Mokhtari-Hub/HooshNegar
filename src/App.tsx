@@ -169,7 +169,7 @@ export default function App() {
           setStartupDiagnostics({
             ready: false,
             runtime: 'cloudflare_workers',
-            databaseMode: 'embedded_pglite',
+            databaseMode: 'cloudflare_durable_object',
             checks: [],
             missingRequiredVars: [],
             invalidVars: [],

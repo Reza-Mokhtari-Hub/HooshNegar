@@ -52,7 +52,7 @@ interface DashboardMetrics {
     userEmail: string | null;
   }>;
   systemHealth: {
-    database: { ok: boolean; mode: 'neon_postgres' | 'embedded_pglite' };
+    database: { ok: boolean; mode: 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite' };
     encryption: { ok: boolean; source: 'env' | 'dev_local_file' | 'missing' };
     telegramBot: {
       configured: boolean;
@@ -265,9 +265,13 @@ export function DashboardSection({
                     <StatusText tone="success">
                       {data.systemHealth.database.mode === 'neon_postgres'
                         ? 'Neon PostgreSQL'
-                        : locale === 'fa'
-                          ? 'متصل (PGlite محلی)'
-                          : 'Connected (Local PGlite)'}
+                        : data.systemHealth.database.mode === 'cloudflare_durable_object'
+                          ? locale === 'fa'
+                            ? 'Cloudflare Durable SQLite'
+                            : 'Cloudflare Durable SQLite'
+                          : locale === 'fa'
+                            ? 'متصل (PGlite محلی)'
+                            : 'Connected (Local PGlite)'}
                     </StatusText>
                   </dd>
                 </div>

@@ -32,8 +32,38 @@ export interface CloudflareScheduledController {
   noRetry(): void;
 }
 
+export interface CloudflareDurableObjectStub {
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+  execSql(
+    queryString: string,
+    params: unknown[],
+    method: string,
+    txToken?: string,
+  ): Promise<{ rows: unknown[][] }>;
+  beginTx(): Promise<string>;
+  endTx(txToken: string): Promise<void>;
+  getOrProvisionSecrets(): Promise<{
+    encryptionMasterKey: string;
+    sessionSecret: string;
+  }>;
+  putBlob(
+    objectKey: string,
+    mimeType: string,
+    dataBase64: string,
+    expiresAtIso: string,
+  ): Promise<void>;
+  getBlob(objectKey: string): Promise<{ mimeType: string; dataBase64: string } | null>;
+  deleteBlob(objectKey: string): Promise<void>;
+}
+
+export interface CloudflareDurableObjectNamespace {
+  idFromName(name: string): unknown;
+  get(id: unknown): CloudflareDurableObjectStub;
+}
+
 export interface CloudflareWorkerEnv {
   ASSETS?: CloudflareFetcher;
   MEDIA_BUCKET?: CloudflareR2Bucket;
+  STATE_DB?: CloudflareDurableObjectNamespace;
   [key: string]: unknown;
 }

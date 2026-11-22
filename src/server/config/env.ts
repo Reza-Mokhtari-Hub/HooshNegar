@@ -7,7 +7,7 @@ export interface EnvValidationResult {
   isProduction: boolean;
   isCloudflare: boolean;
   appUrl: string;
-  databaseMode: 'neon_postgres' | 'embedded_pglite';
+  databaseMode: 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite';
   encryptionConfigured: boolean;
   encryptionSource: 'env' | 'dev_local_file' | 'missing';
   sessionSecretSource: 'env' | 'dev_local_file' | 'missing';
@@ -36,11 +36,15 @@ export function isCloudflareWorker(): boolean {
   return nav?.userAgent === 'Cloudflare-Workers';
 }
 
+function hasCloudflareDurableObjectStore(): boolean {
+  return Boolean((globalThis as { _hooshnegarCfSqlExecutor?: unknown })._hooshnegarCfSqlExecutor);
+}
+
 function loadOrCreateDevKeys(): DevRuntimeKeys {
   if (cachedDevKeys) return cachedDevKeys;
   if (isCloudflareWorker()) {
     throw new Error(
-      'ENCRYPTION_MASTER_KEY and SESSION_SECRET must be set as Cloudflare Workers Secrets in production.',
+      'ENCRYPTION_MASTER_KEY and SESSION_SECRET must be set as Cloudflare Workers Secrets or provisioned via STATE_DB.',
     );
   }
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -164,7 +168,12 @@ export function getEnvValidationSummary(): EnvValidationResult {
   const isCloudflare = isCloudflareWorker();
   const appUrl = process.env.APP_URL?.trim() || 'http://localhost:3000';
   const hasDbUrl = Boolean(process.env.DATABASE_URL?.trim());
-  const databaseMode = hasDbUrl ? 'neon_postgres' : 'embedded_pglite';
+  const hasDoStore = hasCloudflareDurableObjectStore();
+  const databaseMode: 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite' = hasDbUrl
+    ? 'neon_postgres'
+    : hasDoStore
+      ? 'cloudflare_durable_object'
+      : 'embedded_pglite';
 
   const envMasterKey = process.env.ENCRYPTION_MASTER_KEY?.trim();
   const envMasterKeyValid = Boolean(
@@ -198,7 +207,7 @@ export function getEnvValidationSummary(): EnvValidationResult {
   const aiMockMode = isAiMockModeEnabled();
 
   const warnings: string[] = [];
-  if (!hasDbUrl) {
+  if (!hasDbUrl && !hasDoStore) {
     warnings.push('DATABASE_URL تنظیم نشده است؛ از موتور محلی PostgreSQL (PGlite) استفاده می‌شود.');
   }
   if (encryptionSource !== 'env') {

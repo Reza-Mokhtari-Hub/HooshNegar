@@ -6,6 +6,22 @@
     "nodejs_compat"
   ],
   "keep_vars": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "STATE_DB",
+        "class_name": "HooshNegarStore"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "HooshNegarStore"
+      ]
+    }
+  ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",

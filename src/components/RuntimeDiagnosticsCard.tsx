@@ -30,7 +30,7 @@ export interface ClientDbProbe {
 export interface ClientRuntimeDiagnostics {
   ready: boolean;
   runtime: 'cloudflare_workers' | 'nodejs';
-  databaseMode: 'neon_postgres' | 'embedded_pglite';
+  databaseMode: 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite';
   checks: ClientEnvVarCheck[];
   missingRequiredVars: string[];
   invalidVars: Array<{ name: string; reason: string }>;

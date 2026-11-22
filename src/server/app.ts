@@ -29,17 +29,32 @@ import {
 import { getDb } from '../db/index.ts';
 import { redactSecrets } from './security/crypto.ts';
 
+function unwrapErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message) {
+    return `${err.message} (${cause.message})`;
+  }
+  if (cause && typeof cause === 'string') {
+    return `${err.message} (${cause})`;
+  }
+  return err.message;
+}
+
 async function runLiveDbProbe(): Promise<DbProbeResult> {
   const started = Date.now();
   try {
     const db = getDb();
     await db.execute(sql`SELECT 1`);
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT 1`);
+    });
     return {
       ok: true,
       latencyMs: Date.now() - started,
     };
   } catch (err) {
-    const rawMsg = err instanceof Error ? err.message : String(err);
+    const rawMsg = unwrapErrorMessage(err);
     const { safeError, hint } = classifyDatabaseError(rawMsg);
     return {
       ok: false,
@@ -101,7 +116,7 @@ export function createApiApp(): Express {
       await ensurePlatformReady();
       next();
     } catch (err) {
-      const rawMsg = err instanceof Error ? err.message : 'unknown';
+      const rawMsg = unwrapErrorMessage(err);
       const { safeError, hint } = classifyDatabaseError(rawMsg);
       const cfBoundKeys = (globalThis as { _hooshnegarCfBoundKeys?: string[] })._hooshnegarCfBoundKeys;
       const diagnostics = buildRuntimeDiagnostics({

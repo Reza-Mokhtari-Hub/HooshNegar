@@ -18,7 +18,7 @@ export interface DbProbeResult {
 export interface RuntimeDiagnosticsReport {
   ready: boolean;
   runtime: 'cloudflare_workers' | 'nodejs';
-  databaseMode: 'neon_postgres' | 'embedded_pglite';
+  databaseMode: 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite';
   checks: EnvVarCheckItem[];
   missingRequiredVars: string[];
   invalidVars: Array<{ name: string; reason: string }>;
@@ -33,6 +33,7 @@ export interface DiagnosticsInput {
   envMap?: Record<string, string | undefined>;
   isCloudflare?: boolean;
   isProduction?: boolean;
+  hasDurableObjectStore?: boolean;
   boundEnvKeys?: string[];
   dbProbe?: DbProbeResult;
   rawError?: string;
@@ -102,7 +103,7 @@ export function classifyDatabaseError(rawError: string): { safeError: string; hi
 
   return {
     safeError,
-    hint: 'اتصال به دیتابیس برقرار نشد. صحت مقدار DATABASE_URL و وضعیت آنلاین بودن پروژه Neon را بررسی کنید.',
+    hint: 'اتصال به دیتابیس برقرار نشد. وضعیت اتصال و تنظیمات ذخیره‌سازی را بررسی کنید.',
   };
 }
 
@@ -114,22 +115,28 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
     input.boundEnvKeys ??
     (globalThis as { _hooshnegarCfBoundKeys?: string[] })._hooshnegarCfBoundKeys ??
     [];
+  const hasDoStore =
+    input.hasDurableObjectStore ??
+    (Boolean((globalThis as { _hooshnegarCfSqlExecutor?: unknown })._hooshnegarCfSqlExecutor) ||
+      boundKeys.includes('STATE_DB'));
 
   const checks: EnvVarCheckItem[] = [];
   const missingRequiredVars: string[] = [];
   const invalidVars: Array<{ name: string; reason: string }> = [];
 
-  // 1. DATABASE_URL
+  // 1. Storage Backend (Cloudflare Durable Object SQLite or external Neon PostgreSQL)
   const dbUrl = envMap.DATABASE_URL?.trim() ?? '';
-  const dbRequired = isCf;
+  const dbRequired = isCf && !hasDoStore;
   if (!dbUrl) {
     checks.push({
-      name: 'DATABASE_URL',
+      name: hasDoStore ? 'CLOUDFLARE_DURABLE_SQLITE' : 'DATABASE_URL',
       required: dbRequired,
       status: dbRequired ? 'missing' : 'ok',
-      detail: dbRequired
-        ? 'تنظیم نشده (در Cloudflare Workers اتصال Neon PostgreSQL اجباری است)'
-        : 'در حالت محلی از دیتابیس داخلی PGlite استفاده می‌شود',
+      detail: hasDoStore
+        ? 'دیتابیس داخلی Cloudflare Durable Objects SQLite فعال و متصل است (بدون نیاز به دیتابیس خارجی)'
+        : dbRequired
+          ? 'تنظیم نشده (در نبود STATE_DB، رشته اتصال Neon PostgreSQL اجباری است)'
+          : 'در حالت محلی از دیتابیس داخلی PGlite استفاده می‌شود',
     });
     if (dbRequired) missingRequiredVars.push('DATABASE_URL');
   } else if (!isValidPostgresUrl(dbUrl)) {
@@ -166,7 +173,7 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
       name: 'ENCRYPTION_MASTER_KEY',
       required: isProd,
       status: 'ok',
-      detail: 'کلید رمزنگاری ۲۵۶ بیتی معتبر است',
+      detail: 'کلید رمزنگاری ۲۵۶ بیتی آماده و فعال است',
     });
   }
 
@@ -191,7 +198,7 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
       name: 'SESSION_SECRET',
       required: isProd,
       status: 'ok',
-      detail: 'کلید امضای نشست معتبر است',
+      detail: 'کلید امضای نشست آماده و فعال است',
     });
   }
 
@@ -200,21 +207,20 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
   if (!appUrl) {
     checks.push({
       name: 'APP_URL',
-      required: isCf,
+      required: false,
       status: isCf ? 'missing' : 'ok',
       detail: isCf
-        ? 'تنظیم نشده (آدرس عمومی سایت مثل https://hooshnegar....workers.dev)'
+        ? 'به صورت خودکار از دامنه درخواست فعلی تشخیص داده می‌شود'
         : 'مقدار پیش‌فرض http://localhost:3000 استفاده می‌شود',
     });
-    if (isCf) missingRequiredVars.push('APP_URL');
   } else if (!/^https?:\/\/.+/.test(appUrl)) {
     const reason = 'باید با https:// یا http:// شروع شود';
-    checks.push({ name: 'APP_URL', required: isCf, status: 'invalid', detail: reason });
+    checks.push({ name: 'APP_URL', required: false, status: 'invalid', detail: reason });
     invalidVars.push({ name: 'APP_URL', reason });
   } else {
     checks.push({
       name: 'APP_URL',
-      required: isCf,
+      required: false,
       status: 'ok',
       detail: 'آدرس عمومی برنامه تنظیم شده است',
     });
@@ -249,7 +255,7 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
       name: 'CRON_SECRET',
       required: false,
       status: 'missing',
-      detail: 'اختیاری (برای فراخوانی دستی کران‌جاب از بیرون؛ Cron داخلی کلودفلر بدون آن هم کار می‌کند)',
+      detail: 'اختیاری (Cron داخلی کلودفلر بدون نیاز به این کلید کار می‌کند)',
     });
   } else if (cronSecret.length < 16) {
     const reason = 'کوتاه‌تر از ۱۶ کاراکتر است';
@@ -264,19 +270,25 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
     });
   }
 
-  const databaseMode: 'neon_postgres' | 'embedded_pglite' =
-    dbUrl && isValidPostgresUrl(dbUrl) ? 'neon_postgres' : 'embedded_pglite';
+  const databaseMode: 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite' =
+    dbUrl && isValidPostgresUrl(dbUrl)
+      ? 'neon_postgres'
+      : hasDoStore
+        ? 'cloudflare_durable_object'
+        : 'embedded_pglite';
 
-  const nonSystemKeys = boundKeys.filter((k) => k !== 'ASSETS' && k !== 'MEDIA_BUCKET');
+  const nonSystemKeys = boundKeys.filter(
+    (k) => k !== 'ASSETS' && k !== 'MEDIA_BUCKET' && k !== 'STATE_DB',
+  );
   let probableCause: string | null = null;
   const fixSteps: string[] = [];
 
-  if (isCf && missingRequiredVars.length > 0 && nonSystemKeys.length === 0) {
+  if (isCf && missingRequiredVars.length > 0 && !hasDoStore && nonSystemKeys.length === 0) {
     probableCause =
       'کلودفلر هیچ متغیر محیطی به زمان اجرای Worker ارسال نکرده است (فقط ASSETS متصل است). به احتمال بسیار زیاد متغیرها را در بخش «Build → Variables and secrets» وارد کرده‌اید که فقط زمان بیلد (مثل db:migrate) کار می‌کند و به سایت زنده نمی‌رسد.';
     fixSteps.push(
       'در داشبورد Cloudflare به مسیر Workers & Pages → hooshnegar → Settings → Variables and Secrets بروید (دقت کنید بخش Build نباشد!).',
-      `متغیرهای الزامی (${missingRequiredVars.join(' ، ')}) را با دکمه + Add و نوع Secret (یا Text برای APP_URL) اضافه کنید.`,
+      `متغیرهای الزامی (${missingRequiredVars.join(' ، ')}) را با دکمه + Add و نوع Secret اضافه کنید.`,
       'دکمه Deploy / Save پایین جدول را بزنید و سپس اینجا روی «بررسی مجدد اتصال» کلیک کنید.',
     );
   } else if (isCf && missingRequiredVars.length > 0) {
@@ -293,8 +305,7 @@ export function buildRuntimeDiagnostics(input: DiagnosticsInput = {}): RuntimeDi
   } else if (input.dbProbe && !input.dbProbe.ok) {
     probableCause = input.dbProbe.hint ?? 'اتصال به دیتابیس برقرار نشد.';
     fixSteps.push(
-      'رشته اتصال DATABASE_URL در داشبورد Neon را بررسی کرده و مطمئن شوید شامل ?sslmode=require و نام کاربری/رمز صحیح است.',
-      'در صورت تازه ساختن دیتابیس، اطمینان حاصل کنید دستور npm run db:migrate بدون خطا روی آن اجرا شده است.',
+      'جزئیات خطای فنی زیر را بررسی کرده و پس از اصلاح، دکمه «بررسی مجدد اتصال» را بزنید.',
     );
   } else if (input.rawError) {
     const classified = classifyDatabaseError(input.rawError);
