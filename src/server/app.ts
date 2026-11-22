@@ -43,6 +43,7 @@ export function createApiApp(): Express {
   // Public health & runtime readiness check (no secrets exposed)
   app.get('/api/health', (_req: Request, res: Response) => {
     const env = getEnvValidationSummary();
+    const cfBoundKeys = (globalThis as { _hooshnegarCfBoundKeys?: string[] })._hooshnegarCfBoundKeys;
     res.json({
       status: 'ok',
       phase: 3,
@@ -52,6 +53,7 @@ export function createApiApp(): Express {
       qstashConfigured: env.qstashConfigured,
       r2Configured: env.r2Configured,
       aiMockMode: env.aiMockMode,
+      ...(env.isCloudflare ? { boundEnvKeys: cfBoundKeys ?? [] } : {}),
       timestamp: new Date().toISOString(),
     });
   });
