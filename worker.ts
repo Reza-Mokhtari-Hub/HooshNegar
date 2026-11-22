@@ -13,15 +13,13 @@ const WORKER_HTTP_PORT = 3000;
 let cachedHandler: HttpServerHandler | null = null;
 
 function syncWorkerEnvToProcessEnv(env: CloudflareWorkerEnv | undefined): void {
-  process.env.CF_WORKER = '1';
-  if (!process.env.NODE_ENV) {
-    process.env.NODE_ENV = 'production';
-  }
+  const procEnv = process.env as Record<string, string | undefined>;
+  procEnv['CF_WORKER'] = '1';
   if (!env) return;
 
   for (const [key, value] of Object.entries(env)) {
-    if (typeof value === 'string') {
-      process.env[key] = value;
+    if (typeof value === 'string' && key !== 'NODE_ENV') {
+      procEnv[key] = value;
     }
   }
 
