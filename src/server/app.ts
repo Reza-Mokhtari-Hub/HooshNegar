@@ -18,9 +18,37 @@ import {
   apiRateLimitMiddleware,
   securityHeadersMiddleware,
 } from './middleware/auth.ts';
+import { sql } from 'drizzle-orm';
 import { ensurePlatformReady } from './services/bootstrap.ts';
 import { getEnvValidationSummary } from './config/env.ts';
+import {
+  buildRuntimeDiagnostics,
+  classifyDatabaseError,
+  type DbProbeResult,
+} from './config/diagnostics.ts';
+import { getDb } from '../db/index.ts';
 import { redactSecrets } from './security/crypto.ts';
+
+async function runLiveDbProbe(): Promise<DbProbeResult> {
+  const started = Date.now();
+  try {
+    const db = getDb();
+    await db.execute(sql`SELECT 1`);
+    return {
+      ok: true,
+      latencyMs: Date.now() - started,
+    };
+  } catch (err) {
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    const { safeError, hint } = classifyDatabaseError(rawMsg);
+    return {
+      ok: false,
+      latencyMs: Date.now() - started,
+      error: safeError,
+      hint,
+    };
+  }
+}
 
 export function createApiApp(): Express {
   const app = express();
@@ -40,12 +68,20 @@ export function createApiApp(): Express {
   );
   app.use('/api', apiRateLimitMiddleware);
 
-  // Public health & runtime readiness check (no secrets exposed)
-  app.get('/api/health', (_req: Request, res: Response) => {
+  // Public health & runtime readiness check (strictly no secrets exposed)
+  app.get('/api/health', async (req: Request, res: Response) => {
     const env = getEnvValidationSummary();
     const cfBoundKeys = (globalThis as { _hooshnegarCfBoundKeys?: string[] })._hooshnegarCfBoundKeys;
+    const probeRequested = req.query.db === '1' || req.query.probe === '1';
+    const dbProbe = probeRequested ? await runLiveDbProbe() : undefined;
+    const diagnostics = buildRuntimeDiagnostics({
+      boundEnvKeys: cfBoundKeys ?? [],
+      dbProbe,
+    });
+
     res.json({
-      status: 'ok',
+      status: diagnostics.ready ? 'ok' : 'degraded',
+      ready: diagnostics.ready,
       phase: 3,
       runtime: env.isCloudflare ? 'cloudflare_workers' : 'nodejs',
       databaseMode: env.databaseMode,
@@ -54,6 +90,7 @@ export function createApiApp(): Express {
       r2Configured: env.r2Configured,
       aiMockMode: env.aiMockMode,
       ...(env.isCloudflare ? { boundEnvKeys: cfBoundKeys ?? [] } : {}),
+      diagnostics,
       timestamp: new Date().toISOString(),
     });
   });
@@ -64,10 +101,24 @@ export function createApiApp(): Express {
       await ensurePlatformReady();
       next();
     } catch (err) {
-      console.error('[bootstrap]', err instanceof Error ? err.message : 'unknown');
+      const rawMsg = err instanceof Error ? err.message : 'unknown';
+      const { safeError, hint } = classifyDatabaseError(rawMsg);
+      const cfBoundKeys = (globalThis as { _hooshnegarCfBoundKeys?: string[] })._hooshnegarCfBoundKeys;
+      const diagnostics = buildRuntimeDiagnostics({
+        boundEnvKeys: cfBoundKeys ?? [],
+        rawError: rawMsg,
+        dbProbe: {
+          ok: false,
+          latencyMs: 0,
+          error: safeError,
+          hint,
+        },
+      });
+      console.error('[bootstrap]', safeError);
       res.status(503).json({
-        error: 'پایگاه‌داده در حال آماده‌سازی است یا اتصال برقرار نشد.',
+        error: hint,
         code: 'DB_UNAVAILABLE',
+        diagnostics,
       });
     }
   });

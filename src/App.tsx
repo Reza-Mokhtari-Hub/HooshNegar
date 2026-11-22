@@ -30,10 +30,11 @@ import {
   LifeBuoy,
   Bell,
 } from 'lucide-react';
-import { apiRequest, setCsrfToken, setUnauthorizedHandler } from './lib/api';
+import { ApiError, apiRequest, setCsrfToken, setUnauthorizedHandler } from './lib/api';
 import './lib/firebase';
 import { DICTIONARIES, type Locale, type NavSectionId } from './i18n';
 import { AuthView, type AdminUserSummary } from './components/AuthView';
+import type { ClientRuntimeDiagnostics } from './components/RuntimeDiagnosticsCard';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Button } from './components/ui/primitives';
 import { DashboardSection } from './components/sections/DashboardSection';
@@ -107,6 +108,8 @@ export default function App() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [envWarnings, setEnvWarnings] = useState<string[]>([]);
   const [admin, setAdmin] = useState<AdminUserSummary | null>(null);
+  const [startupDiagnostics, setStartupDiagnostics] = useState<ClientRuntimeDiagnostics | null>(null);
+  const [retryingConnection, setRetryingConnection] = useState(false);
 
   const t = DICTIONARIES[locale];
   const displayAppName = appNameOverride || t.appName;
@@ -121,11 +124,13 @@ export default function App() {
   }, [dark]);
 
   const checkAuth = useCallback(async () => {
+    setRetryingConnection(true);
     try {
       const status = await apiRequest<{
         needsSetup: boolean;
         warnings: string[];
       }>('/api/auth/status', { skipAuthRedirect: true });
+      setStartupDiagnostics(null);
       setNeedsSetup(status.needsSetup);
       setEnvWarnings(status.warnings ?? []);
 
@@ -142,9 +147,43 @@ export default function App() {
           setCsrfToken(null);
         }
       }
-    } catch {
+    } catch (err) {
       setAdmin(null);
+      const fromPayload =
+        err instanceof ApiError && err.payload && typeof err.payload.diagnostics === 'object'
+          ? (err.payload.diagnostics as ClientRuntimeDiagnostics)
+          : null;
+
+      if (fromPayload) {
+        setStartupDiagnostics(fromPayload);
+      } else {
+        try {
+          const health = await apiRequest<{ diagnostics?: ClientRuntimeDiagnostics }>(
+            '/api/health?db=1',
+            { skipAuthRedirect: true },
+          );
+          if (health.diagnostics) {
+            setStartupDiagnostics(health.diagnostics);
+          }
+        } catch {
+          setStartupDiagnostics({
+            ready: false,
+            runtime: 'cloudflare_workers',
+            databaseMode: 'embedded_pglite',
+            checks: [],
+            missingRequiredVars: [],
+            invalidVars: [],
+            boundEnvKeys: [],
+            probableCause:
+              err instanceof Error
+                ? `ارتباط با سرور API برقرار نشد: ${err.message}`
+                : 'ارتباط با سرور API برقرار نشد.',
+            fixSteps: ['اتصال اینترنت و وضعیت آنلاین بودن Worker را بررسی کرده و دوباره تلاش کنید.'],
+          });
+        }
+      }
     } finally {
+      setRetryingConnection(false);
       setAuthChecked(true);
     }
   }, []);
@@ -187,6 +226,9 @@ export default function App() {
           onToggleLocale={() => setLocale((prev) => (prev === 'fa' ? 'en' : 'fa'))}
           onToggleDark={() => setDark((prev) => !prev)}
           warnings={envWarnings}
+          startupDiagnostics={startupDiagnostics}
+          retryingConnection={retryingConnection}
+          onRetryConnection={checkAuth}
           onAuthenticated={(authenticatedAdmin) => {
             setNeedsSetup(false);
             setAdmin(authenticatedAdmin);

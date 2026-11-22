@@ -12,12 +12,14 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 export class ApiError extends Error {
   status: number;
   code?: string;
+  payload?: Record<string, unknown>;
 
-  constructor(message: string, status: number, code?: string) {
+  constructor(message: string, status: number, code?: string, payload?: Record<string, unknown>) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.payload = payload;
   }
 }
 
@@ -68,6 +70,7 @@ export async function apiRequest<T>(
       typeof data.error === 'string' ? data.error : `خطای ارتباط با سرور (HTTP ${response.status})`,
       response.status,
       typeof data.code === 'string' ? data.code : undefined,
+      data,
     );
   }
 
