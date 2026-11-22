@@ -7,17 +7,13 @@ import { and, isNull, lte, eq } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { storedFiles } from '../../db/schema.ts';
 import { getR2Config, isCloudflareWorker } from '../config/env.ts';
+import {
+  getCloudflareRequestContext,
+  type CloudflareBlobStore,
+} from '../cloudflare/requestContext.ts';
 import type { CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
 
-export interface CloudflareBlobStore {
-  putBlob(
-    objectKey: string,
-    mimeType: string,
-    dataBase64: string,
-    expiresAtIso: string,
-  ): Promise<void>;
-  deleteBlob(objectKey: string): Promise<void>;
-}
+export type { CloudflareBlobStore };
 
 declare global {
   var _hooshnegarCfR2Bucket: CloudflareR2Bucket | undefined;
@@ -272,7 +268,7 @@ class CloudflareDurableObjectBlobAdapter implements StorageAdapter {
   readonly providerName = 'local_temp' as const;
 
   private getStore(): CloudflareBlobStore {
-    const store = global._hooshnegarCfBlobStore;
+    const store = getCloudflareRequestContext()?.blobStore ?? global._hooshnegarCfBlobStore;
     if (!store) {
       throw new Error('Cloudflare Durable Object STATE_DB blob store is not available for this request.');
     }
@@ -439,8 +435,9 @@ let cachedAdapter: StorageAdapter | null = null;
 
 export function getStorageAdapter(): StorageAdapter {
   const r2 = getR2Config();
-  if (global._hooshnegarCfR2Bucket) {
-    return new CloudflareNativeR2BindingAdapter(global._hooshnegarCfR2Bucket, r2.publicBaseUrl);
+  const activeR2Bucket = getCloudflareRequestContext()?.r2Bucket ?? global._hooshnegarCfR2Bucket;
+  if (activeR2Bucket) {
+    return new CloudflareNativeR2BindingAdapter(activeR2Bucket, r2.publicBaseUrl);
   }
   if (r2.configured) {
     if (!cachedAdapter || cachedAdapter.providerName !== 'r2') {
@@ -448,7 +445,7 @@ export function getStorageAdapter(): StorageAdapter {
     }
     return cachedAdapter;
   }
-  if (global._hooshnegarCfBlobStore) {
+  if (getCloudflareRequestContext()?.blobStore ?? global._hooshnegarCfBlobStore) {
     return new CloudflareDurableObjectBlobAdapter();
   }
   if (!cachedAdapter || cachedAdapter.providerName !== 'local_temp') {

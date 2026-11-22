@@ -428,7 +428,15 @@ async function sendSupportInfo(ctx: Context, isPaySupport = false) {
 }
 
 export function createTelegramBotInstance(botToken: string): Bot {
-  const bot = new Bot(botToken);
+  const safeFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+    globalThis.fetch(input, init)) as unknown as NonNullable<
+    NonNullable<ConstructorParameters<typeof Bot>[1]>['client']
+  >['fetch'];
+  const bot = new Bot(botToken, {
+    client: {
+      fetch: safeFetch,
+    },
+  });
 
   // =========================================================================
   // SLASH COMMANDS (All 11 Required Commands)

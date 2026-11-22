@@ -42,6 +42,7 @@
     "@electric-sql/pglite": "./src/db/pgliteStub.ts",
     "drizzle-orm/pglite": "./src/db/pgliteStub.ts",
     "drizzle-orm/pglite/migrator": "./src/db/pgliteStub.ts",
+    "grammy": "./node_modules/grammy/out/web.mjs",
     "hash-wasm": "./src/server/security/hashWasmStub.ts",
     "iconv-lite": "./src/server/cloudflare/iconvLiteShim.ts"
   }

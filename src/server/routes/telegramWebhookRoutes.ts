@@ -40,12 +40,22 @@ async function dispatchJobPayload(payload: QueuedJobPayload): Promise<void> {
     const updateId = (payload.update as { update_id?: number }).update_id;
     const extId = updateId !== undefined ? `tg_update:${updateId}` : null;
     try {
-      await processTelegramUpdate(payload.update as unknown as Update);
+      const result = await processTelegramUpdate(payload.update as unknown as Update);
       if (extId) {
-        await db
-          .update(webhookEvents)
-          .set({ status: 'processed', processedAt: new Date() })
-          .where(eq(webhookEvents.idempotencyKey, extId));
+        if (result.ok) {
+          await db
+            .update(webhookEvents)
+            .set({ status: 'processed', processedAt: new Date(), errorMessage: null })
+            .where(eq(webhookEvents.idempotencyKey, extId));
+        } else {
+          await db
+            .update(webhookEvents)
+            .set({
+              status: 'failed',
+              errorMessage: result.reason ?? 'BOT_INACTIVE_OR_UNCONFIGURED',
+            })
+            .where(eq(webhookEvents.idempotencyKey, extId));
+        }
       }
     } catch (err) {
       const msg = redactSecrets(err instanceof Error ? err.message : 'Update processing failed');

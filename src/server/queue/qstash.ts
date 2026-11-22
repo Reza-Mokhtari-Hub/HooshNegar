@@ -1,5 +1,14 @@
 import { Client, Receiver } from '@upstash/qstash';
 import { getQStashConfig, getEnvValidationSummary } from '../config/env.ts';
+import {
+  getCloudflareRequestContext,
+  getCloudflareWaitUntil,
+  runWithCloudflareRequestContext,
+  type CloudflareRequestContext,
+} from '../cloudflare/requestContext.ts';
+import type { CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
+import type { CloudflareBlobStore } from '../storage/storageAdapter.ts';
+import type { CloudflareSqlExecutor } from '../../db/index.ts';
 
 export interface QueuedJobPayload {
   kind: 'telegram_update' | 'ai_generation_job' | 'video_poll_job';
@@ -22,6 +31,25 @@ function getCallbackBaseUrl(): string {
   const override = process.env.QSTASH_CALLBACK_BASE_URL?.trim();
   if (override) return override.replace(/\/+$/, '');
   return getEnvValidationSummary().appUrl.replace(/\/+$/, '');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function captureRequestContext(): CloudflareRequestContext {
+  const active = getCloudflareRequestContext();
+  const g = globalThis as {
+    _hooshnegarCfSqlExecutor?: CloudflareSqlExecutor;
+    _hooshnegarCfBlobStore?: CloudflareBlobStore;
+    _hooshnegarCfR2Bucket?: CloudflareR2Bucket;
+  };
+  return {
+    sqlExecutor: active?.sqlExecutor ?? g._hooshnegarCfSqlExecutor,
+    blobStore: active?.blobStore ?? g._hooshnegarCfBlobStore,
+    r2Bucket: active?.r2Bucket ?? g._hooshnegarCfR2Bucket,
+    waitUntil: active?.waitUntil ?? getCloudflareWaitUntil(),
+  };
 }
 
 /**
@@ -58,15 +86,16 @@ export async function verifyQStashSignature(params: {
 
 /**
  * Enqueues a durable background job via Upstash QStash when configured,
- * or executes asynchronously with bounded retries in local development.
+ * executes inside Cloudflare ctx.waitUntil() on Cloudflare Workers,
+ * or executes asynchronously with bounded retries in local Node.js runtime.
  */
 export async function enqueueBackgroundJob(
   payload: QueuedJobPayload,
   options?: { delaySeconds?: number; retries?: number },
-): Promise<{ mode: 'qstash' | 'local_async'; messageId: string }> {
+): Promise<{ mode: 'qstash' | 'cloudflare_waituntil' | 'local_async'; messageId: string }> {
   const cfg = getQStashConfig();
   const baseUrl = getCallbackBaseUrl();
-  const retries = options?.retries ?? 3;
+  const retries = Math.max(1, options?.retries ?? 3);
   const delaySeconds = options?.delaySeconds ?? 0;
 
   if (cfg.configured && baseUrl.startsWith('https://')) {
@@ -87,12 +116,49 @@ export async function enqueueBackgroundJob(
     };
   }
 
-  // Non-blocking async local queue with bounded exponential retries
+  const capturedCtx = captureRequestContext();
+  const waitUntil = capturedCtx.waitUntil;
+  const runJobWithRetries = async () => {
+    if (!localProcessor) return;
+    if (delaySeconds > 0) {
+      await sleep(delaySeconds * 1000);
+    }
+    for (let attemptNum = 1; attemptNum <= retries; attemptNum++) {
+      try {
+        await runWithCloudflareRequestContext(capturedCtx, () =>
+          localProcessor!({ ...payload, attempt: attemptNum }),
+        );
+        return;
+      } catch (err) {
+        console.error(
+          `[bg-queue] job ${payload.kind} attempt ${attemptNum} failed:`,
+          err instanceof Error ? err.message : 'unknown',
+        );
+        if (attemptNum >= retries) {
+          return;
+        }
+        await sleep(Math.min(15000, 1000 * Math.pow(2, attemptNum)));
+      }
+    }
+  };
+
+  if (waitUntil) {
+    const messageId = `cf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    waitUntil(runJobWithRetries());
+    return {
+      mode: 'cloudflare_waituntil',
+      messageId,
+    };
+  }
+
+  // Non-blocking async local Node queue with bounded exponential retries
   const messageId = `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const scheduleAttempt = (attemptNum: number, delayMs: number) => {
     const timer = setTimeout(() => {
       if (!localProcessor) return;
-      void localProcessor({ ...payload, attempt: attemptNum }).catch((err) => {
+      void runWithCloudflareRequestContext(capturedCtx, () =>
+        localProcessor!({ ...payload, attempt: attemptNum }),
+      ).catch((err) => {
         console.error(
           `[local-queue] job ${payload.kind} attempt ${attemptNum} failed:`,
           err instanceof Error ? err.message : 'unknown',

@@ -66,11 +66,20 @@ export function TelegramSection({ locale }: { locale: Locale }) {
     setLoading(true);
     try {
       const [tgRes, modelsRes, whRes] = await Promise.all([
-        apiRequest<{ settings: TelegramSettingsDTO }>('/api/telegram'),
+        apiRequest<{ settings: TelegramSettingsDTO; suggestedWebhookUrl?: string }>('/api/telegram'),
         apiRequest<{ models: ModelRecord[] }>('/api/models'),
         apiRequest<LiveWebhookStatusDTO>('/api/telegram/webhook-status').catch(() => null),
       ]);
-      setSettings(tgRes.settings);
+      const browserHttpsWebhook =
+        typeof window !== 'undefined' && window.location.origin.startsWith('https://')
+          ? `${window.location.origin}/api/telegram/webhook`
+          : '';
+      const resolvedWebhookUrl =
+        tgRes.settings.webhookUrl || tgRes.suggestedWebhookUrl || browserHttpsWebhook;
+      setSettings({
+        ...tgRes.settings,
+        webhookUrl: resolvedWebhookUrl,
+      });
       setModels(modelsRes.models);
       if (whRes) setWebhookStatus(whRes);
     } catch (err) {
@@ -90,7 +99,11 @@ export function TelegramSection({ locale }: { locale: Locale }) {
     setSaving(true);
     setFeedback(null);
     try {
-      const res = await apiRequest<{ settings: TelegramSettingsDTO }>('/api/telegram', {
+      const res = await apiRequest<{
+        settings: TelegramSettingsDTO;
+        connectionResult?: { ok: boolean; message: string; latencyMs: number } | null;
+        webhookSyncResult?: { ok: boolean; message: string } | null;
+      }>('/api/telegram', {
         method: 'PUT',
         body: {
           botToken: botToken.trim(),
@@ -109,13 +122,37 @@ export function TelegramSection({ locale }: { locale: Locale }) {
       if (res.settings) setSettings(res.settings);
       setBotToken('');
       setWebhookSecret('');
-      setFeedback({
-        tone: 'success',
-        text:
-          locale === 'fa'
-            ? 'تنظیمات ربات تلگرام ذخیره شد (توکن‌ها با AES-256-GCM رمزنگاری شدند).'
-            : 'Telegram bot configuration saved (tokens encrypted with AES-256-GCM).',
-      });
+
+      if (res.connectionResult && !res.connectionResult.ok) {
+        setFeedback({
+          tone: 'danger',
+          text: res.connectionResult.message,
+        });
+      } else if (res.webhookSyncResult && !res.webhookSyncResult.ok) {
+        setFeedback({
+          tone: 'danger',
+          text: `${res.connectionResult?.message ?? ''} — خطا در ثبت وب‌هوک: ${res.webhookSyncResult.message}`,
+        });
+      } else if (res.connectionResult?.ok && res.webhookSyncResult?.ok) {
+        setFeedback({
+          tone: 'success',
+          text: `${res.connectionResult.message} (${res.connectionResult.latencyMs}ms) — ${res.webhookSyncResult.message}`,
+        });
+      } else if (res.connectionResult?.ok) {
+        setFeedback({
+          tone: 'success',
+          text: `${res.connectionResult.message} (${res.connectionResult.latencyMs}ms)`,
+        });
+      } else {
+        setFeedback({
+          tone: 'success',
+          text:
+            locale === 'fa'
+              ? 'تنظیمات ربات تلگرام ذخیره شد (توکن‌ها با AES-256-GCM رمزنگاری شدند).'
+              : 'Telegram bot configuration saved (tokens encrypted with AES-256-GCM).',
+        });
+      }
+      await load();
     } catch (err) {
       setFeedback({ tone: 'danger', text: err instanceof Error ? err.message : 'خطا در ذخیره تنظیمات' });
     } finally {
@@ -127,15 +164,21 @@ export function TelegramSection({ locale }: { locale: Locale }) {
     setTesting(true);
     setFeedback(null);
     try {
+      const candidate = botToken.trim();
       const res = await apiRequest<{ result: { ok: boolean; message: string; latencyMs: number } }>(
         '/api/telegram/test-connection',
-        { method: 'POST' },
+        {
+          method: 'POST',
+          body: candidate ? { botToken: candidate } : {},
+        },
       );
       setFeedback({
         tone: res.result.ok ? 'success' : 'danger',
         text: `${res.result.message} (${res.result.latencyMs}ms)`,
       });
-      await load();
+      if (!candidate) {
+        await load();
+      }
     } catch (err) {
       setFeedback({ tone: 'danger', text: err instanceof Error ? err.message : 'خطا در تست ربات' });
     } finally {
@@ -179,7 +222,12 @@ export function TelegramSection({ locale }: { locale: Locale }) {
         </div>
 
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={handleTestBot} disabled={testing || !settings.hasBotToken}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleTestBot}
+            disabled={testing || (!settings.hasBotToken && botToken.trim().length < 10)}
+          >
             <PlugZap className="w-3.5 h-3.5" />
             <span>{testing ? t.common.testing : locale === 'fa' ? 'تست اتصال ربات' : 'Test Bot Connection'}</span>
           </Button>
@@ -187,7 +235,7 @@ export function TelegramSection({ locale }: { locale: Locale }) {
             variant="outline"
             size="sm"
             onClick={handleSyncWebhook}
-            disabled={syncingWebhook || !settings.hasBotToken || !settings.webhookUrl}
+            disabled={syncingWebhook || !settings.hasBotToken}
           >
             <Webhook className="w-3.5 h-3.5" />
             <span>{locale === 'fa' ? 'همگام‌سازی وب‌هوک' : 'Sync Webhook'}</span>
@@ -258,6 +306,12 @@ export function TelegramSection({ locale }: { locale: Locale }) {
             </Button>
           </div>
         </div>
+        {settings.lastTestMessage && (
+          <div className="pt-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-700 dark:text-slate-300">
+            <span>{locale === 'fa' ? 'نتیجه آخرین اتصال: ' : 'Last check message: '}</span>
+            <span>{settings.lastTestMessage}</span>
+          </div>
+        )}
         {webhookStatus?.liveStatus && (
           <div className="pt-2.5 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-400">
             <div>
@@ -295,7 +349,13 @@ export function TelegramSection({ locale }: { locale: Locale }) {
                 type="password"
                 dir="ltr"
                 value={botToken}
-                onChange={(e) => setBotToken(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setBotToken(val);
+                  if (val.trim().length > 0 && !settings.hasBotToken && !settings.isActive) {
+                    setSettings({ ...settings, isActive: true });
+                  }
+                }}
                 placeholder={settings.maskedBotToken || '1234567890:AAF...'}
                 autoComplete="off"
               />
@@ -303,7 +363,7 @@ export function TelegramSection({ locale }: { locale: Locale }) {
 
             <div>
               <FieldLabel htmlFor="tg-webhook-secret">
-                {locale === 'fa' ? 'راز امنیتی وب‌هوک (X-Telegram-Bot-Api-Secret-Token)' : 'Webhook Secret Token'}
+                {locale === 'fa' ? 'راز امنیتی وب‌هوک (اختیاری — در صورت خالی بودن خودکار ساخته می‌شود)' : 'Webhook Secret Token (optional)'}
               </FieldLabel>
               <Input
                 id="tg-webhook-secret"
@@ -311,7 +371,7 @@ export function TelegramSection({ locale }: { locale: Locale }) {
                 dir="ltr"
                 value={webhookSecret}
                 onChange={(e) => setWebhookSecret(e.target.value)}
-                placeholder={settings.maskedWebhookSecret || 'secret-token-value'}
+                placeholder={settings.maskedWebhookSecret || 'خودکار ساخته می‌شود'}
                 autoComplete="off"
               />
             </div>
@@ -345,20 +405,39 @@ export function TelegramSection({ locale }: { locale: Locale }) {
                 dir="ltr"
                 value={settings.webhookUrl}
                 onChange={(e) => setSettings({ ...settings, webhookUrl: e.target.value })}
-                placeholder="https://hooshnegar-ai.your-subdomain.workers.dev/api/telegram/webhook"
+                placeholder={
+                  typeof window !== 'undefined' && window.location.origin.startsWith('https://')
+                    ? `${window.location.origin}/api/telegram/webhook`
+                    : 'https://your-worker.workers.dev/api/telegram/webhook'
+                }
               />
             </div>
           </div>
 
-          <label className="flex items-center gap-2.5 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={settings.isActive}
-              onChange={(e) => setSettings({ ...settings, isActive: e.target.checked })}
-              className="w-4 h-4 rounded border-slate-300 text-blue-700"
-            />
-            <span>{locale === 'fa' ? 'ربات تلگرام فعال باشد' : 'Enable Telegram Bot'}</span>
-          </label>
+          <div className="flex flex-wrap items-center justify-between gap-4 pt-2 border-t border-slate-200 dark:border-slate-800">
+            <label className="flex items-center gap-2.5 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.isActive}
+                onChange={(e) => setSettings({ ...settings, isActive: e.target.checked })}
+                className="w-4 h-4 rounded border-slate-300 text-blue-700"
+              />
+              <span>{locale === 'fa' ? 'ربات تلگرام فعال باشد' : 'Enable Telegram Bot'}</span>
+            </label>
+
+            <Button type="submit" disabled={saving}>
+              <Save className="w-4 h-4" />
+              <span>
+                {saving
+                  ? locale === 'fa'
+                    ? 'در حال ذخیره و اتصال...'
+                    : 'Saving & Connecting...'
+                  : locale === 'fa'
+                    ? 'ذخیره و اتصال ربات'
+                    : 'Save & Connect Bot'}
+              </span>
+            </Button>
+          </div>
         </Surface>
 
         <Surface className="p-6 space-y-5">
@@ -482,7 +561,15 @@ export function TelegramSection({ locale }: { locale: Locale }) {
           <div className="flex justify-end pt-3 border-t border-slate-200 dark:border-slate-800">
             <Button type="submit" disabled={saving}>
               <Save className="w-4 h-4" />
-              <span>{saving ? t.common.saving : t.common.save}</span>
+              <span>
+                {saving
+                  ? locale === 'fa'
+                    ? 'در حال ذخیره و اتصال...'
+                    : 'Saving & Connecting...'
+                  : locale === 'fa'
+                    ? 'ذخیره و اتصال ربات'
+                    : 'Save & Connect Bot'}
+              </span>
             </Button>
           </div>
         </Surface>

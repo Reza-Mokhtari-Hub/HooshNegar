@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { redactSecrets } from '../security/crypto.ts';
 
 export interface TelegramBotTestResult {
@@ -18,16 +19,82 @@ export interface TelegramBotTestResult {
   };
 }
 
+/**
+ * Cleans whitespace, invisible characters, and accidental `bot` URL prefix from BotFather tokens.
+ */
+export function normalizeBotToken(raw: string): string {
+  const cleaned = raw.replace(/[\s\u200B-\u200D\uFEFF]/g, '').trim();
+  const botPrefixMatch = /^bot(\d+:[A-Za-z0-9_-]+)$/i.exec(cleaned);
+  return botPrefixMatch ? botPrefixMatch[1]! : cleaned;
+}
+
+export function isValidTelegramTokenFormat(token: string): boolean {
+  return /^\d{5,15}:[A-Za-z0-9_-]{20,}$/.test(token);
+}
+
+/**
+ * Generates a Telegram-safe CSPRNG secret_token (`[A-Za-z0-9_-]`, max 256 chars).
+ */
+export function generateWebhookSecret(): string {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+/**
+ * Ensures webhook URL points to `/api/telegram/webhook` when user supplies a bare HTTPS origin
+ * or when auto-detecting from the active request/APP_URL origin.
+ */
+export function normalizeWebhookUrl(rawUrl: string, fallbackHttpsOrigin?: string | null): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    if (fallbackHttpsOrigin && fallbackHttpsOrigin.startsWith('https://')) {
+      return `${fallbackHttpsOrigin.replace(/\/+$/, '')}/api/telegram/webhook`;
+    }
+    return '';
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' && (parsed.pathname === '' || parsed.pathname === '/')) {
+      parsed.pathname = '/api/telegram/webhook';
+      return parsed.toString();
+    }
+    return trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
+function formatTelegramApiErrorFa(statusCode: number, description: string | undefined, botToken: string): string {
+  const cleanDesc = redactSecrets(description ?? `HTTP ${statusCode}`, [botToken]);
+  if (statusCode === 401 || /unauthorized/i.test(cleanDesc)) {
+    return 'توکن ربات تلگرام نامعتبر است (۴۰۱). لطفاً توکن کامل دریافتی از @BotFather را بررسی کنید.';
+  }
+  if (statusCode === 404 || /not found/i.test(cleanDesc)) {
+    return 'ساختار توکن ربات اشتباه است (۴۰۴). فرمت صحیح مانند 1234567890:AAF... می‌باشد.';
+  }
+  return `خطای Telegram API: ${cleanDesc}`;
+}
+
 export async function testTelegramBotConnection(
   botToken: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TelegramBotTestResult> {
+  const cleanToken = normalizeBotToken(botToken);
+  if (!isValidTelegramTokenFormat(cleanToken)) {
+    return {
+      ok: false,
+      status: 'failed',
+      latencyMs: 0,
+      message: 'فرمت توکن ربات تلگرام معتبر نیست. توکن باید شامل شناسه عددی و بخش حروفی جداشده با دو نقطه (:) باشد.',
+    };
+  }
+
   const startedAt = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const meRes = await fetchImpl(`https://api.telegram.org/bot${botToken}/getMe`, {
+    const meRes = await fetchImpl(`https://api.telegram.org/bot${cleanToken}/getMe`, {
       method: 'GET',
       signal: controller.signal,
     });
@@ -48,13 +115,13 @@ export async function testTelegramBotConnection(
         ok: false,
         status: 'failed',
         latencyMs,
-        message: `خطای Telegram API: ${redactSecrets(meJson.description ?? `HTTP ${meRes.status}`, [botToken])}`,
+        message: formatTelegramApiErrorFa(meRes.status, meJson.description, cleanToken),
       };
     }
 
     let webhookInfo: TelegramBotTestResult['webhookInfo'];
     try {
-      const whRes = await fetchImpl(`https://api.telegram.org/bot${botToken}/getWebhookInfo`, {
+      const whRes = await fetchImpl(`https://api.telegram.org/bot${cleanToken}/getWebhookInfo`, {
         method: 'GET',
         signal: controller.signal,
       });
@@ -67,7 +134,7 @@ export async function testTelegramBotConnection(
           url: whJson.result.url ?? '',
           pendingUpdateCount: whJson.result.pending_update_count ?? 0,
           lastErrorMessage: whJson.result.last_error_message
-            ? redactSecrets(whJson.result.last_error_message, [botToken])
+            ? redactSecrets(whJson.result.last_error_message, [cleanToken])
             : undefined,
         };
       }
@@ -95,7 +162,7 @@ export async function testTelegramBotConnection(
       ok: false,
       status: 'failed',
       latencyMs,
-      message: `عدم دسترسی به Telegram API: ${redactSecrets(msg, [botToken])}`,
+      message: `عدم دسترسی به Telegram API: ${redactSecrets(msg, [cleanToken])}`,
     };
   } finally {
     clearTimeout(timeout);
@@ -108,20 +175,22 @@ export async function syncTelegramWebhook(
   webhookSecret?: string | null,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ ok: boolean; message: string }> {
-  if (!webhookUrl || !webhookUrl.startsWith('https://')) {
+  const cleanToken = normalizeBotToken(botToken);
+  const normalizedUrl = normalizeWebhookUrl(webhookUrl);
+  if (!normalizedUrl || !normalizedUrl.startsWith('https://')) {
     return { ok: false, message: 'برای ثبت وب‌هوک، آدرس HTTPS معتبر الزامی است.' };
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
     const payload: Record<string, unknown> = {
-      url: webhookUrl,
+      url: normalizedUrl,
       allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
     };
     if (webhookSecret && webhookSecret.trim().length > 0) {
       payload.secret_token = webhookSecret.trim();
     }
-    const res = await fetchImpl(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+    const res = await fetchImpl(`https://api.telegram.org/bot${cleanToken}/setWebhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -132,17 +201,20 @@ export async function syncTelegramWebhook(
       return {
         ok: false,
         message: redactSecrets(json.description ?? `HTTP ${res.status}`, [
-          botToken,
+          cleanToken,
           webhookSecret ?? '',
         ]),
       };
     }
-    return { ok: true, message: 'وب‌هوک تلگرام با موفقیت ثبت و همگام‌سازی شد.' };
+    return {
+      ok: true,
+      message: `وب‌هوک تلگرام با موفقیت روی ${normalizedUrl} ثبت و همگام‌سازی شد.`,
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'خطا در ثبت وب‌هوک';
     return {
       ok: false,
-      message: redactSecrets(msg, [botToken, webhookSecret ?? '']),
+      message: redactSecrets(msg, [cleanToken, webhookSecret ?? '']),
     };
   } finally {
     clearTimeout(timeout);
@@ -166,10 +238,11 @@ export async function getTelegramWebhookStatus(
   botToken: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TelegramWebhookStatusResult> {
+  const cleanToken = normalizeBotToken(botToken);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetchImpl(`https://api.telegram.org/bot${botToken}/getWebhookInfo`, {
+    const res = await fetchImpl(`https://api.telegram.org/bot${cleanToken}/getWebhookInfo`, {
       method: 'GET',
       signal: controller.signal,
     });
@@ -194,7 +267,7 @@ export async function getTelegramWebhookStatus(
         url: '',
         hasCustomCertificate: false,
         pendingUpdateCount: 0,
-        message: redactSecrets(json.description ?? `HTTP ${res.status}`, [botToken]),
+        message: formatTelegramApiErrorFa(res.status, json.description, cleanToken),
       };
     }
 
@@ -209,7 +282,7 @@ export async function getTelegramWebhookStatus(
         ? new Date(info.last_error_date * 1000).toISOString()
         : null,
       lastErrorMessage: info.last_error_message
-        ? redactSecrets(info.last_error_message, [botToken])
+        ? redactSecrets(info.last_error_message, [cleanToken])
         : null,
       maxConnections: info.max_connections,
       allowedUpdates: info.allowed_updates ?? [],
@@ -224,10 +297,9 @@ export async function getTelegramWebhookStatus(
       url: '',
       hasCustomCertificate: false,
       pendingUpdateCount: 0,
-      message: redactSecrets(msg, [botToken]),
+      message: redactSecrets(msg, [cleanToken]),
     };
   } finally {
     clearTimeout(timeout);
   }
 }
-

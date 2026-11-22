@@ -151,7 +151,7 @@ export const modelCreateSchema = z.object({
 export const modelUpdateSchema = modelCreateSchema.partial();
 
 export const telegramSettingsUpdateSchema = z.object({
-  botToken: z.string().trim().min(10).max(512).optional().or(z.literal('')),
+  botToken: z.string().trim().max(512).optional().or(z.literal('')),
   botUsername: z.string().trim().max(128).default(''),
   botDisplayName: z.string().trim().max(160).default(''),
   webhookUrl: z

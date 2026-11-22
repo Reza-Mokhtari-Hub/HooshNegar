@@ -53,8 +53,12 @@ export async function getConfiguredTelegramApi(): Promise<{
     iv: row.tokenIv,
     authTag: row.tokenAuthTag,
   });
+  const safeFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+    globalThis.fetch(input, init)) as unknown as NonNullable<
+    ConstructorParameters<typeof Api>[1]
+  >['fetch'];
   return {
-    api: new Api(botToken),
+    api: new Api(botToken, { fetch: safeFetch }),
     botToken,
   };
 }

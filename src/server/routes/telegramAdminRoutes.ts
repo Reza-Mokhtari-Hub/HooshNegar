@@ -2,9 +2,17 @@ import { Router, type Response } from 'express';
 import { count, desc, eq } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { telegramBotSettings, webhookEvents } from '../../db/schema.ts';
-import { decryptSecret, EncryptionKeyUnavailableError } from '../security/crypto.ts';
 import {
+  decryptSecret,
+  EncryptionKeyUnavailableError,
+  encryptSecret,
+  maskSecret,
+} from '../security/crypto.ts';
+import {
+  generateWebhookSecret,
   getTelegramWebhookStatus,
+  normalizeBotToken,
+  normalizeWebhookUrl,
   syncTelegramWebhook,
   testTelegramBotConnection,
 } from '../services/telegramService.ts';
@@ -15,6 +23,27 @@ import {
   requireRole,
   type AdminRequest,
 } from '../middleware/auth.ts';
+
+function resolveHttpsOrigin(req: AdminRequest): string | null {
+  const envUrl = process.env.APP_URL?.trim();
+  if (envUrl && envUrl.startsWith('https://')) {
+    try {
+      return new URL(envUrl).origin;
+    } catch {
+      // fall through
+    }
+  }
+  const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '')
+    .split(',')[0]
+    ?.trim()
+    .toLowerCase();
+  const proto = forwardedProto || req.protocol;
+  const host = (String(req.headers['x-forwarded-host'] ?? '').split(',')[0]?.trim()) || req.get('host');
+  if (proto === 'https' && host) {
+    return `https://${host}`;
+  }
+  return null;
+}
 
 export function createTelegramAdminRouter(): Router {
   const router = Router();
@@ -40,21 +69,16 @@ export function createTelegramAdminRouter(): Router {
           return;
         }
 
-        const requestedUrl =
+        const requestedUrl = normalizeWebhookUrl(
           typeof req.body?.webhookUrl === 'string' && req.body.webhookUrl.trim()
-            ? req.body.webhookUrl.trim()
-            : row.webhookUrl;
+            ? req.body.webhookUrl
+            : row.webhookUrl,
+          resolveHttpsOrigin(req),
+        );
 
         if (!requestedUrl || !requestedUrl.startsWith('https://')) {
           res.status(400).json({ error: 'برای ثبت وب‌هوک، آدرس HTTPS معتبر الزامی است.' });
           return;
-        }
-
-        if (requestedUrl !== row.webhookUrl) {
-          await db
-            .update(telegramBotSettings)
-            .set({ webhookUrl: requestedUrl, updatedAt: new Date() })
-            .where(eq(telegramBotSettings.id, row.id));
         }
 
         const botToken = decryptSecret({
@@ -62,7 +86,8 @@ export function createTelegramAdminRouter(): Router {
           iv: row.tokenIv,
           authTag: row.tokenAuthTag,
         });
-        const webhookSecret =
+
+        let webhookSecret =
           row.encryptedWebhookSecret && row.webhookSecretIv && row.webhookSecretAuthTag
             ? decryptSecret({
                 ciphertext: row.encryptedWebhookSecret,
@@ -71,7 +96,40 @@ export function createTelegramAdminRouter(): Router {
               })
             : null;
 
+        const patch: Partial<typeof telegramBotSettings.$inferInsert> = {
+          updatedAt: new Date(),
+        };
+        if (requestedUrl !== row.webhookUrl) {
+          patch.webhookUrl = requestedUrl;
+        }
+        if (!webhookSecret) {
+          webhookSecret = generateWebhookSecret();
+          const encAuto = encryptSecret(webhookSecret);
+          patch.encryptedWebhookSecret = encAuto.ciphertext;
+          patch.webhookSecretIv = encAuto.iv;
+          patch.webhookSecretAuthTag = encAuto.authTag;
+          patch.maskedWebhookSecret = maskSecret(webhookSecret);
+        }
+        if (!row.isActive) {
+          patch.isActive = true;
+        }
+        await db.update(telegramBotSettings).set(patch).where(eq(telegramBotSettings.id, row.id));
+
         const syncRes = await syncTelegramWebhook(botToken, requestedUrl, webhookSecret);
+        if (syncRes.ok && (row.connectionStatus !== 'connected' || !row.botUsername)) {
+          const testRes = await testTelegramBotConnection(botToken);
+          await db
+            .update(telegramBotSettings)
+            .set({
+              connectionStatus: testRes.status,
+              lastTestedAt: new Date(),
+              lastTestMessage: testRes.message,
+              botUsername: testRes.botInfo?.username || row.botUsername,
+              botDisplayName: testRes.botInfo?.firstName || row.botDisplayName,
+              updatedAt: new Date(),
+            })
+            .where(eq(telegramBotSettings.id, row.id));
+        }
 
         await recordAuditLog({
           adminUserId: req.admin!.id,
@@ -179,46 +237,59 @@ export function createTelegramAdminRouter(): Router {
           .where(eq(telegramBotSettings.singletonKey, 'primary'))
           .limit(1);
 
-        if (!row?.encryptedBotToken || !row.tokenIv || !row.tokenAuthTag) {
+        const candidateToken =
+          typeof req.body?.botToken === 'string' && req.body.botToken.trim().length > 0
+            ? normalizeBotToken(req.body.botToken)
+            : null;
+
+        if (!candidateToken && (!row?.encryptedBotToken || !row.tokenIv || !row.tokenAuthTag)) {
           res.status(400).json({
-            error: 'توکن ربات تلگرام هنوز تنظیم نشده است. ابتدا توکن را وارد و ذخیره کنید.',
+            error: 'توکن ربات تلگرام هنوز تنظیم نشده است. ابتدا توکن را وارد کنید.',
             code: 'BOT_TOKEN_NOT_CONFIGURED',
           });
           return;
         }
 
-        const botToken = decryptSecret({
-          ciphertext: row.encryptedBotToken,
-          iv: row.tokenIv,
-          authTag: row.tokenAuthTag,
-        });
+        const botToken =
+          candidateToken ??
+          decryptSecret({
+            ciphertext: row!.encryptedBotToken!,
+            iv: row!.tokenIv!,
+            authTag: row!.tokenAuthTag!,
+          });
 
         const result = await testTelegramBotConnection(botToken);
         const now = new Date();
 
-        await db
-          .update(telegramBotSettings)
-          .set({
-            connectionStatus: result.status,
-            lastTestedAt: now,
-            lastTestMessage: result.message,
-            botUsername: result.botInfo?.username || row.botUsername,
-            botDisplayName: result.botInfo?.firstName || row.botDisplayName,
-            updatedAt: now,
-          })
-          .where(eq(telegramBotSettings.id, row.id));
+        if (row && !candidateToken) {
+          await db
+            .update(telegramBotSettings)
+            .set({
+              connectionStatus: result.status,
+              lastTestedAt: now,
+              lastTestMessage: result.message,
+              botUsername: result.botInfo?.username || row.botUsername,
+              botDisplayName: result.botInfo?.firstName || row.botDisplayName,
+              updatedAt: now,
+            })
+            .where(eq(telegramBotSettings.id, row.id));
+        }
 
         await recordAuditLog({
           adminUserId: req.admin!.id,
           actorEmail: req.admin!.email,
           action: 'telegram.connection_tested',
           resourceType: 'telegram_bot_settings',
-          resourceId: row.id,
+          resourceId: row?.id,
           severity: result.ok ? 'info' : 'warning',
           status: result.ok ? 'success' : 'failure',
           ipAddress: ip,
           userAgent: ua,
-          details: { ok: result.ok, latencyMs: result.latencyMs },
+          details: {
+            ok: result.ok,
+            latencyMs: result.latencyMs,
+            unsavedToken: Boolean(candidateToken),
+          },
           extraSecretsToRedact: [botToken],
         });
 

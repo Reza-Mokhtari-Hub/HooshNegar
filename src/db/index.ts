@@ -7,21 +7,15 @@ import { drizzle as drizzlePgProxy } from 'drizzle-orm/pg-proxy';
 import { PGlite } from '@electric-sql/pglite';
 import { drizzle as drizzlePglite, type PgliteDatabase } from 'drizzle-orm/pglite';
 import { isCloudflareWorker } from '../server/config/env.ts';
+import {
+  getCloudflareRequestContext,
+  type CloudflareSqlExecutor,
+} from '../server/cloudflare/requestContext.ts';
 import * as schema from './schema.ts';
 
 export type AppDatabase = PgliteDatabase<typeof schema>;
 export type DatabaseMode = 'neon_postgres' | 'cloudflare_durable_object' | 'embedded_pglite';
-
-export interface CloudflareSqlExecutor {
-  execSql(
-    queryString: string,
-    params: unknown[],
-    method: string,
-    txToken?: string,
-  ): Promise<{ rows: unknown[][] }>;
-  beginTx(): Promise<string>;
-  endTx(txToken: string): Promise<void>;
-}
+export type { CloudflareSqlExecutor };
 
 declare global {
   var _hooshnegarDb: AppDatabase | undefined;
@@ -35,12 +29,12 @@ export function setCloudflareSqlExecutor(executor: CloudflareSqlExecutor | undef
 }
 
 export function hasCloudflareSqlExecutor(): boolean {
-  return Boolean(global._hooshnegarCfSqlExecutor);
+  return Boolean(getCloudflareRequestContext()?.sqlExecutor ?? global._hooshnegarCfSqlExecutor);
 }
 
 function createCloudflareDurableObjectDb(): AppDatabase {
   const getLiveExecutor = (): CloudflareSqlExecutor => {
-    const exec = global._hooshnegarCfSqlExecutor;
+    const exec = getCloudflareRequestContext()?.sqlExecutor ?? global._hooshnegarCfSqlExecutor;
     if (!exec) {
       throw new Error(
         'Cloudflare Durable Object STATE_DB executor is not initialized for this request.',
@@ -123,7 +117,7 @@ function createDatabaseInstance(): { db: AppDatabase; mode: DatabaseMode } {
     };
   }
 
-  if (global._hooshnegarCfSqlExecutor) {
+  if (hasCloudflareSqlExecutor()) {
     return {
       db: createCloudflareDurableObjectDb(),
       mode: 'cloudflare_durable_object',
@@ -159,7 +153,7 @@ export function getDb(): AppDatabase {
   // Always refresh DB handle inside Cloudflare Workers if executor or env changed between invocations
   if (
     global._hooshnegarDb &&
-    global._hooshnegarCfSqlExecutor &&
+    hasCloudflareSqlExecutor() &&
     global._hooshnegarDbMode !== 'cloudflare_durable_object' &&
     !process.env.DATABASE_URL?.trim()
   ) {

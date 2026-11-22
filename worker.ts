@@ -18,6 +18,11 @@ import { createApiApp } from './src/server/app.ts';
 import { ensurePlatformReady } from './src/server/services/bootstrap.ts';
 import { runScheduledMaintenance } from './src/server/services/maintenanceService.ts';
 import { setCloudflareBlobStore, setCloudflareR2Bucket } from './src/server/storage/storageAdapter.ts';
+import {
+  runWithCloudflareRequestContext,
+  setGlobalCloudflareWaitUntil,
+  type CloudflareRequestContext,
+} from './src/server/cloudflare/requestContext.ts';
 
 declare global {
   var _hooshnegarCfBoundKeys: string[] | undefined;
@@ -239,12 +244,18 @@ export class HooshNegarStore extends DurableObject<CloudflareWorkerEnv> {
 async function syncWorkerEnvToProcessEnv(
   env: CloudflareWorkerEnv | undefined,
   requestUrl?: string,
-): Promise<void> {
+  waitUntilFn?: (promise: Promise<unknown>) => void,
+): Promise<CloudflareRequestContext> {
   const procEnv = process.env as Record<string, string | undefined>;
   procEnv['CF_WORKER'] = '1';
+  setGlobalCloudflareWaitUntil(waitUntilFn);
+  const reqCtx: CloudflareRequestContext = {
+    waitUntil: waitUntilFn,
+  };
+
   if (!env) {
     global._hooshnegarCfBoundKeys = [];
-    return;
+    return reqCtx;
   }
 
   const boundKeys: string[] = [];
@@ -279,6 +290,7 @@ async function syncWorkerEnvToProcessEnv(
 
   if (env.MEDIA_BUCKET) {
     setCloudflareR2Bucket(env.MEDIA_BUCKET);
+    reqCtx.r2Bucket = env.MEDIA_BUCKET;
   }
 
   if (env.STATE_DB) {
@@ -286,6 +298,8 @@ async function syncWorkerEnvToProcessEnv(
     const stub = env.STATE_DB.get(storeId);
     setCloudflareSqlExecutor(stub);
     setCloudflareBlobStore(stub);
+    reqCtx.sqlExecutor = stub;
+    reqCtx.blobStore = stub;
 
     // Auto-provision persistent 256-bit encryption & session keys inside Cloudflare Durable Object
     // when not explicitly set via Cloudflare Dashboard Secrets
@@ -307,6 +321,8 @@ async function syncWorkerEnvToProcessEnv(
       // Ignore malformed request URL
     }
   }
+
+  return reqCtx;
 }
 
 function getExpressWorkerHandler(): HttpServerHandler {
@@ -324,12 +340,15 @@ export default {
     env: CloudflareWorkerEnv,
     ctx: CloudflareExecutionContext,
   ): Promise<Response> {
-    await syncWorkerEnvToProcessEnv(env, request.url);
+    const waitUntilFn = (promise: Promise<unknown>) => {
+      ctx.waitUntil(promise);
+    };
+    const reqCtx = await syncWorkerEnvToProcessEnv(env, request.url, waitUntilFn);
 
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api')) {
       const handler = getExpressWorkerHandler();
-      return handler.fetch(request, env, ctx);
+      return runWithCloudflareRequestContext(reqCtx, () => handler.fetch(request, env, ctx));
     }
 
     if (env.ASSETS) {
@@ -344,14 +363,17 @@ export default {
     env: CloudflareWorkerEnv,
     ctx: CloudflareExecutionContext,
   ): Promise<void> {
-    await syncWorkerEnvToProcessEnv(env);
+    const waitUntilFn = (promise: Promise<unknown>) => {
+      ctx.waitUntil(promise);
+    };
+    const reqCtx = await syncWorkerEnvToProcessEnv(env, undefined, waitUntilFn);
 
     ctx.waitUntil(
-      (async () => {
+      runWithCloudflareRequestContext(reqCtx, async () => {
         await ensurePlatformReady();
         const result = await runScheduledMaintenance();
         console.log('[cloudflare:cron] Maintenance sweep completed:', JSON.stringify(result));
-      })(),
+      }),
     );
   },
 };
