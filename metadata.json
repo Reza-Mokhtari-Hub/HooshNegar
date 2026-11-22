@@ -1,0 +1,6 @@
+{
+  "name": "HooshNegar AI — پلتفرم مدیریت هوش مصنوعی و ربات تلگرام",
+  "description": "پلتفرم سازمانی مدیریت چندارائه‌دهنده هوش مصنوعی، مدل‌ها، ربات تلگرام، پلن‌های اشتراک و امنیت با رمزنگاری AES-256-GCM و Drizzle ORM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,11 +1,88 @@
-<div align="center">
+# هوش‌نگار (HooshNegar AI) — پلتفرم تجاری چندمدلی هوش مصنوعی متصل به ربات تلگرام (فاز ۱، ۲ و ۳)
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+پلتفرم تولیدی (Production-Grade) چندارائه‌دهنده هوش مصنوعی متصل به ربات تلگرام (**Grammy + Webhook**) با پرداخت اختصاصی **Telegram Stars (`XTR`)**، موتور اشتراک و کیف‌پول اعتبار حسابرسی‌شده، سیستم معرفی دوستان و کوپن‌ها، داشبورد مالی و سودآوری، صف پس‌زمینه **Upstash QStash**، ذخیره‌سازی رسانه **Cloudflare R2** و پایگاه‌داده **PostgreSQL (Neon + Drizzle ORM)** آماده استقرار روی **Vercel**.
 
-  <h1>Built with AI Studio</h2>
+---
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## قابلیت‌های پیاده‌سازی‌شده
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+### فاز ۱ — زیرساخت امن، پایگاه‌داده و پنل مدیریت
+- **احراز هویت امن مدیران**: ورود با ایمیل و رمز عبور، هش **Argon2id** (`hash-wasm`)، نشست‌های سمت سرور در PostgreSQL، کوکی‌های `HttpOnly` / `Secure` / `SameSite`، محافظت **CSRF**، محدودیت نرخ ورود و قفل ضد Brute-Force، کنترل دسترسی مبتنی بر نقش (**RBAC**: `super_admin`, `admin`, `operator`, `auditor`) و گزارش ممیزی امنیتی (`audit_logs`).
+- **پایگاه‌داده نرمال‌سازی‌شده (۳۷ جدول + ۳ Migration واقعی Drizzle ORM)**: شامل جداول هسته، ربات تلگرام، موتور AI، پرداخت‌های استارز، بسته‌های اعتبار، قوانین معرفی، کوپن‌ها، قالب‌ها و لاگ‌های اعلان، و محدودیت‌های سفارشی کاربر.
+- **رمزنگاری AES-256-GCM کلیدهای API و توکن‌های تلگرام**: کلیدها هرگز به‌صورت خام به فرانت‌اند یا لاگ‌ها ارسال نمی‌شوند و قابلیت چرخش کلید دارند.
 
-</div>
+### فاز ۲ — ربات کامل تلگرام (Grammy) و موتور چندوجهی هوش مصنوعی
+- **وب‌هوک امن و Idempotent تلگرام**: اعتبارسنجی زمان‌ثابت `X-Telegram-Bot-Api-Secret-Token`، پردازش سریع `pre_checkout_query` زیر ۱۰ ثانیه، و پردازش ناهمگام درخواست‌های AI از طریق **Upstash QStash** با تأیید امضای `Upstash-Signature`.
+- **تجربه کاربری کامل فارسی در تلگرام**: پشتیبانی کامل از `/start`, `/help`, `/models`, `/plan`, `/balance`, `/buy`, `/referral`, `/history`, `/settings`, `/cancel`, `/paysupport` و کیبوردهای اینلاین پویا.
+- **موتور چندارائه‌دهنده AI با Failover امن و حفاظت SSRF**: پشتیبانی بومی از OpenAI-compatible، Google Gemini، Anthropic، Replicate، fal.ai و Custom HTTPS با محافظ Failover که تغییر مسیر به مدل‌های غیرفعال، ناسازگار، غیرمجاز برای پلن کاربر یا گران‌تر را مسدود می‌کند.
+
+### فاز ۳ — اشتراک، پرداخت تلگرام استارز (XTR)، کیف‌پول اعتبار، معرفی، مالی و پشتیبانی
+- **موتور اشتراک کاملاً قابل پیکربندی (بدون مقادیر Hardcoded)**:
+  - پشتیبانی نامحدود از پلن‌های `Free`, `Basic`, `Pro`, `Premium`, `Enterprise` و `Custom` همراه با بسته‌های شارژ اعتبار (`credit_packages`).
+  - پیکربندی قیمت تلگرام استارز (`XTR`)، تمدید خودکار ۳۰ روزه تلگرام (`isRecurringStars` با اعتبارسنجی رسمی ۱ تا ۲۵۰۰ استارز و دقیقاً ۳۰ روز / `2592000` ثانیه)، سهمیه‌های روزانه/ماهانه برای متن، تصویر، صوت و ویدیو، حداکثر حجم فایل، طول زمینه، صف اولویت، ارائه‌دهندگان و مدل‌های مجاز.
+- **پرداخت اختصاصی Telegram Stars (`XTR`)**:
+  - انطباق کامل با قوانین محصولات دیجیتال تلگرام: exclusively `currency: 'XTR'` و `provider_token: ''` (بدون هیچ درگاه خارجی مانند Stripe/PayPal/Crypto درون ربات).
+  - امضای HMAC-SHA256 روی `invoice_payload`، اعتبارسنجی سریع `pre_checkout_query`، ثبت idempotent پرداخت با `telegram_payment_charge_id` (جلوگیری از شارژ تکراری)، پشتیبانی از تمدید دوره‌ای (`is_first_recurring` / `is_recurring`)، لغو تمدید خودکار (`editUserStarSubscription`) و بازپرداخت رسمی (`refundStarPayment`) از پنل مدیریت.
+- **کیف‌پول اعتبار حسابرسی‌شده**:
+  - قفل سطری اتمی (`SELECT ... FOR UPDATE`)، ثبت `balanceBefore` و `balanceAfter` در `credit_transactions`، جلوگیری پیش‌فرض از موجودی منفی (مگر فعال‌سازی صریح `allowNegativeBalance`)، رزرو و بازگشت ۱۰۰٪ اعتبار در خطای AI، و ارسال خودکار هشدار کمبود اعتبار.
+- **برنامه معرفی دوستان، ضدتقلب و کوپن‌ها**:
+  - لینک اختصاصی دعوت (`t.me/<bot>?start=REF_...`)، جلوگیری خودکار از معرفی به خود (Self-referral) و ثبت‌نام تکراری، امتیازدهی ریسک سرعت دعوت (`fraudVelocityLimitPerHour`)، پاداش مشروط به خرید (`requirePurchase`)، و کوپن‌های تخفیف درصدی/ثابت (اعتبارسنجی صرفاً سمت سرور) و کدهای هدیه اعتبار.
+- **داشبورد مالی، مدیریت کامل کاربران، پشتیبانی و اعلان‌ها**:
+  - گزارش درآمد استارز، درآمد/هزینه/سود برآوردی (با برچسب صریح برآوردی)، نرخ تبدیل، فیلتر چندبعدی، خروجی CSV ایمن در برابر Formula Injection، پنل جزئیات کامل کاربر (تنظیم حسابرسی‌شده اعتبار، تخصیص دستی پلن، محدودیت‌های سفارشی، حذف دائم داده برای `super_admin`)، تیکت‌های پشتیبانی دسته‌بندی‌شده با ارسال پاسخ به تلگرام، و ۱۰ قالب اعلان قابل ویرایش با جلوگیری از ارسال تکراری.
+
+---
+
+## متغیرهای محیطی (Environment Variables)
+
+فایل `.env.example` را کپی کرده و مقادیر واقعی را در `.env` یا تنظیمات پروژه **Vercel** وارد کنید:
+
+| متغیر | الزامی در تولید | توضیح |
+| --- | :---: | --- |
+| `DATABASE_URL` | بله | رشته اتصال PostgreSQL از Neon (`postgresql://...?sslmode=require`) |
+| `ENCRYPTION_MASTER_KEY` | بله | کلید اصلی رمزنگاری AES-256-GCM دقیقاً ۶۴ کاراکتر هگز (`openssl rand -hex 32`) |
+| `SESSION_SECRET` | بله | کلید تصادفی حداقل ۳۲ کاراکتر برای نشست‌ها (`openssl rand -base64 48`) |
+| `PAYMENT_PAYLOAD_SECRET` | توصیه‌شده | کلید اختصاصی HMAC-SHA256 برای امضای فاکتورهای استارز (در صورت نبود از `ENCRYPTION_MASTER_KEY` استفاده می‌کند) |
+| `CRON_SECRET` | بله | کلید احراز هویت Vercel Cron برای مسیر `/api/cron/maintenance` (`openssl rand -hex 32`) |
+| `APP_URL` | بله | نشانی عمومی HTTPS پلتفرم (مثلاً `https://your-app.vercel.app`) |
+| `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | توصیه‌شده | صف پایدار پس‌زمینه و Retry برای کارهای طولانی AI در Vercel |
+| `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL` | اختیاری | ذخیره‌سازی رسانه Cloudflare R2 با پاک‌سازی خودکار فایل‌های منقضی |
+| `INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, `INITIAL_ADMIN_NAME` | اختیاری | ایجاد خودکار مدیر ارشد در اولین اجرا (در غیر این صورت صفحه راه‌اندازی اولیه نمایش داده می‌شود) |
+| `AI_MOCK_MODE` | **فقط توسعه** | در محیط تولید (`NODE_ENV=production`) به‌صورت خودکار نادیده گرفته می‌شود |
+
+---
+
+## اجرای محلی، Migration و تست‌ها
+
+```bash
+npm install
+npm run db:migrate   # اجرای هر ۳ migration پایگاه‌داده روی Neon یا PGlite محلی
+npm run dev          # اجرای سرور تمام‌پشته روی http://localhost:3000
+npm run lint         # بررسی TypeScript Strict Mode
+npm run build        # ساخت بسته تولیدی Vite
+npm test             # اجرای تمام تست‌های واحد و یکپارچه Vitest (فاز ۱، ۲ و ۳)
+```
+
+---
+
+## چک‌لیست استقرار روی Vercel و پیکربندی سرویس‌های خارجی
+
+1. **پایگاه‌داده Neon PostgreSQL**:
+   - یک دیتابیس Neon بسازید و `DATABASE_URL` را در Vercel ثبت کنید.
+   - دستور `DATABASE_URL="..." npm run db:migrate` را پیش از انتشار اجرا کنید.
+2. **ساخت ربات در BotFather و فعال‌سازی Telegram Stars**:
+   - در `@BotFather` دستور `/newbot` را اجرا کنید و توکن را در پنل مدیریت → **تنظیمات ربات تلگرام** وارد کنید.
+   - یک **Webhook Secret** تصادفی تنظیم کنید، آدرس `https://<your-domain>/api/telegram/webhook` را ذخیره کرده و دکمه **همگام‌سازی وب‌هوک** را بزنید.
+   - پرداخت‌های Telegram Stars (`XTR`) بدون نیاز به `provider_token` خارجی و با استفاده از API رسمی تلگرام فعال هستند؛ دستور `/paysupport` نیز برای رعایت الزامات رسمی تلگرام پیاده‌سازی شده است.
+3. **ارائه‌دهندگان هوش مصنوعی، پلن‌ها و بسته‌های اعتبار**:
+   - از بخش **ارائه‌دهندگان هوش مصنوعی** و **مدل‌های هوش مصنوعی**، کلیدهای واقعی (OpenAI, Gemini, Anthropic, Replicate, fal.ai) را ثبت کنید و `creditCost` / `minCreditCost` / `providerCostPerOpUsd` را تنظیم نمایید.
+   - از بخش **پلن‌ها و بسته‌های اعتبار**، پلن‌های اشتراک (قیمت `XTR`) و بسته‌های اعتبار را ایجاد کنید و پلن رایگان پیش‌فرض را در **تنظیمات سیستم** انتخاب نمایید.
+4. **کار زمان‌بندی‌شده (Vercel Cron)**:
+   - فایل `vercel.json` مسیر `/api/cron/maintenance` را به‌صورت ساعتی (`0 * * * *`) زمان‌بندی می‌کند و با `CRON_SECRET` محافظت می‌شود (انقضای خودکار اشتراک‌ها، یادآور تمدید ۲۴ ساعته، پاک‌سازی فایل‌های منقضی و بازیابی کارهای معوق).
+
+---
+
+## عیب‌یابی سریع (Troubleshooting)
+
+- **خطای `ENCRYPTION_KEY_MISSING`**: مقدار ۶۴ کاراکتر هگز برای `ENCRYPTION_MASTER_KEY` در متغیرهای محیطی تنظیم کنید.
+- **وب‌هوک تلگرام پیام دریافت نمی‌کند**: وضعیت وب‌هوک را در بخش **پایش ربات تلگرام** بررسی کنید و مطمئن شوید `APP_URL` با `https://` شروع می‌شود و کلید `webhookSecret` با Bot API همگام‌سازی شده است.
+- **بازپرداخت استارز خطا می‌دهد**: مطمئن شوید توکن ربات در تنظیمات تلگرام ذخیره شده و پرداخت انتخاب‌شده دارای `telegramPaymentChargeId` معتبر و ارز `XTR` است.

@@ -1,0 +1,41 @@
+{
+  "entities": {
+    "AdminProfile": {
+      "title": "AdminProfile",
+      "description": "Authorized admin operator record synchronized for SSO verification.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 255 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "role": { "type": "string", "enum": ["super_admin", "admin", "operator", "auditor"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "role", "createdAt", "updatedAt"]
+    },
+    "AdminAuditMirror": {
+      "title": "AdminAuditMirror",
+      "description": "Redacted cloud mirror of high-severity administrative security events (no secrets or PII).",
+      "type": "object",
+      "properties": {
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "resourceType": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["actorUid", "action", "resourceType", "severity", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminProfile" },
+      "description": "Private admin operator authorization records restricted strictly to verified admins."
+    },
+    "/auditMirrors/{auditId}": {
+      "schema": { "$ref": "#/entities/AdminAuditMirror" },
+      "description": "Immutable redacted admin audit log mirror readable and appendable only by verified admins."
+    }
+  }
+}
