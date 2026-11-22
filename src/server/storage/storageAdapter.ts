@@ -6,7 +6,16 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { and, isNull, lte, eq } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { storedFiles } from '../../db/schema.ts';
-import { getR2Config } from '../config/env.ts';
+import { getR2Config, isCloudflareWorker } from '../config/env.ts';
+import type { CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
+
+declare global {
+  var _hooshnegarCfR2Bucket: CloudflareR2Bucket | undefined;
+}
+
+export function setCloudflareR2Bucket(bucket: CloudflareR2Bucket | undefined): void {
+  global._hooshnegarCfR2Bucket = bucket;
+}
 
 export interface StoredObjectResult {
   id: string;
@@ -161,10 +170,98 @@ class CloudflareR2StorageAdapter implements StorageAdapter {
   }
 }
 
+class CloudflareNativeR2BindingAdapter implements StorageAdapter {
+  readonly providerName = 'r2' as const;
+
+  constructor(
+    private readonly bucket: CloudflareR2Bucket,
+    private readonly publicBaseUrl: string,
+  ) {}
+
+  async putObject(input: StoragePutInput): Promise<StoredObjectResult> {
+    const objectKey = buildObjectKey(input.prefix, input.extension);
+    const ttlHours = input.ttlHours ?? (input.prefix === 'temp-uploads' ? 2 : 72);
+    const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+
+    await this.bucket.put(objectKey, input.buffer, {
+      httpMetadata: { contentType: input.mimeType },
+      customMetadata: { expiresAt: expiresAt.toISOString() },
+    });
+
+    const signedUrl = await this.getSignedDownloadUrl(objectKey);
+    const db = getDb();
+    const [row] = await db
+      .insert(storedFiles)
+      .values({
+        userId: input.userId ?? null,
+        requestId: input.requestId ?? null,
+        jobId: input.jobId ?? null,
+        storageProvider: 'r2',
+        objectKey,
+        mimeType: input.mimeType,
+        fileSizeBytes: input.buffer.byteLength,
+        expiresAt,
+      })
+      .returning({ id: storedFiles.id });
+
+    return {
+      id: row?.id ?? objectKey,
+      storageProvider: 'r2',
+      objectKey,
+      mimeType: input.mimeType,
+      fileSizeBytes: input.buffer.byteLength,
+      signedUrl,
+      localPath: null,
+      expiresAt,
+    };
+  }
+
+  async getSignedDownloadUrl(objectKey: string): Promise<string | null> {
+    if (this.publicBaseUrl) {
+      return `${this.publicBaseUrl.replace(/\/+$/, '')}/${objectKey}`;
+    }
+    return null;
+  }
+
+  async deleteObject(objectKey: string): Promise<void> {
+    await this.bucket.delete(objectKey);
+  }
+
+  async cleanupExpiredFiles(): Promise<number> {
+    const db = getDb();
+    const now = new Date();
+    const expired = await db
+      .select()
+      .from(storedFiles)
+      .where(and(eq(storedFiles.storageProvider, 'r2'), isNull(storedFiles.deletedAt), lte(storedFiles.expiresAt, now)))
+      .limit(100);
+
+    let cleaned = 0;
+    for (const file of expired) {
+      try {
+        await this.deleteObject(file.objectKey);
+        await db
+          .update(storedFiles)
+          .set({ deletedAt: now })
+          .where(eq(storedFiles.id, file.id));
+        cleaned += 1;
+      } catch {
+        // Continue cleaning other objects
+      }
+    }
+    return cleaned;
+  }
+}
+
 class LocalTempStorageAdapter implements StorageAdapter {
   readonly providerName = 'local_temp' as const;
 
   async putObject(input: StoragePutInput): Promise<StoredObjectResult> {
+    if (isCloudflareWorker()) {
+      throw new Error(
+        'Cloudflare R2 storage is required on Cloudflare Workers. Bind MEDIA_BUCKET in wrangler.jsonc or set R2_* secrets.',
+      );
+    }
     const objectKey = buildObjectKey(input.prefix, input.extension);
     const fullPath = path.join(LOCAL_TEMP_DIR, objectKey);
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
@@ -241,6 +338,9 @@ let cachedAdapter: StorageAdapter | null = null;
 
 export function getStorageAdapter(): StorageAdapter {
   const r2 = getR2Config();
+  if (global._hooshnegarCfR2Bucket) {
+    return new CloudflareNativeR2BindingAdapter(global._hooshnegarCfR2Bucket, r2.publicBaseUrl);
+  }
   if (r2.configured) {
     if (!cachedAdapter || cachedAdapter.providerName !== 'r2') {
       cachedAdapter = new CloudflareR2StorageAdapter();

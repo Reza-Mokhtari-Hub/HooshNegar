@@ -2,19 +2,27 @@ import { describe, expect, it } from 'vitest';
 import {
   generateSessionToken,
   hashPassword,
+  hashPasswordScrypt,
   hashSessionToken,
   timingSafeEqualStr,
   verifyPassword,
 } from './password.ts';
 import { InProcessRateLimiter } from './rateLimit.ts';
 
-describe('Argon2id Password Hashing & Session Security', () => {
+describe('Argon2id & Cloudflare Scrypt Password Hashing & Session Security', () => {
   it('hashes with PHC Argon2id format and verifies passwords accurately', async () => {
     const hash = await hashPassword('StrongAdminPass2026!');
     expect(hash.startsWith('$argon2id$')).toBe(true);
     expect(await verifyPassword('StrongAdminPass2026!', hash)).toBe(true);
     expect(await verifyPassword('WrongPassword2026!', hash)).toBe(false);
     expect(await verifyPassword('StrongAdminPass2026!', 'not-a-hash')).toBe(false);
+  });
+
+  it('hashes with native scrypt (Cloudflare Workers runtime) and verifies accurately', async () => {
+    const hash = await hashPasswordScrypt('CloudflarePass2026!');
+    expect(hash.startsWith('$scrypt$')).toBe(true);
+    expect(await verifyPassword('CloudflarePass2026!', hash)).toBe(true);
+    expect(await verifyPassword('WrongPassword2026!', hash)).toBe(false);
   });
 
   it('generates unique session tokens and hashes deterministically', () => {

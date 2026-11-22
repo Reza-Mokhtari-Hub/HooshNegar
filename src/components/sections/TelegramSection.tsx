@@ -345,7 +345,7 @@ export function TelegramSection({ locale }: { locale: Locale }) {
                 dir="ltr"
                 value={settings.webhookUrl}
                 onChange={(e) => setSettings({ ...settings, webhookUrl: e.target.value })}
-                placeholder="https://your-domain.vercel.app/api/telegram/webhook"
+                placeholder="https://hooshnegar-ai.your-subdomain.workers.dev/api/telegram/webhook"
               />
             </div>
           </div>

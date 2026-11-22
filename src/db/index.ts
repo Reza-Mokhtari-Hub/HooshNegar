@@ -4,6 +4,7 @@ import { neon } from '@neondatabase/serverless';
 import { drizzle as drizzleNeon } from 'drizzle-orm/neon-http';
 import { PGlite } from '@electric-sql/pglite';
 import { drizzle as drizzlePglite, type PgliteDatabase } from 'drizzle-orm/pglite';
+import { isCloudflareWorker } from '../server/config/env.ts';
 import * as schema from './schema.ts';
 
 export type AppDatabase = PgliteDatabase<typeof schema>;
@@ -24,6 +25,12 @@ function createDatabaseInstance(): { db: AppDatabase; mode: 'neon_postgres' | 'e
       db: neonDb as unknown as AppDatabase,
       mode: 'neon_postgres',
     };
+  }
+
+  if (isCloudflareWorker()) {
+    throw new Error(
+      'DATABASE_URL (Neon PostgreSQL) is required on Cloudflare Workers. Add it in Cloudflare Dashboard → Workers → Settings → Variables and Secrets.',
+    );
   }
 
   const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);

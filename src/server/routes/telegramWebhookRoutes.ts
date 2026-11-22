@@ -233,7 +233,7 @@ export function createTelegramWebhookRouter(): Router {
   });
 
   // =========================================================================
-  // 1B. SCHEDULED MAINTENANCE CRON (Vercel Cron Bearer Secret OR QStash Signature)
+  // 1B. SCHEDULED MAINTENANCE CRON (Cloudflare / Bearer Secret OR QStash Signature)
   // =========================================================================
   const handleMaintenanceCron = async (req: RawBodyRequest, res: Response) => {
     const cronSecret = process.env.CRON_SECRET?.trim();

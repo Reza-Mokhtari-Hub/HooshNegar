@@ -5,7 +5,7 @@ import path from 'node:path';
 export interface EnvValidationResult {
   nodeEnv: 'development' | 'production' | 'test';
   isProduction: boolean;
-  isVercel: boolean;
+  isCloudflare: boolean;
   appUrl: string;
   databaseMode: 'neon_postgres' | 'embedded_pglite';
   encryptionConfigured: boolean;
@@ -28,8 +28,21 @@ interface DevRuntimeKeys {
 
 let cachedDevKeys: DevRuntimeKeys | null = null;
 
+export function isCloudflareWorker(): boolean {
+  if (process.env.CF_WORKER === '1') {
+    return true;
+  }
+  const nav = (globalThis as { navigator?: { userAgent?: string } }).navigator;
+  return nav?.userAgent === 'Cloudflare-Workers';
+}
+
 function loadOrCreateDevKeys(): DevRuntimeKeys {
   if (cachedDevKeys) return cachedDevKeys;
+  if (isCloudflareWorker()) {
+    throw new Error(
+      'ENCRYPTION_MASTER_KEY and SESSION_SECRET must be set as Cloudflare Workers Secrets in production.',
+    );
+  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (fs.existsSync(DEV_KEYS_FILE)) {
     const parsed = JSON.parse(fs.readFileSync(DEV_KEYS_FILE, 'utf8')) as Partial<DevRuntimeKeys>;
@@ -56,7 +69,7 @@ function loadOrCreateDevKeys(): DevRuntimeKeys {
 }
 
 export function isProductionRuntime(): boolean {
-  return process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+  return process.env.NODE_ENV === 'production' || isCloudflareWorker();
 }
 
 export function getEncryptionMasterKeyHex(): string | null {
@@ -148,7 +161,7 @@ export function getEnvValidationSummary(): EnvValidationResult {
         ? 'test'
         : 'development';
   const isProd = isProductionRuntime();
-  const isVercel = process.env.VERCEL === '1';
+  const isCloudflare = isCloudflareWorker();
   const appUrl = process.env.APP_URL?.trim() || 'http://localhost:3000';
   const hasDbUrl = Boolean(process.env.DATABASE_URL?.trim());
   const databaseMode = hasDbUrl ? 'neon_postgres' : 'embedded_pglite';
@@ -202,7 +215,7 @@ export function getEnvValidationSummary(): EnvValidationResult {
   return {
     nodeEnv,
     isProduction: isProd,
-    isVercel,
+    isCloudflare,
     appUrl,
     databaseMode,
     encryptionConfigured: encryptionSource !== 'missing',

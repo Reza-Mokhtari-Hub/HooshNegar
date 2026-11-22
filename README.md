@@ -1,6 +1,6 @@
 # هوش‌نگار (HooshNegar AI) — پلتفرم تجاری چندمدلی هوش مصنوعی متصل به ربات تلگرام (فاز ۱، ۲ و ۳)
 
-پلتفرم تولیدی (Production-Grade) چندارائه‌دهنده هوش مصنوعی متصل به ربات تلگرام (**Grammy + Webhook**) با پرداخت اختصاصی **Telegram Stars (`XTR`)**، موتور اشتراک و کیف‌پول اعتبار حسابرسی‌شده، سیستم معرفی دوستان و کوپن‌ها، داشبورد مالی و سودآوری، صف پس‌زمینه **Upstash QStash**، ذخیره‌سازی رسانه **Cloudflare R2** و پایگاه‌داده **PostgreSQL (Neon + Drizzle ORM)** آماده استقرار روی **Vercel**.
+پلتفرم تولیدی (Production-Grade) چندارائه‌دهنده هوش مصنوعی متصل به ربات تلگرام (**Grammy + Webhook**) با پرداخت اختصاصی **Telegram Stars (`XTR`)**، موتور اشتراک و کیف‌پول اعتبار حسابرسی‌شده، سیستم معرفی دوستان و کوپن‌ها، داشبورد مالی و سودآوری، صف پس‌زمینه **Upstash QStash**، ذخیره‌سازی رسانه **Cloudflare R2** و پایگاه‌داده **PostgreSQL (Neon + Drizzle ORM)** با استقرار کامل روی **Cloudflare Workers**.
 
 ---
 
@@ -34,7 +34,7 @@
 
 ## متغیرهای محیطی (Environment Variables)
 
-فایل `.env.example` را کپی کرده و مقادیر واقعی را در `.env` یا تنظیمات پروژه **Vercel** وارد کنید:
+فایل `.env.example` را کپی کرده و مقادیر واقعی را در `.env` یا بخش **Variables and Secrets** پروژه در **Cloudflare Workers** وارد کنید:
 
 | متغیر | الزامی در تولید | توضیح |
 | --- | :---: | --- |
@@ -42,10 +42,10 @@
 | `ENCRYPTION_MASTER_KEY` | بله | کلید اصلی رمزنگاری AES-256-GCM دقیقاً ۶۴ کاراکتر هگز (`openssl rand -hex 32`) |
 | `SESSION_SECRET` | بله | کلید تصادفی حداقل ۳۲ کاراکتر برای نشست‌ها (`openssl rand -base64 48`) |
 | `PAYMENT_PAYLOAD_SECRET` | توصیه‌شده | کلید اختصاصی HMAC-SHA256 برای امضای فاکتورهای استارز (در صورت نبود از `ENCRYPTION_MASTER_KEY` استفاده می‌کند) |
-| `CRON_SECRET` | بله | کلید احراز هویت Vercel Cron برای مسیر `/api/cron/maintenance` (`openssl rand -hex 32`) |
-| `APP_URL` | بله | نشانی عمومی HTTPS پلتفرم (مثلاً `https://your-app.vercel.app`) |
-| `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | توصیه‌شده | صف پایدار پس‌زمینه و Retry برای کارهای طولانی AI در Vercel |
-| `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL` | اختیاری | ذخیره‌سازی رسانه Cloudflare R2 با پاک‌سازی خودکار فایل‌های منقضی |
+| `CRON_SECRET` | اختیاری | کلید احراز هویت مسیر HTTP `/api/cron/maintenance` (علاوه بر اجرای بومی ساعتی توسط Cloudflare Cron Trigger) |
+| `APP_URL` | بله | نشانی عمومی HTTPS روی Cloudflare Workers (مثلاً `https://hooshnegar-ai.<subdomain>.workers.dev` یا دامنه اختصاصی) |
+| `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | توصیه‌شده | صف پایدار پس‌زمینه و Retry برای کارهای طولانی AI |
+| `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL` | اختیاری | ذخیره‌سازی رسانه Cloudflare R2 (یا اتصال مستقیم `MEDIA_BUCKET` در `wrangler.jsonc`) |
 | `INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, `INITIAL_ADMIN_NAME` | اختیاری | ایجاد خودکار مدیر ارشد در اولین اجرا (در غیر این صورت صفحه راه‌اندازی اولیه نمایش داده می‌شود) |
 | `AI_MOCK_MODE` | **فقط توسعه** | در محیط تولید (`NODE_ENV=production`) به‌صورت خودکار نادیده گرفته می‌شود |
 
@@ -64,20 +64,26 @@ npm test             # اجرای تمام تست‌های واحد و یکپا�
 
 ---
 
-## چک‌لیست استقرار روی Vercel و پیکربندی سرویس‌های خارجی
+## چک‌لیست استقرار کامل روی Cloudflare Workers (بدون نیاز به Vercel)
 
 1. **پایگاه‌داده Neon PostgreSQL**:
-   - یک دیتابیس Neon بسازید و `DATABASE_URL` را در Vercel ثبت کنید.
-   - دستور `DATABASE_URL="..." npm run db:migrate` را پیش از انتشار اجرا کنید.
-2. **ساخت ربات در BotFather و فعال‌سازی Telegram Stars**:
+   - یک دیتابیس Neon بسازید و `DATABASE_URL` را به‌عنوان Secret در Cloudflare Workers ثبت کنید.
+   - یک‌بار دستور `DATABASE_URL="..." npm run db:migrate` را اجرا کنید تا هر ۳ migration روی Neon اعمال شود.
+2. **استقرار مستقیم از GitHub روی Cloudflare Workers**:
+   - در داشبورد Cloudflare بروید به **Workers & Pages → Create → Workers → Connect to Git** و ریپازیتوری گیت‌هاب خود را انتخاب کنید.
+   - **Build command**: `npm run build`
+   - **Deploy command**: `npx wrangler deploy`
+   - فایل `wrangler.jsonc` به‌صورت خودکار فرانت‌اند (`./dist`)، سرور API (`worker.ts` با `nodejs_compat`) و **Cron Trigger ساعتی رایگان (`0 * * * *`)** را مستقر می‌کند.
+   - *(یا از سیستم محلی با یک دستور: `npm run cf:deploy`)*
+3. **ساخت ربات در BotFather و فعال‌سازی Telegram Stars**:
    - در `@BotFather` دستور `/newbot` را اجرا کنید و توکن را در پنل مدیریت → **تنظیمات ربات تلگرام** وارد کنید.
-   - یک **Webhook Secret** تصادفی تنظیم کنید، آدرس `https://<your-domain>/api/telegram/webhook` را ذخیره کرده و دکمه **همگام‌سازی وب‌هوک** را بزنید.
-   - پرداخت‌های Telegram Stars (`XTR`) بدون نیاز به `provider_token` خارجی و با استفاده از API رسمی تلگرام فعال هستند؛ دستور `/paysupport` نیز برای رعایت الزامات رسمی تلگرام پیاده‌سازی شده است.
-3. **ارائه‌دهندگان هوش مصنوعی، پلن‌ها و بسته‌های اعتبار**:
+   - یک **Webhook Secret** تصادفی تنظیم کنید، آدرس `https://<your-worker-domain>/api/telegram/webhook` را ذخیره کرده و دکمه **همگام‌سازی وب‌هوک** را بزنید.
+   - پرداخت‌های Telegram Stars (`XTR`) بدون نیاز به `provider_token` خارجی و با API رسمی تلگرام فعال هستند؛ دستور `/paysupport` نیز به‌صورت بومی پیاده‌سازی شده است.
+4. **ارائه‌دهندگان هوش مصنوعی، پلن‌ها و بسته‌های اعتبار**:
    - از بخش **ارائه‌دهندگان هوش مصنوعی** و **مدل‌های هوش مصنوعی**، کلیدهای واقعی (OpenAI, Gemini, Anthropic, Replicate, fal.ai) را ثبت کنید و `creditCost` / `minCreditCost` / `providerCostPerOpUsd` را تنظیم نمایید.
    - از بخش **پلن‌ها و بسته‌های اعتبار**، پلن‌های اشتراک (قیمت `XTR`) و بسته‌های اعتبار را ایجاد کنید و پلن رایگان پیش‌فرض را در **تنظیمات سیستم** انتخاب نمایید.
-4. **کار زمان‌بندی‌شده (Vercel Cron)**:
-   - فایل `vercel.json` مسیر `/api/cron/maintenance` را به‌صورت روزانه (`0 0 * * *` — سازگار با پلن رایگان **Vercel Hobby**) زمان‌بندی می‌کند و با `CRON_SECRET` محافظت می‌شود (انقضای خودکار اشتراک‌ها، یادآور تمدید ۲۴ ساعته، پاک‌سازی فایل‌های منقضی و بازیابی کارهای معوق). در صورت نیاز به اجرای ساعتی (`0 * * * *`) می‌توانید از پلن **Vercel Pro** یا **Upstash QStash Schedules** استفاده کنید.
+5. **کار زمان‌بندی‌شده بومی (Cloudflare Cron Triggers — رایگان و ساعتی)**:
+   - فایل `wrangler.jsonc` هر ساعت (`0 * * * *`) رویداد `scheduled` در `worker.ts` را به‌صورت مستقیم و رایگان اجرا می‌کند (انقضای خودکار اشتراک‌ها، یادآور تمدید، پاک‌سازی فایل‌های منقضی و بازیابی کارهای معوق).
 
 ---
 

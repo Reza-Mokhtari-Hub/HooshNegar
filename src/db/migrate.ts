@@ -3,11 +3,20 @@ import path from 'node:path';
 import { migrate as migratePglite } from 'drizzle-orm/pglite/migrator';
 import { migrate as migrateNeon } from 'drizzle-orm/neon-http/migrator';
 import { getDb, getDatabaseMode } from './index.ts';
+import { isCloudflareWorker } from '../server/config/env.ts';
 
 let migrationPromise: Promise<void> | null = null;
 
 export async function runMigrations(): Promise<void> {
   if (migrationPromise) {
+    return migrationPromise;
+  }
+
+  // Cloudflare Workers isolates have no local filesystem for drizzle/*.sql.
+  // Schema migrations are applied against Neon PostgreSQL via `npm run db:migrate` during deploy.
+  if (isCloudflareWorker()) {
+    getDb();
+    migrationPromise = Promise.resolve();
     return migrationPromise;
   }
 
@@ -35,9 +44,13 @@ export async function runMigrations(): Promise<void> {
   }
 }
 
-// Allow running directly via `npm run db:migrate`
+// Allow running directly via `npm run db:migrate` (Node.js CLI only)
+const argv1 = process.argv?.[1];
 const isDirectExecution =
-  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
+  !isCloudflareWorker() &&
+  typeof argv1 === 'string' &&
+  typeof import.meta?.url === 'string' &&
+  path.resolve(argv1) === path.resolve(new URL(import.meta.url).pathname);
 
 if (isDirectExecution) {
   runMigrations()

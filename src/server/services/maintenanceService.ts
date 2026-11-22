@@ -18,8 +18,8 @@ export interface MaintenanceRunSummary {
 }
 
 /**
- * Idempotent scheduled maintenance runner invoked by Vercel Cron, Upstash QStash,
- * or manually by a super_admin from the System Settings page.
+ * Idempotent scheduled maintenance runner invoked by Cloudflare Workers Cron Triggers,
+ * Upstash QStash, or manually by a super_admin from the System Settings page.
  */
 export async function runScheduledMaintenance(nowOverride?: Date): Promise<MaintenanceRunSummary> {
   const now = nowOverride ?? new Date();
