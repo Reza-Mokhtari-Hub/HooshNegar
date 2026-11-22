@@ -40,7 +40,23 @@ export function createApiApp(): Express {
   );
   app.use('/api', apiRateLimitMiddleware);
 
-  // Ensure DB migrations & bootstrap have completed before serving any API route
+  // Public health & runtime readiness check (no secrets exposed)
+  app.get('/api/health', (_req: Request, res: Response) => {
+    const env = getEnvValidationSummary();
+    res.json({
+      status: 'ok',
+      phase: 3,
+      runtime: env.isCloudflare ? 'cloudflare_workers' : 'nodejs',
+      databaseMode: env.databaseMode,
+      encryptionConfigured: env.encryptionConfigured,
+      qstashConfigured: env.qstashConfigured,
+      r2Configured: env.r2Configured,
+      aiMockMode: env.aiMockMode,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // Ensure DB migrations & bootstrap have completed before serving DB-backed API routes
   app.use('/api', async (_req: Request, res: Response, next: NextFunction) => {
     try {
       await ensurePlatformReady();
@@ -52,21 +68,6 @@ export function createApiApp(): Express {
         code: 'DB_UNAVAILABLE',
       });
     }
-  });
-
-  // Public health check (no secrets exposed)
-  app.get('/api/health', (_req: Request, res: Response) => {
-    const env = getEnvValidationSummary();
-    res.json({
-      status: 'ok',
-      phase: 3,
-      databaseMode: env.databaseMode,
-      encryptionConfigured: env.encryptionConfigured,
-      qstashConfigured: env.qstashConfigured,
-      r2Configured: env.r2Configured,
-      aiMockMode: env.aiMockMode,
-      timestamp: new Date().toISOString(),
-    });
   });
 
   // External signed webhook, Cron & QStash worker routes (cryptographically authenticated, not admin-session)
