@@ -36,6 +36,8 @@ import { DICTIONARIES, type Locale, type NavSectionId } from './i18n';
 import { AuthView, type AdminUserSummary } from './components/AuthView';
 import type { ClientRuntimeDiagnostics } from './components/RuntimeDiagnosticsCard';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { TelegramMiniApp } from './miniapp/TelegramMiniApp';
+import { isMiniAppEntryRoute } from './miniapp/telegramSdk';
 import { Button } from './components/ui/primitives';
 import { DashboardSection } from './components/sections/DashboardSection';
 import { ProvidersSection } from './components/sections/ProvidersSection';
@@ -98,6 +100,7 @@ const NAV_ITEMS: NavItem[] = [
 ];
 
 export default function App() {
+  const [isMiniApp] = useState(() => isMiniAppEntryRoute());
   const [locale, setLocale] = useState<Locale>('fa');
   const [dark, setDark] = useState(false);
   const [appNameOverride, setAppNameOverride] = useState<string | null>(null);
@@ -189,13 +192,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isMiniApp) {
+      return;
+    }
     setUnauthorizedHandler(() => {
       setAdmin(null);
       setCsrfToken(null);
     });
     void checkAuth();
     return () => setUnauthorizedHandler(null);
-  }, [checkAuth]);
+  }, [checkAuth, isMiniApp]);
+
+  if (isMiniApp) {
+    return (
+      <ErrorBoundary>
+        <TelegramMiniApp />
+      </ErrorBoundary>
+    );
+  }
 
   const handleLogout = async () => {
     try {

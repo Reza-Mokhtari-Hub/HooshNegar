@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities, providerCredentials } from '../../db/schema.ts';
 import type { CapabilityType } from '../../shared/validation.ts';
@@ -7,11 +7,20 @@ import { isAiMockModeEnabled } from '../config/env.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { assertSafeOutboundUrl, SsrfProtectionError } from '../security/ssrf.ts';
 import {
+  extractHuggingFaceRepoFromUrl,
+  normalizeBaseUrl,
+  normalizeGeminiModelId,
+  normalizeGeminiRootBaseUrl,
+  normalizeOpenAiRootBaseUrl,
+  resolveHfSpaceRootUrl,
+} from './discovery.ts';
+import {
   AIProviderError,
   estimateTokenCostUsd,
   estimateTokensRough,
   type AudioTranscriptionInput,
   type AudioTranscriptionOutput,
+  type CredentialFailureKind,
   type DocumentAnalysisInput,
   type ImageEditInput,
   type ImageGenerationInput,
@@ -38,10 +47,6 @@ import {
   runMockVisionAnalysis,
 } from './mockAdapter.ts';
 
-function normalizeBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/, '');
-}
-
 function mergeHeaders(
   base: Record<string, string>,
   extra?: Record<string, string>,
@@ -58,17 +63,44 @@ function mergeHeaders(
   return out;
 }
 
+function isQuotaExhaustedSignal(text: string): boolean {
+  return /insufficient_quota|quota[_\s-]?exceeded|exceeded your current quota|resource_exhausted|credit balance is too low|billing|payment required|zerogpu.*quota|daily.*limit/i.test(
+    text,
+  );
+}
+
+function isInvalidKeySignal(text: string): boolean {
+  return /api_key_invalid|invalid[_\s-]?api[_\s-]?key|incorrect api key|invalid token|unauthorized|authentication failed|permission_denied/i.test(
+    text,
+  );
+}
+
 function classifyHttpError(status: number, bodyText: string, apiKey: string): AIProviderError {
-  const safeMsg = redactSecrets(bodyText.slice(0, 300), [apiKey]);
-  if (status === 401 || status === 403) {
+  const secrets = apiKey ? [apiKey] : [];
+  const safeMsg = redactSecrets(bodyText.slice(0, 300), secrets);
+
+  if (status === 402 || (status === 429 && isQuotaExhaustedSignal(bodyText))) {
+    return new AIProviderError({
+      code: 'RATE_LIMITED',
+      message: `Provider quota exhausted (${status}): ${safeMsg}`,
+      userMessageFa: 'سهمیه کلید API این ارائه‌دهنده به پایان رسیده است.',
+      retryable: true,
+      httpStatus: status,
+      credentialFailureKind: 'quota_exhausted',
+    });
+  }
+
+  if (status === 401 || status === 403 || isInvalidKeySignal(bodyText)) {
     return new AIProviderError({
       code: 'INVALID_API_KEY',
       message: `Provider auth failed (${status}): ${safeMsg}`,
       userMessageFa: 'کلید API ارائه‌دهنده نامعتبر یا منقضی است. لطفاً به پشتیبانی اطلاع دهید.',
       retryable: false,
       httpStatus: status,
+      credentialFailureKind: 'invalid',
     });
   }
+
   if (status === 429) {
     return new AIProviderError({
       code: 'RATE_LIMITED',
@@ -76,50 +108,121 @@ function classifyHttpError(status: number, bodyText: string, apiKey: string): AI
       userMessageFa: 'سرویس هوش مصنوعی موقتاً شلوغ است (محدودیت نرخ). لطفاً لحظاتی بعد دوباره تلاش کنید.',
       retryable: true,
       httpStatus: 429,
+      credentialFailureKind: 'rate_limited',
     });
   }
+
   if (status === 400 || status === 422) {
+    if (isQuotaExhaustedSignal(bodyText)) {
+      return new AIProviderError({
+        code: 'RATE_LIMITED',
+        message: `Provider quota exhausted (${status}): ${safeMsg}`,
+        userMessageFa: 'سهمیه کلید API این ارائه‌دهنده به پایان رسیده است.',
+        retryable: true,
+        httpStatus: status,
+        credentialFailureKind: 'quota_exhausted',
+      });
+    }
     return new AIProviderError({
       code: 'INVALID_PROMPT',
       message: `Provider rejected input (${status}): ${safeMsg}`,
       userMessageFa: 'درخواست یا ورودی ارسال‌شده توسط مدل هوش مصنوعی پذیرفته نشد. لطفاً متن یا فایل را اصلاح کنید.',
       retryable: false,
       httpStatus: status,
+      credentialFailureKind: 'prompt_error',
     });
   }
+
   return new AIProviderError({
     code: 'PROVIDER_ERROR',
     message: `Provider HTTP ${status}: ${safeMsg}`,
     userMessageFa: 'خطایی از سمت سرویس هوش مصنوعی رخ داد. اعتبار شما کسر نشد.',
     retryable: status >= 500 || status === 408,
     httpStatus: status,
+    credentialFailureKind: 'transient',
   });
 }
 
 function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
   if (err instanceof AIProviderError) return err;
+  const secrets = apiKey ? [apiKey] : [];
   if (err instanceof SsrfProtectionError) {
     return new AIProviderError({
       code: 'SSRF_BLOCKED',
       message: err.message,
       userMessageFa: 'آدرس ارائه‌دهنده به دلیل قوانین امنیتی مسدود شده است.',
       retryable: false,
+      credentialFailureKind: 'prompt_error',
     });
   }
-  const msg = redactSecrets(err instanceof Error ? err.message : 'Network error', [apiKey]);
+
+  const rawMsg = err instanceof Error ? err.message : String(err ?? 'Network error');
+  const msg = redactSecrets(rawMsg, secrets);
+
+  // Inspect structured status from SDK errors (e.g. @google/genai ApiError)
+  const errRecord = (typeof err === 'object' && err !== null ? err : {}) as {
+    status?: unknown;
+    statusCode?: unknown;
+  };
+  const numericStatus =
+    typeof errRecord.status === 'number'
+      ? errRecord.status
+      : typeof errRecord.statusCode === 'number'
+        ? errRecord.statusCode
+        : null;
+
+  if (numericStatus && numericStatus >= 400) {
+    return classifyHttpError(numericStatus, rawMsg, apiKey);
+  }
+
+  if (isInvalidKeySignal(rawMsg)) {
+    return new AIProviderError({
+      code: 'INVALID_API_KEY',
+      message: msg,
+      userMessageFa: 'کلید API ارائه‌دهنده نامعتبر یا منقضی است.',
+      retryable: false,
+      credentialFailureKind: 'invalid',
+    });
+  }
+
+  if (isQuotaExhaustedSignal(rawMsg)) {
+    return new AIProviderError({
+      code: 'RATE_LIMITED',
+      message: msg,
+      userMessageFa: 'سهمیه کلید API این ارائه‌دهنده به پایان رسیده است.',
+      retryable: true,
+      httpStatus: 429,
+      credentialFailureKind: 'quota_exhausted',
+    });
+  }
+
+  if (/\b429\b|too many requests|rate[_\s-]?limit/i.test(rawMsg)) {
+    return new AIProviderError({
+      code: 'RATE_LIMITED',
+      message: msg,
+      userMessageFa: 'سرویس هوش مصنوعی موقتاً شلوغ است (محدودیت نرخ).',
+      retryable: true,
+      httpStatus: 429,
+      credentialFailureKind: 'rate_limited',
+    });
+  }
+
   if (err instanceof Error && err.name === 'AbortError') {
     return new AIProviderError({
       code: 'TIMEOUT',
       message: `Request aborted or timed out: ${msg}`,
       userMessageFa: 'زمان پاسخ‌گویی مدل هوش مصنوعی به پایان رسید یا عملیات متوقف شد.',
       retryable: true,
+      credentialFailureKind: 'transient',
     });
   }
+
   return new AIProviderError({
     code: 'NETWORK_ERROR',
     message: msg,
     userMessageFa: 'خطای شبکه در ارتباط با سرویس هوش مصنوعی رخ داد. اعتبار شما بازگردانده شد.',
     retryable: true,
+    credentialFailureKind: 'transient',
   });
 }
 
@@ -130,6 +233,7 @@ function assertCapabilitySupported(ctx: ProviderExecutionContext, required: Capa
       message: `Model ${ctx.modelIdentifier} does not have capability ${required} enabled.`,
       userMessageFa: 'مدل انتخاب‌شده از این قابلیت پشتیبانی نمی‌کند. لطفاً مدل دیگری از منوی مدل‌ها انتخاب کنید.',
       retryable: false,
+      credentialFailureKind: 'prompt_error',
     });
   }
 }
@@ -155,17 +259,18 @@ async function fetchWithTimeout(
 }
 
 function createGeminiClient(ctx: ProviderExecutionContext): GoogleGenAI {
+  const normalizedBase = ctx.baseUrl ? normalizeGeminiRootBaseUrl(ctx.baseUrl) : undefined;
   return new GoogleGenAI({
     apiKey: ctx.apiKey,
     httpOptions: {
-      baseUrl: ctx.baseUrl ? normalizeBaseUrl(ctx.baseUrl) : undefined,
+      baseUrl: normalizedBase,
       headers: mergeHeaders({ 'User-Agent': 'aistudio-build' }, ctx.additionalHeaders),
     },
   });
 }
 
 // =============================================================================
-// LOAD MODEL + PROVIDER + DECRYPTED CREDENTIAL (WITH FALLBACK)
+// LOAD MODEL + PROVIDER + MULTI-KEY CREDENTIAL POOL (WITH AUTO-SWITCHING)
 // =============================================================================
 
 export interface LoadedModelRoute {
@@ -194,27 +299,33 @@ async function loadProviderContextForId(params: {
 
   if (!provider) return null;
 
-  const [cred] = await db
+  const creds = await db
     .select()
     .from(providerCredentials)
     .where(and(eq(providerCredentials.providerId, provider.id), eq(providerCredentials.isActive, true)))
-    .orderBy(desc(providerCredentials.keyVersion))
-    .limit(1);
+    .orderBy(asc(providerCredentials.priority), asc(providerCredentials.failureCount), desc(providerCredentials.keyVersion));
 
-  if (!cred) return null;
-
-  const apiKey = decryptSecret({
-    ciphertext: cred.encryptedApiKey,
-    iv: cred.iv,
-    authTag: cred.authTag,
+  const nowMs = Date.now();
+  const usableCreds = creds.filter((c) => {
+    if (c.status === 'invalid' || c.status === 'disabled') return false;
+    if (c.cooldownUntil && new Date(c.cooldownUntil).getTime() > nowMs) return false;
+    return true;
   });
 
-  return {
+  // Order healthy 'active' keys ahead of cooled-down/expired-cooldown keys
+  usableCreds.sort((a, b) => {
+    const aHealthy = a.status === 'active' ? 0 : 1;
+    const bHealthy = b.status === 'active' ? 0 : 1;
+    if (aHealthy !== bHealthy) return aHealthy - bHealthy;
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return b.keyVersion - a.keyVersion;
+  });
+
+  const baseMeta = {
     providerId: provider.id,
     providerName: provider.name,
     providerType: provider.providerType,
     baseUrl: provider.baseUrl,
-    apiKey,
     organizationId: provider.organizationId,
     additionalHeaders: provider.additionalHeaders ?? {},
     modelId: params.modelId,
@@ -227,6 +338,33 @@ async function loadProviderContextForId(params: {
     maxInputSize: params.maxInputSize,
     maxOutputSize: params.maxOutputSize,
   };
+
+  if (usableCreds.length === 0) {
+    // Public Hugging Face Spaces can operate without an API token if no credentials were attached
+    if (provider.providerType === 'huggingface_space' && creds.length === 0) {
+      const anonCtx: ProviderExecutionContext = {
+        ...baseMeta,
+        apiKey: '',
+        credentialId: null,
+      };
+      anonCtx.credentialPool = [anonCtx];
+      return anonCtx;
+    }
+    return null;
+  }
+
+  const contexts: ProviderExecutionContext[] = usableCreds.map((c) => ({
+    ...baseMeta,
+    credentialId: c.id,
+    apiKey: decryptSecret({
+      ciphertext: c.encryptedApiKey,
+      iv: c.iv,
+      authTag: c.authTag,
+    }),
+  }));
+
+  const primary = { ...contexts[0]!, credentialPool: contexts };
+  return primary;
 }
 
 export interface FailoverSafetyOptions {
@@ -373,21 +511,366 @@ export async function loadModelExecutionRoute(
   return { primary, fallback };
 }
 
+async function markCredentialSuccess(credentialId?: string | null): Promise<void> {
+  if (!credentialId) return;
+  try {
+    const db = getDb();
+    const now = new Date();
+    await db
+      .update(providerCredentials)
+      .set({
+        status: 'active',
+        cooldownUntil: null,
+        failureCount: 0,
+        lastUsedAt: now,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        updatedAt: now,
+      })
+      .where(eq(providerCredentials.id, credentialId));
+  } catch {
+    // Non-fatal in case a synthetic route without DB credential is tested
+  }
+}
+
+async function markCredentialFailure(credentialId: string | null | undefined, err: AIProviderError): Promise<void> {
+  if (!credentialId) return;
+  try {
+    const db = getDb();
+    const now = new Date();
+    const kind: CredentialFailureKind =
+      err.credentialFailureKind ??
+      (err.code === 'INVALID_API_KEY'
+        ? 'invalid'
+        : err.code === 'RATE_LIMITED'
+          ? 'rate_limited'
+          : 'transient');
+
+    let nextStatus = 'active';
+    let cooldownUntil: Date | null = null;
+    if (kind === 'invalid') {
+      nextStatus = 'invalid';
+    } else if (kind === 'quota_exhausted') {
+      nextStatus = 'quota_exhausted';
+      cooldownUntil = new Date(Date.now() + 6 * 60 * 60 * 1000); // 6 hours
+    } else if (kind === 'rate_limited') {
+      nextStatus = 'rate_limited';
+      cooldownUntil = new Date(Date.now() + 90 * 1000); // 90 seconds
+    }
+
+    await db
+      .update(providerCredentials)
+      .set({
+        status: nextStatus,
+        cooldownUntil,
+        failureCount: sql`${providerCredentials.failureCount} + 1`,
+        lastUsedAt: now,
+        lastErrorCode: err.code,
+        lastErrorMessage: err.message.slice(0, 500),
+        updatedAt: now,
+      })
+      .where(eq(providerCredentials.id, credentialId));
+  } catch {
+    // Non-fatal
+  }
+}
+
+async function tryExecutionPool<T>(
+  baseCtx: ProviderExecutionContext,
+  executor: (ctx: ProviderExecutionContext) => Promise<T>,
+): Promise<T> {
+  const pool = baseCtx.credentialPool && baseCtx.credentialPool.length > 0 ? baseCtx.credentialPool : [baseCtx];
+  let lastError: AIProviderError | null = null;
+
+  for (const candidate of pool) {
+    try {
+      const result = await executor(candidate);
+      await markCredentialSuccess(candidate.credentialId);
+      return result;
+    } catch (err) {
+      const aiErr = wrapNetworkError(err, candidate.apiKey);
+      lastError = aiErr;
+      // Never rotate API keys for user input validation, cancelation, or missing capabilities
+      if (
+        aiErr.code === 'CANCELED' ||
+        aiErr.code === 'UNSUPPORTED_CAPABILITY' ||
+        aiErr.code === 'SSRF_BLOCKED' ||
+        aiErr.credentialFailureKind === 'prompt_error'
+      ) {
+        throw aiErr;
+      }
+      await markCredentialFailure(candidate.credentialId, aiErr);
+    }
+  }
+
+  throw (
+    lastError ??
+    new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: 'All active credentials for provider failed.',
+      userMessageFa: 'همه کلیدهای فعال این ارائه‌دهنده با خطا مواجه شدند یا سهمیه آن‌ها تمام شده است.',
+    })
+  );
+}
+
 async function runWithFailover<T>(
   route: LoadedModelRoute,
   executor: (ctx: ProviderExecutionContext) => Promise<T>,
 ): Promise<{ result: T; usedFallback: boolean; providerId: string }> {
   try {
-    const result = await executor(route.primary);
+    const result = await tryExecutionPool(route.primary, executor);
     return { result, usedFallback: false, providerId: route.primary.providerId };
   } catch (err) {
     const aiErr = wrapNetworkError(err, route.primary.apiKey);
-    if (route.fallback && (aiErr.retryable || aiErr.code === 'PROVIDER_ERROR' || aiErr.code === 'RATE_LIMITED')) {
-      const result = await executor(route.fallback);
+    if (
+      aiErr.code === 'CANCELED' ||
+      aiErr.code === 'UNSUPPORTED_CAPABILITY' ||
+      aiErr.code === 'SSRF_BLOCKED' ||
+      aiErr.credentialFailureKind === 'prompt_error'
+    ) {
+      throw aiErr;
+    }
+    if (
+      route.fallback &&
+      (aiErr.retryable ||
+        aiErr.code === 'INVALID_API_KEY' ||
+        aiErr.code === 'PROVIDER_ERROR' ||
+        aiErr.code === 'RATE_LIMITED')
+    ) {
+      const result = await tryExecutionPool(route.fallback, executor);
       return { result, usedFallback: true, providerId: route.fallback.providerId };
     }
     throw aiErr;
   }
+}
+
+// =============================================================================
+// HUGGING FACE GRADIO SPACE EXECUTION HELPER
+// =============================================================================
+
+function extractGradioOutputText(val: unknown): string {
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val)) {
+    const last = val[val.length - 1];
+    if (Array.isArray(last)) {
+      return last.map((x) => (typeof x === 'string' ? x : '')).filter(Boolean).join('\n');
+    }
+    return val.map(extractGradioOutputText).filter(Boolean).join('\n');
+  }
+  if (val && typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    if (typeof obj.value === 'string') return obj.value;
+    if (typeof obj.text === 'string') return obj.text;
+    if (typeof obj.content === 'string') return obj.content;
+  }
+  return '';
+}
+
+function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
+  const resolvePath = (p: string): string => {
+    if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
+    const cleanHost = normalizeBaseUrl(spaceHost);
+    if (p.startsWith('/')) return `${cleanHost}/gradio_api/file=${p}`;
+    return `${cleanHost}/gradio_api/file=${p}`;
+  };
+  if (typeof val === 'string' && (val.startsWith('http') || val.startsWith('data:') || val.includes('/'))) {
+    return resolvePath(val);
+  }
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const found = extractGradioMediaUrl(item, spaceHost);
+      if (found) return found;
+    }
+  }
+  if (val && typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    if (typeof obj.url === 'string') return resolvePath(obj.url);
+    if (typeof obj.path === 'string') return resolvePath(obj.path);
+    if (obj.image) return extractGradioMediaUrl(obj.image, spaceHost);
+    if (obj.value) return extractGradioMediaUrl(obj.value, spaceHost);
+  }
+  return null;
+}
+
+function buildGradioInputPayload(
+  ctx: ProviderExecutionContext,
+  promptText: string,
+  systemPrompt?: string,
+  history?: Array<{ role: string; content: string }>,
+  mediaDataUri?: string,
+): unknown[] {
+  const paramSpecs = Array.isArray(ctx.modelParameters?.parameters)
+    ? (ctx.modelParameters.parameters as Array<{
+        index?: number;
+        name?: string;
+        component?: string;
+        hasDefault?: boolean;
+        defaultValue?: unknown;
+      }>)
+    : null;
+
+  if (!paramSpecs || paramSpecs.length === 0) {
+    return mediaDataUri ? [promptText, mediaDataUri] : [promptText];
+  }
+
+  let injectedPrompt = false;
+  let injectedMedia = false;
+
+  return paramSpecs.map((spec) => {
+    const comp = (spec.component ?? '').toLowerCase();
+    const pname = (spec.name ?? '').toLowerCase();
+
+    if (mediaDataUri && !injectedMedia && (comp.includes('image') || comp.includes('audio') || comp.includes('file'))) {
+      injectedMedia = true;
+      return { url: mediaDataUri, meta: { _type: 'gradio.FileData' } };
+    }
+    if (comp.includes('chatbot') || pname.includes('history')) {
+      return (history ?? []).map((h) => [h.role === 'user' ? h.content : null, h.role === 'assistant' ? h.content : null]);
+    }
+    if (pname.includes('system') && systemPrompt) {
+      return systemPrompt;
+    }
+    if (
+      !injectedPrompt &&
+      (comp.includes('textbox') || comp.includes('text') || pname.includes('prompt') || pname.includes('message') || pname.includes('input'))
+    ) {
+      injectedPrompt = true;
+      return promptText;
+    }
+    if (spec.hasDefault) {
+      return spec.defaultValue ?? null;
+    }
+    if (comp.includes('slider') || comp.includes('number')) return 1;
+    if (comp.includes('checkbox')) return false;
+    return '';
+  });
+}
+
+async function runGradioSpaceCall(
+  ctx: ProviderExecutionContext,
+  dataArgs: unknown[],
+  signal?: AbortSignal,
+): Promise<{ outputData: unknown[]; spaceHost: string }> {
+  const paramSpaceHost = typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost : '';
+  const resolved = paramSpaceHost
+    ? { resolvedRootUrl: normalizeBaseUrl(paramSpaceHost) }
+    : await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders);
+  const spaceHost = resolved.resolvedRootUrl;
+
+  const modelIdParts = ctx.modelIdentifier.split('::');
+  const apiName = (
+    typeof ctx.modelParameters?.apiName === 'string'
+      ? ctx.modelParameters.apiName
+      : modelIdParts[1] || 'predict'
+  ).replace(/^\/+/, '');
+
+  const prefix =
+    typeof ctx.modelParameters?.endpointPrefix === 'string'
+      ? ctx.modelParameters.endpointPrefix
+      : '/gradio_api';
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (ctx.apiKey.trim()) {
+    headers.Authorization = `Bearer ${ctx.apiKey.trim()}`;
+  }
+  const mergedHeaders = mergeHeaders(headers, ctx.additionalHeaders);
+
+  const candidates = [
+    `${spaceHost}${prefix}/call/${apiName}`,
+    `${spaceHost}/call/${apiName}`,
+  ];
+
+  let submitRes: Response | null = null;
+  let activeCallUrl = candidates[0]!;
+
+  for (const url of candidates) {
+    const res = await fetchWithTimeout(
+      url,
+      { method: 'POST', headers: mergedHeaders, body: JSON.stringify({ data: dataArgs }) },
+      30000,
+      signal,
+    );
+    if (res.status !== 404) {
+      submitRes = res;
+      activeCallUrl = url;
+      break;
+    }
+  }
+
+  // Fallback for legacy Gradio `/api/predict`
+  if (!submitRes) {
+    const legacyUrl = `${spaceHost}/api/predict`;
+    const legacyRes = await fetchWithTimeout(
+      legacyUrl,
+      { method: 'POST', headers: mergedHeaders, body: JSON.stringify({ data: dataArgs }) },
+      60000,
+      signal,
+    );
+    if (!legacyRes.ok) throw classifyHttpError(legacyRes.status, await legacyRes.text(), ctx.apiKey);
+    const json = (await legacyRes.json()) as { data?: unknown[] };
+    return { outputData: Array.isArray(json.data) ? json.data : [], spaceHost };
+  }
+
+  if (!submitRes.ok) {
+    throw classifyHttpError(submitRes.status, await submitRes.text(), ctx.apiKey);
+  }
+
+  const { event_id: eventId } = (await submitRes.json()) as { event_id?: string };
+  if (!eventId) {
+    throw new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: 'Hugging Face Space did not return an event_id.',
+      userMessageFa: 'پاسخی از صف پردازش Hugging Face Space دریافت نشد.',
+    });
+  }
+
+  const sseRes = await fetchWithTimeout(
+    `${activeCallUrl}/${encodeURIComponent(eventId)}`,
+    { method: 'GET', headers: mergedHeaders },
+    90000,
+    signal,
+  );
+  if (!sseRes.ok) {
+    throw classifyHttpError(sseRes.status, await sseRes.text(), ctx.apiKey);
+  }
+
+  const sseText = await sseRes.text();
+  const blocks = sseText.split(/\r?\n\r?\n/);
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    let eventName = '';
+    const dataLines: string[] = [];
+    for (const l of lines) {
+      if (l.startsWith('event:')) eventName = l.slice(6).trim();
+      if (l.startsWith('data:')) dataLines.push(l.slice(5).trim());
+    }
+    const payloadRaw = dataLines.join('\n');
+    if (eventName === 'error') {
+      const isQuota = isQuotaExhaustedSignal(payloadRaw);
+      throw new AIProviderError({
+        code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
+        message: `HF Space error: ${redactSecrets(payloadRaw, ctx.apiKey ? [ctx.apiKey] : [])}`,
+        userMessageFa: isQuota
+          ? 'سهمیه ZeroGPU توکن فعلی به پایان رسیده است.'
+          : 'اجرای پردازش در Hugging Face Space با خطا مواجه شد.',
+        retryable: true,
+        credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
+      });
+    }
+    if (eventName === 'complete' && payloadRaw) {
+      const parsed = JSON.parse(payloadRaw) as unknown;
+      return {
+        outputData: Array.isArray(parsed) ? parsed : [parsed],
+        spaceHost,
+      };
+    }
+  }
+
+  throw new AIProviderError({
+    code: 'PROVIDER_ERROR',
+    message: 'Hugging Face Space stream ended without complete event.',
+    userMessageFa: 'خروجی کاملی از Hugging Face Space دریافت نشد.',
+  });
 }
 
 // =============================================================================
@@ -405,6 +888,7 @@ async function executeTextOnProvider(
   try {
     if (ctx.providerType === 'google_gemini') {
       const ai = createGeminiClient(ctx);
+      const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
       const contents = input.messages
         .filter((m) => m.role !== 'system')
         .map((m) => {
@@ -424,7 +908,7 @@ async function executeTextOnProvider(
 
       if (input.onChunk) {
         const stream = await ai.models.generateContentStream({
-          model: ctx.modelIdentifier,
+          model: modelId,
           contents: contents as never,
           config: config as never,
         });
@@ -459,7 +943,7 @@ async function executeTextOnProvider(
       }
 
       const response = await ai.models.generateContent({
-        model: ctx.modelIdentifier,
+        model: modelId,
         contents: contents as never,
         config: config as never,
       });
@@ -590,9 +1074,24 @@ async function executeTextOnProvider(
       };
     }
 
-    if (ctx.providerType === 'openai_compatible' || ctx.providerType === 'custom') {
-      const base = normalizeBaseUrl(ctx.baseUrl);
-      const url = base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
+    if (
+      ctx.providerType === 'openai_compatible' ||
+      ctx.providerType === 'custom' ||
+      ctx.providerType === 'huggingface'
+    ) {
+      let url: string;
+      if (ctx.providerType === 'huggingface') {
+        const repoFromUrl = extractHuggingFaceRepoFromUrl(ctx.baseUrl);
+        if (repoFromUrl && ctx.baseUrl.includes('/hf-inference/models/')) {
+          url = `${normalizeBaseUrl(ctx.baseUrl)}/v1/chat/completions`;
+        } else {
+          const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '');
+          url = `${routerRoot}/v1/chat/completions`;
+        }
+      } else {
+        const base = normalizeOpenAiRootBaseUrl(ctx.baseUrl);
+        url = `${base}/chat/completions`;
+      }
       const formattedMessages: Array<Record<string, unknown>> = [];
       if (input.systemPrompt) {
         formattedMessages.push({ role: 'system', content: input.systemPrompt });
@@ -704,6 +1203,36 @@ async function executeTextOnProvider(
       };
     }
 
+    if (ctx.providerType === 'huggingface_space') {
+      const lastUser = [...input.messages].reverse().find((m) => m.role === 'user');
+      const promptText = lastUser?.content || input.messages.map((m) => m.content).join('\n');
+      const mediaDataUri =
+        lastUser?.imageBase64 && lastUser?.imageMimeType
+          ? `data:${lastUser.imageMimeType};base64,${lastUser.imageBase64}`
+          : undefined;
+
+      const args = buildGradioInputPayload(
+        ctx,
+        promptText,
+        input.systemPrompt,
+        input.messages.slice(0, -1),
+        mediaDataUri,
+      );
+      const { outputData } = await runGradioSpaceCall(ctx, args, input.signal);
+      const text = extractGradioOutputText(outputData).trim();
+      const inTok = estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
+      const outTok = estimateTokensRough(text);
+      if (input.onChunk && text) {
+        await input.onChunk(text);
+      }
+      return {
+        text: text || 'پاسخی از Hugging Face Space دریافت نشد.',
+        inputTokens: inTok,
+        outputTokens: outTok,
+        costUsd: 0,
+      };
+    }
+
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider type ${ctx.providerType} does not support text/chat completion.`,
@@ -765,8 +1294,25 @@ export async function analyzeVisionWithRoute(
 // 3. IMAGE GENERATION & IMAGE EDITING (STRICT CAPABILITY SEPARATION)
 // =============================================================================
 
-async function downloadBinarySafe(url: string, apiKey: string): Promise<{ buffer: Buffer; mimeType: string }> {
-  const res = await fetchWithTimeout(url, { method: 'GET' }, 45000);
+async function downloadBinarySafe(
+  url: string,
+  apiKey: string,
+  attachBearerAuth = false,
+): Promise<{ buffer: Buffer; mimeType: string }> {
+  if (url.startsWith('data:')) {
+    const match = /^data:([^;]+);base64,(.+)$/s.exec(url);
+    if (match?.[2]) {
+      return {
+        buffer: Buffer.from(match[2], 'base64'),
+        mimeType: match[1] || 'application/octet-stream',
+      };
+    }
+  }
+  const headers: Record<string, string> = {};
+  if (attachBearerAuth && apiKey.trim()) {
+    headers.Authorization = `Bearer ${apiKey.trim()}`;
+  }
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 45000);
   if (!res.ok) {
     throw classifyHttpError(res.status, await res.text(), apiKey);
   }
@@ -819,13 +1365,14 @@ async function executeImageGenOnProvider(
   try {
     if (ctx.providerType === 'google_gemini') {
       const ai = createGeminiClient(ctx);
+      const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
       const imageConfig: Record<string, unknown> = {};
       if (input.aspectRatio) imageConfig.aspectRatio = input.aspectRatio;
       if (input.resolution && ['1K', '2K', '4K'].includes(input.resolution.toUpperCase())) {
         imageConfig.imageSize = input.resolution.toUpperCase();
       }
       const response = await ai.models.generateContent({
-        model: ctx.modelIdentifier,
+        model: modelId,
         contents: { parts: [{ text: input.prompt }] } as never,
         config: Object.keys(imageConfig).length > 0 ? ({ imageConfig } as never) : undefined,
       });
@@ -852,7 +1399,7 @@ async function executeImageGenOnProvider(
     }
 
     if (ctx.providerType === 'openai_compatible' || ctx.providerType === 'custom') {
-      const url = `${normalizeBaseUrl(ctx.baseUrl)}/images/generations`;
+      const url = `${normalizeOpenAiRootBaseUrl(ctx.baseUrl)}/images/generations`;
       const sizeMap: Record<string, string> = {
         '1:1': '1024x1024',
         '16:9': '1536x1024',
@@ -1012,6 +1559,68 @@ async function executeImageGenOnProvider(
       return { images, costUsd: 0.03 * Math.max(1, images.length) };
     }
 
+    if (ctx.providerType === 'huggingface') {
+      const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '').replace(/\/hf-inference\/models\/.+$/i, '');
+      const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: mergeHeaders(
+            {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${ctx.apiKey}`,
+              Accept: 'image/png',
+            },
+            ctx.additionalHeaders,
+          ),
+          body: JSON.stringify({
+            inputs: input.prompt,
+            parameters: { ...(ctx.modelParameters ?? {}) },
+          }),
+        },
+        90000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
+      const buffer = Buffer.from(await res.arrayBuffer());
+      return {
+        images: [
+          {
+            buffer,
+            mimeType: contentType.startsWith('image/') ? contentType : 'image/png',
+            extension: contentType.includes('jpeg') ? 'jpg' : contentType.includes('webp') ? 'webp' : 'png',
+          },
+        ],
+        costUsd: 0.02,
+      };
+    }
+
+    if (ctx.providerType === 'huggingface_space') {
+      const args = buildGradioInputPayload(ctx, input.prompt);
+      const { outputData, spaceHost } = await runGradioSpaceCall(ctx, args, input.signal);
+      const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
+      if (!mediaUrl) {
+        throw new AIProviderError({
+          code: 'PROVIDER_ERROR',
+          message: 'Hugging Face Space returned no image output.',
+          userMessageFa: 'تصویری از خروجی Hugging Face Space دریافت نشد.',
+        });
+      }
+      const dl = await downloadBinarySafe(mediaUrl, ctx.apiKey, true);
+      return {
+        images: [
+          {
+            buffer: dl.buffer,
+            mimeType: dl.mimeType,
+            extension: dl.mimeType.includes('jpeg') ? 'jpg' : dl.mimeType.includes('webp') ? 'webp' : 'png',
+          },
+        ],
+        costUsd: 0,
+      };
+    }
+
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider ${ctx.providerType} does not support image generation.`,
@@ -1041,8 +1650,9 @@ async function executeImageEditOnProvider(
   try {
     if (ctx.providerType === 'google_gemini') {
       const ai = createGeminiClient(ctx);
+      const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
       const response = await ai.models.generateContent({
-        model: ctx.modelIdentifier,
+        model: modelId,
         contents: {
           parts: [
             {
@@ -1084,7 +1694,7 @@ async function executeImageEditOnProvider(
 
     if (ctx.providerType === 'openai_compatible' || ctx.providerType === 'custom') {
       const endpoint = input.mode === 'variation' ? '/images/variations' : '/images/edits';
-      const url = `${normalizeBaseUrl(ctx.baseUrl)}${endpoint}`;
+      const url = `${normalizeOpenAiRootBaseUrl(ctx.baseUrl)}${endpoint}`;
       const form = new FormData();
       form.append('model', ctx.modelIdentifier);
       if (input.mode === 'edit') {
@@ -1242,8 +1852,9 @@ async function executeTranscribeOnProvider(
   try {
     if (ctx.providerType === 'google_gemini') {
       const ai = createGeminiClient(ctx);
+      const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
       const response = await ai.models.generateContent({
-        model: ctx.modelIdentifier,
+        model: modelId,
         contents: {
           parts: [
             {
@@ -1268,7 +1879,7 @@ async function executeTranscribeOnProvider(
     }
 
     if (ctx.providerType === 'openai_compatible' || ctx.providerType === 'custom') {
-      const url = `${normalizeBaseUrl(ctx.baseUrl)}/audio/transcriptions`;
+      const url = `${normalizeOpenAiRootBaseUrl(ctx.baseUrl)}/audio/transcriptions`;
       const form = new FormData();
       form.append('model', ctx.modelIdentifier);
       if (input.language) form.append('language', input.language);
@@ -1290,6 +1901,38 @@ async function executeTranscribeOnProvider(
       if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
       const json = (await res.json()) as { text?: string };
       return { text: json.text?.trim() ?? '', language: input.language, costUsd: 0.005 };
+    }
+
+    if (ctx.providerType === 'huggingface') {
+      const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '').replace(/\/hf-inference\/models\/.+$/i, '');
+      const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: mergeHeaders(
+            { 'Content-Type': input.mimeType || 'audio/mpeg', Authorization: `Bearer ${ctx.apiKey}` },
+            ctx.additionalHeaders,
+          ),
+          body: new Uint8Array(input.audioBuffer),
+        },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      const json = (await res.json()) as { text?: string };
+      return { text: json.text?.trim() ?? '', language: input.language, costUsd: 0.003 };
+    }
+
+    if (ctx.providerType === 'huggingface_space') {
+      const dataUri = `data:${input.mimeType};base64,${input.audioBuffer.toString('base64')}`;
+      const args = buildGradioInputPayload(ctx, '', undefined, undefined, dataUri);
+      const { outputData } = await runGradioSpaceCall(ctx, args, input.signal);
+      return {
+        text: extractGradioOutputText(outputData).trim(),
+        language: input.language,
+        costUsd: 0,
+      };
     }
 
     throw new AIProviderError({
@@ -1321,9 +1964,10 @@ async function executeSpeechOnProvider(
   try {
     if (ctx.providerType === 'google_gemini') {
       const ai = createGeminiClient(ctx);
+      const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
       const voiceName = input.voice || 'Kore';
       const response = await ai.models.generateContent({
-        model: ctx.modelIdentifier,
+        model: modelId,
         contents: [{ role: 'user', parts: [{ text: input.text }] }] as never,
         config: {
           responseModalities: ['AUDIO'],
@@ -1351,7 +1995,7 @@ async function executeSpeechOnProvider(
     }
 
     if (ctx.providerType === 'openai_compatible' || ctx.providerType === 'custom') {
-      const url = `${normalizeBaseUrl(ctx.baseUrl)}/audio/speech`;
+      const url = `${normalizeOpenAiRootBaseUrl(ctx.baseUrl)}/audio/speech`;
       const res = await fetchWithTimeout(
         url,
         {
@@ -1377,6 +2021,54 @@ async function executeSpeechOnProvider(
         mimeType: 'audio/mpeg',
         extension: 'mp3',
         costUsd: 0.01,
+      };
+    }
+
+    if (ctx.providerType === 'huggingface') {
+      const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '').replace(/\/hf-inference\/models\/.+$/i, '');
+      const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: mergeHeaders(
+            { 'Content-Type': 'application/json', Authorization: `Bearer ${ctx.apiKey}` },
+            ctx.additionalHeaders,
+          ),
+          body: JSON.stringify({ inputs: input.text }),
+        },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'audio/flac';
+      const ext = contentType.includes('mpeg') ? 'mp3' : contentType.includes('wav') ? 'wav' : 'flac';
+      return {
+        audioBuffer: Buffer.from(await res.arrayBuffer()),
+        mimeType: contentType,
+        extension: ext,
+        costUsd: 0.004,
+      };
+    }
+
+    if (ctx.providerType === 'huggingface_space') {
+      const args = buildGradioInputPayload(ctx, input.text);
+      const { outputData, spaceHost } = await runGradioSpaceCall(ctx, args, input.signal);
+      const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
+      if (!mediaUrl) {
+        throw new AIProviderError({
+          code: 'PROVIDER_ERROR',
+          message: 'Hugging Face Space returned no audio output.',
+          userMessageFa: 'خروجی صوتی از Hugging Face Space دریافت نشد.',
+        });
+      }
+      const dl = await downloadBinarySafe(mediaUrl, ctx.apiKey, true);
+      const ext = dl.mimeType.includes('mpeg') ? 'mp3' : dl.mimeType.includes('ogg') ? 'ogg' : 'wav';
+      return {
+        audioBuffer: dl.buffer,
+        mimeType: dl.mimeType,
+        extension: ext,
+        costUsd: 0,
       };
     }
 
@@ -1488,10 +2180,11 @@ export async function startVideoGenerationWithRoute(
 
       if (ctx.providerType === 'google_gemini') {
         const ai = createGeminiClient(ctx);
+        const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
         const op = await (ai.models as unknown as {
           generateVideos?: (args: Record<string, unknown>) => Promise<{ name?: string; done?: boolean }>;
         }).generateVideos?.({
-          model: ctx.modelIdentifier,
+          model: modelId,
           prompt: input.prompt,
           config: {
             aspectRatio: input.aspectRatio ?? '16:9',
@@ -1633,7 +2326,7 @@ export async function pollVideoGenerationJob(
     }
 
     if (ctx.providerType === 'google_gemini') {
-      const url = `${normalizeBaseUrl(ctx.baseUrl)}/v1beta/${providerJobId}`;
+      const url = `${normalizeGeminiRootBaseUrl(ctx.baseUrl)}/v1beta/${providerJobId}`;
       const res = await fetchWithTimeout(
         url,
         {

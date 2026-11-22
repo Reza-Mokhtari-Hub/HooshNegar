@@ -10,6 +10,7 @@ import {
   type RawBodyRequest,
 } from './routes/telegramWebhookRoutes.ts';
 import { createTelegramAdminRouter } from './routes/telegramAdminRoutes.ts';
+import { createMiniAppRouter } from './routes/miniAppRoutes.ts';
 import { createMonitorRouter } from './routes/monitorRoutes.ts';
 import { createBillingRouter } from './routes/billingRoutes.ts';
 import { createFinanceRouter } from './routes/financeRoutes.ts';
@@ -140,6 +141,9 @@ export function createApiApp(): Express {
 
   // External signed webhook, Cron & QStash worker routes (cryptographically authenticated, not admin-session)
   app.use('/api', createTelegramWebhookRouter());
+
+  // Telegram Mini App API routes (authenticated via signed Telegram WebApp initData / Mini App token)
+  app.use('/api/miniapp', createMiniAppRouter());
 
   // Admin-authenticated API routes
   app.use('/api/auth', createAuthRouter());

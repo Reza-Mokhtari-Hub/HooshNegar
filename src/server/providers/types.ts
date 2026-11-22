@@ -13,11 +13,19 @@ export type AIErrorCode =
   | 'SSRF_BLOCKED'
   | 'CANCELED';
 
+export type CredentialFailureKind =
+  | 'quota_exhausted'
+  | 'rate_limited'
+  | 'invalid'
+  | 'transient'
+  | 'prompt_error';
+
 export class AIProviderError extends Error {
   readonly code: AIErrorCode;
   readonly retryable: boolean;
   readonly httpStatus: number | null;
   readonly userMessageFa: string;
+  readonly credentialFailureKind?: CredentialFailureKind;
 
   constructor(params: {
     code: AIErrorCode;
@@ -25,6 +33,7 @@ export class AIProviderError extends Error {
     userMessageFa: string;
     retryable?: boolean;
     httpStatus?: number | null;
+    credentialFailureKind?: CredentialFailureKind;
   }) {
     super(params.message);
     this.name = 'AIProviderError';
@@ -32,6 +41,7 @@ export class AIProviderError extends Error {
     this.userMessageFa = params.userMessageFa;
     this.retryable = params.retryable ?? false;
     this.httpStatus = params.httpStatus ?? null;
+    this.credentialFailureKind = params.credentialFailureKind;
   }
 }
 
@@ -41,6 +51,8 @@ export interface ProviderExecutionContext {
   providerType: ProviderType;
   baseUrl: string;
   apiKey: string;
+  credentialId?: string | null;
+  credentialPool?: ProviderExecutionContext[];
   organizationId?: string | null;
   additionalHeaders?: Record<string, string>;
   modelId: string;

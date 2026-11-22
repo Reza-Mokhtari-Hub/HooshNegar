@@ -6,9 +6,20 @@ export const PROVIDER_TYPES = [
   'anthropic',
   'replicate',
   'fal_ai',
+  'huggingface',
+  'huggingface_space',
   'custom',
 ] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
+
+export const CREDENTIAL_POOL_STATUSES = [
+  'active',
+  'rate_limited',
+  'quota_exhausted',
+  'invalid',
+  'disabled',
+] as const;
+export type CredentialPoolStatus = (typeof CREDENTIAL_POOL_STATUSES)[number];
 
 export const MODEL_CATEGORIES = [
   'llm',
@@ -96,16 +107,37 @@ export const safeUrlSchema = z
     message: 'آدرس باید با http:// یا https:// شروع شود',
   });
 
-export const providerCreateSchema = z.object({
-  name: z.string().trim().min(2, 'نام ارائه‌دهنده حداقل ۲ کاراکتر باشد').max(120),
-  providerType: z.enum(PROVIDER_TYPES),
-  baseUrl: safeUrlSchema,
-  apiKey: z.string().trim().min(6, 'کلید API معتبر وارد کنید').max(512),
-  organizationId: z.string().trim().max(160).optional().or(z.literal('')),
-  additionalHeaders: z.record(z.string().min(1).max(100), z.string().max(1000)).optional().default({}),
-  isActive: z.boolean().optional().default(true),
-  priority: z.coerce.number().int().min(0).max(10000).optional().default(100),
-});
+export const providerCreateSchema = z
+  .object({
+    name: z.string().trim().min(2, 'نام ارائه‌دهنده حداقل ۲ کاراکتر باشد').max(120),
+    providerType: z.enum(PROVIDER_TYPES),
+    baseUrl: safeUrlSchema,
+    apiKey: z.string().trim().max(512).optional().default(''),
+    apiKeys: z.array(z.string().trim().min(6, 'هر کلید API باید حداقل ۶ کاراکتر باشد').max(512)).max(50).optional().default([]),
+    organizationId: z.string().trim().max(160).optional().or(z.literal('')),
+    additionalHeaders: z.record(z.string().min(1).max(100), z.string().max(1000)).optional().default({}),
+    isActive: z.boolean().optional().default(true),
+    priority: z.coerce.number().int().min(0).max(10000).optional().default(100),
+    autoSyncModels: z.boolean().optional().default(true),
+  })
+  .superRefine((data, ctx) => {
+    const primary = data.apiKey.trim();
+    const extra = data.apiKeys.map((k) => k.trim()).filter(Boolean);
+    if (primary.length > 0 && primary.length < 6) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['apiKey'],
+        message: 'کلید API معتبر وارد کنید (حداقل ۶ کاراکتر)',
+      });
+    }
+    if (data.providerType !== 'huggingface_space' && primary.length < 6 && extra.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['apiKey'],
+        message: 'حداقل یک کلید API معتبر وارد کنید',
+      });
+    }
+  });
 
 export const providerUpdateSchema = z.object({
   name: z.string().trim().min(2).max(120).optional(),
@@ -120,6 +152,45 @@ export const providerUpdateSchema = z.object({
 export const providerRotateKeySchema = z.object({
   apiKey: z.string().trim().min(6, 'کلید جدید معتبر وارد کنید').max(512),
   label: z.string().trim().min(1).max(120).optional().default('primary'),
+});
+
+export const providerCredentialCreateSchema = z
+  .object({
+    apiKey: z.string().trim().max(512).optional().default(''),
+    apiKeys: z.array(z.string().trim().min(6, 'هر کلید API باید حداقل ۶ کاراکتر باشد').max(512)).max(50).optional().default([]),
+    label: z.string().trim().min(1).max(120).optional().default('backup'),
+    priority: z.coerce.number().int().min(0).max(10000).optional().default(100),
+  })
+  .superRefine((data, ctx) => {
+    const single = data.apiKey.trim();
+    const batch = data.apiKeys.map((k) => k.trim()).filter(Boolean);
+    if (single.length > 0 && single.length < 6) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['apiKey'],
+        message: 'کلید API معتبر وارد کنید (حداقل ۶ کاراکتر)',
+      });
+    }
+    if (single.length < 6 && batch.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['apiKey'],
+        message: 'حداقل یک کلید API معتبر وارد کنید',
+      });
+    }
+  });
+
+export const providerCredentialUpdateSchema = z.object({
+  label: z.string().trim().min(1).max(120).optional(),
+  priority: z.coerce.number().int().min(0).max(10000).optional(),
+  isActive: z.boolean().optional(),
+  resetStatus: z.boolean().optional(),
+});
+
+export const providerSyncModelsSchema = z.object({
+  discoverOnly: z.boolean().optional().default(false),
+  defaultCreditCost: z.coerce.number().min(0).max(10000).optional(),
+  activateAll: z.boolean().optional().default(true),
 });
 
 export const modelCreateSchema = z.object({

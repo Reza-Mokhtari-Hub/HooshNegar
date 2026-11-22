@@ -96,4 +96,54 @@ describe('Shared Zod Validation Schemas', () => {
       }).success,
     ).toBe(true);
   });
+
+  it('supports Hugging Face Spaces without API key and multi-key failover arrays', async () => {
+    const { providerCredentialCreateSchema } = await import('./validation.ts');
+
+    // Public HF Space allowed with empty apiKey
+    expect(
+      providerCreateSchema.safeParse({
+        name: 'HF Public Space',
+        providerType: 'huggingface_space',
+        baseUrl: 'https://huggingface.co/spaces/black-forest-labs/FLUX.1-schnell',
+        apiKey: '',
+      }).success,
+    ).toBe(true);
+
+    // Non-HF Space without any key must fail
+    expect(
+      providerCreateSchema.safeParse({
+        name: 'Gemini Empty',
+        providerType: 'google_gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        apiKey: '',
+      }).success,
+    ).toBe(false);
+
+    // Non-HF provider can be created via apiKeys array even if primary apiKey is omitted
+    expect(
+      providerCreateSchema.safeParse({
+        name: 'HF Router Pool',
+        providerType: 'huggingface',
+        baseUrl: 'https://router.huggingface.co',
+        apiKeys: ['hf_key_one_123456', 'hf_key_two_654321'],
+      }).success,
+    ).toBe(true);
+
+    // Pool append schema requires at least one valid key
+    expect(
+      providerCredentialCreateSchema.safeParse({
+        apiKeys: ['AIzaKeyOne123456', 'AIzaKeyTwo654321'],
+        label: 'backup',
+        priority: 105,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      providerCredentialCreateSchema.safeParse({
+        apiKey: '',
+        apiKeys: [],
+      }).success,
+    ).toBe(false);
+  });
 });

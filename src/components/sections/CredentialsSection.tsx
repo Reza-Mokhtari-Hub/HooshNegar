@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, ShieldAlert } from 'lucide-react';
+import { RefreshCw, RotateCcw, ShieldAlert } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
-import { DICTIONARIES, formatDateTime, type Locale } from '../../i18n';
-import type { ProviderType } from '../../shared/validation';
+import { DICTIONARIES, formatDateTime, formatNumber, type Locale } from '../../i18n';
+import type { CredentialPoolStatus, ProviderType } from '../../shared/validation';
 import { Button, EmptyState, StatusText, Surface, TableSkeleton } from '../ui/primitives';
 
 interface CredentialItem {
@@ -13,6 +13,13 @@ interface CredentialItem {
   label: string;
   keyVersion: number;
   maskedPreview: string;
+  priority: number;
+  status: CredentialPoolStatus | string;
+  cooldownUntil: string | null;
+  failureCount: number;
+  lastUsedAt: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
   isActive: boolean;
   rotatedAt: string | null;
   revokedAt: string | null;
@@ -27,6 +34,25 @@ interface TelegramCredentialSummary {
   maskedWebhookSecret: string | null;
   encryptionAlgorithm: string;
   updatedAt: string;
+}
+
+function getPoolStatusDisplay(
+  c: CredentialItem,
+  locale: Locale,
+): { label: string; tone: 'success' | 'warning' | 'danger' | 'neutral' } {
+  if (!c.isActive || c.status === 'disabled') {
+    return { label: locale === 'fa' ? 'باطل‌شده' : 'Revoked', tone: 'neutral' };
+  }
+  if (c.status === 'invalid') {
+    return { label: locale === 'fa' ? 'نامعتبر (۴۰۱/۴۰۳)' : 'Invalid Key', tone: 'danger' };
+  }
+  if (c.status === 'quota_exhausted') {
+    return { label: locale === 'fa' ? 'سهمیه تمام‌شده' : 'Quota Exhausted', tone: 'danger' };
+  }
+  if (c.status === 'rate_limited') {
+    return { label: locale === 'fa' ? 'محدودیت نرخ موقت' : 'Rate Limited', tone: 'warning' };
+  }
+  return { label: locale === 'fa' ? 'سالم و فعال' : 'Active / Healthy', tone: 'success' };
 }
 
 export function CredentialsSection({ locale }: { locale: Locale }) {
@@ -66,6 +92,23 @@ export function CredentialsSection({ locale }: { locale: Locale }) {
     }
   };
 
+  const handleResetStatus = async (id: string) => {
+    try {
+      await apiRequest(`/api/credentials/${id}`, {
+        method: 'PATCH',
+        body: { resetStatus: true, isActive: true },
+      });
+      setFeedback(
+        locale === 'fa'
+          ? 'وضعیت کلید بازنشانی شد و دوباره در چرخه فعال قرار گرفت.'
+          : 'Credential status reset to active.',
+      );
+      await load();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'خطا در بازنشانی وضعیت کلید');
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -73,8 +116,8 @@ export function CredentialsSection({ locale }: { locale: Locale }) {
           <h1 className="text-xl font-bold text-slate-900 dark:text-slate-100">{t.nav.credentials}</h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
             {locale === 'fa'
-              ? 'خزانه متمرکز کلیدهای رمزنگاری‌شده با AES-256-GCM. هیچ کلید خام یا متن رمزنگاری‌شده هرگز به مرورگر ارسال نمی‌شود.'
-              : 'Centralized AES-256-GCM credential vault. Raw and encrypted key material never leaves the server.'}
+              ? 'خزانه متمرکز کلیدهای رمزنگاری‌شده با AES-256-GCM و پایش سلامت استخر Failover.'
+              : 'Centralized AES-256-GCM credential vault and failover pool health monitor.'}
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={load} disabled={loading}>
@@ -84,7 +127,10 @@ export function CredentialsSection({ locale }: { locale: Locale }) {
       </div>
 
       {feedback && (
-        <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs text-slate-700 dark:text-slate-200">
+        <div
+          role="status"
+          className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs text-slate-700 dark:text-slate-200"
+        >
           {feedback}
         </div>
       )}
@@ -125,11 +171,11 @@ export function CredentialsSection({ locale }: { locale: Locale }) {
         </div>
       </Surface>
 
-      {/* Provider Credentials History & Rotation Table */}
+      {/* Provider Credentials Pool & Health Table */}
       <Surface className="overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-800">
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-            {locale === 'fa' ? 'کلیدهای ارائه‌دهندگان هوش مصنوعی' : 'AI Provider API Credentials'}
+            {locale === 'fa' ? 'استخر کلیدهای ارائه‌دهندگان هوش مصنوعی' : 'AI Provider API Credential Pool'}
           </h2>
         </div>
 
@@ -140,7 +186,7 @@ export function CredentialsSection({ locale }: { locale: Locale }) {
             title={locale === 'fa' ? 'هنوز کلید API ذخیره نشده است' : 'No credentials stored yet'}
             description={
               locale === 'fa'
-                ? 'با افزودن ارائه‌دهنده در بخش «ارائه‌دهندگان هوش مصنوعی»، نسخه‌های رمزنگاری‌شده کلیدها در این خزانه ثبت می‌شوند.'
+                ? 'با افزودن ارائه‌دهنده در بخش «ارائه‌دهندگان هوش مصنوعی»، کلیدهای رمزنگاری‌شده در این خزانه ثبت می‌شوند.'
                 : 'Encrypted key versions appear here once you register AI providers.'
             }
           />
@@ -149,64 +195,86 @@ export function CredentialsSection({ locale }: { locale: Locale }) {
             <table className="w-full text-start border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 text-[11px] font-semibold text-slate-500 dark:text-slate-400">
-                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'ارائه‌دهنده' : 'Provider'}</th>
+                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'ارائه‌دهنده / برچسب' : 'Provider / Label'}</th>
                   <th className="py-3 px-4 text-start">{locale === 'fa' ? 'پیش‌نمایش ماسک‌شده' : 'Masked Preview'}</th>
-                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'نسخه / الگوریتم' : 'Version / Cipher'}</th>
-                  <th className="py-3 px-4 text-start">{t.common.status}</th>
-                  <th className="py-3 px-4 text-start">{t.common.createdAt}</th>
+                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'اولویت / نسخه' : 'Priority / Version'}</th>
+                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'وضعیت استخر و خطا' : 'Pool Health'}</th>
+                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'آخرین استفاده' : 'Last Used'}</th>
                   <th className="py-3 px-4 text-end">{t.common.actions}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
-                {creds.map((c) => (
-                  <tr key={c.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
-                    <td className="py-3.5 px-4">
-                      <div className="font-semibold text-slate-900 dark:text-slate-100">{c.providerName}</div>
-                      <div className="text-[11px] text-slate-500">{t.providerTypes[c.providerType]}</div>
-                    </td>
-                    <td className="py-3.5 px-4 font-mono">
-                      <span dir="ltr" className="inline-block">
-                        {c.maskedPreview}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-4 font-mono tabular-nums text-slate-600 dark:text-slate-400">
-                      <span dir="ltr" className="inline-block">
-                        v{c.keyVersion} · {c.encryptionAlgorithm}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <StatusText tone={c.isActive ? 'success' : 'danger'}>
-                        {c.isActive
-                          ? locale === 'fa'
-                            ? 'فعال'
-                            : 'Active'
-                          : locale === 'fa'
-                            ? 'باطل‌شده'
-                            : 'Revoked'}
-                      </StatusText>
-                    </td>
-                    <td className="py-3.5 px-4 text-slate-600 dark:text-slate-400">
-                      {formatDateTime(c.createdAt, locale)}
-                    </td>
-                    <td className="py-3.5 px-4 text-end">
-                      {c.isActive ? (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleRevoke(c.id)}
-                          className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/40"
-                        >
-                          <ShieldAlert className="w-3.5 h-3.5" />
-                          <span>{locale === 'fa' ? 'باطل‌سازی' : 'Revoke'}</span>
-                        </Button>
-                      ) : (
-                        <span className="text-[11px] text-slate-400">
-                          {c.revokedAt ? formatDateTime(c.revokedAt, locale) : '—'}
+                {creds.map((c) => {
+                  const st = getPoolStatusDisplay(c, locale);
+                  const needsReset = !c.isActive || c.status !== 'active' || c.failureCount > 0;
+                  return (
+                    <tr key={c.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                      <td className="py-3.5 px-4">
+                        <div className="font-semibold text-slate-900 dark:text-slate-100">{c.providerName}</div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">
+                          {t.providerTypes[c.providerType]} ·{' '}
+                          <span dir="ltr" className="font-mono">
+                            {c.label}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 font-mono">
+                        <span dir="ltr" className="inline-block">
+                          {c.maskedPreview}
                         </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="py-3.5 px-4 font-mono tabular-nums text-slate-600 dark:text-slate-400">
+                        <span dir="ltr" className="inline-block">
+                          #{c.priority} · v{c.keyVersion}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <StatusText tone={st.tone}>{st.label}</StatusText>
+                        <div className="text-[11px] text-slate-500 mt-0.5 max-w-[240px] truncate" title={c.lastErrorMessage ?? ''}>
+                          {c.failureCount > 0 && (
+                            <span className="tabular-nums me-1">
+                              {locale === 'fa'
+                                ? `${formatNumber(c.failureCount, locale)} خطا`
+                                : `${c.failureCount} fails`}
+                              {c.lastErrorMessage ? ' · ' : ''}
+                            </span>
+                          )}
+                          {c.lastErrorMessage || (c.cooldownUntil ? formatDateTime(c.cooldownUntil, locale) : '')}
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-600 dark:text-slate-400">
+                        {c.lastUsedAt ? formatDateTime(c.lastUsedAt, locale) : formatDateTime(c.createdAt, locale)}
+                      </td>
+                      <td className="py-3.5 px-4 text-end">
+                        <div className="flex items-center justify-end gap-1.5">
+                          {needsReset && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleResetStatus(c.id)}
+                              aria-label={`${locale === 'fa' ? 'بازنشانی وضعیت' : 'Reset status'} ${c.maskedPreview}`}
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>{locale === 'fa' ? 'بازنشانی' : 'Reset'}</span>
+                            </Button>
+                          )}
+                          {c.isActive && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleRevoke(c.id)}
+                              className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/40"
+                              aria-label={`${locale === 'fa' ? 'باطل‌سازی' : 'Revoke'} ${c.maskedPreview}`}
+                            >
+                              <ShieldAlert className="w-3.5 h-3.5" />
+                              <span>{locale === 'fa' ? 'باطل‌سازی' : 'Revoke'}</span>
+                            </Button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

@@ -1,10 +1,13 @@
 import { Router, type Response } from 'express';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, providerCredentials, telegramBotSettings } from '../../db/schema.ts';
 import {
   providerCreateSchema,
+  providerCredentialCreateSchema,
+  providerCredentialUpdateSchema,
   providerRotateKeySchema,
+  providerSyncModelsSchema,
   providerUpdateSchema,
 } from '../../shared/validation.ts';
 import {
@@ -14,6 +17,11 @@ import {
   maskSecret,
 } from '../security/crypto.ts';
 import { testProviderConnection } from '../providers/adapters.ts';
+import {
+  discoverProviderModels,
+  syncProviderModelsToDatabase,
+  type SyncModelsResult,
+} from '../providers/discovery.ts';
 import { recordAuditLog } from '../security/audit.ts';
 import { SsrfProtectionError, validatePublicHttpsUrl } from '../security/ssrf.ts';
 import {
@@ -33,14 +41,25 @@ function slugifyProviderName(name: string): string {
   return `${base || 'provider'}-${suffix}`;
 }
 
+function isCredentialHealthy(
+  cred: { isActive: boolean; status: string; cooldownUntil: Date | null },
+  nowMs: number,
+): boolean {
+  if (!cred.isActive) return false;
+  if (cred.status === 'invalid' || cred.status === 'disabled') return false;
+  if (cred.cooldownUntil && new Date(cred.cooldownUntil).getTime() > nowMs) return false;
+  return cred.status === 'active' || cred.status === 'rate_limited' || cred.status === 'quota_exhausted';
+}
+
 export function createProviderRouter(): Router {
   const router = Router();
   router.use(requireAdminAuth);
 
-  // List providers with strictly masked credential preview (never raw or encrypted values)
+  // List providers with masked primary key + credential pool health stats (never raw or encrypted values)
   router.get('/providers', async (_req: AdminRequest, res: Response) => {
     try {
       const db = getDb();
+      const nowMs = Date.now();
       const [providers, credentials, models] = await Promise.all([
         db.select().from(aiProviders).orderBy(aiProviders.priority, desc(aiProviders.createdAt)),
         db
@@ -50,16 +69,27 @@ export function createProviderRouter(): Router {
             label: providerCredentials.label,
             keyVersion: providerCredentials.keyVersion,
             maskedPreview: providerCredentials.maskedPreview,
+            priority: providerCredentials.priority,
+            status: providerCredentials.status,
+            cooldownUntil: providerCredentials.cooldownUntil,
+            failureCount: providerCredentials.failureCount,
             isActive: providerCredentials.isActive,
             rotatedAt: providerCredentials.rotatedAt,
             createdAt: providerCredentials.createdAt,
           })
           .from(providerCredentials)
-          .where(eq(providerCredentials.isActive, true)),
+          .where(eq(providerCredentials.isActive, true))
+          .orderBy(asc(providerCredentials.priority), desc(providerCredentials.keyVersion)),
         db.select({ id: aiModels.id, providerId: aiModels.providerId, isActive: aiModels.isActive }).from(aiModels),
       ]);
 
-      const credByProvider = new Map(credentials.map((c) => [c.providerId, c]));
+      const credsByProvider = new Map<string, typeof credentials>();
+      for (const c of credentials) {
+        const list = credsByProvider.get(c.providerId) ?? [];
+        list.push(c);
+        credsByProvider.set(c.providerId, list);
+      }
+
       const modelStats = new Map<string, { total: number; active: number }>();
       for (const m of models) {
         const cur = modelStats.get(m.providerId) ?? { total: 0, active: 0 };
@@ -70,8 +100,18 @@ export function createProviderRouter(): Router {
 
       res.json({
         providers: providers.map((p) => {
-          const cred = credByProvider.get(p.id);
+          const pool = credsByProvider.get(p.id) ?? [];
+          const primaryCred = pool.find((c) => isCredentialHealthy(c, nowMs)) ?? pool[0];
+          const healthyKeysCount = pool.filter((c) => isCredentialHealthy(c, nowMs)).length;
+          const exhaustedKeysCount = pool.filter(
+            (c) =>
+              c.status === 'quota_exhausted' ||
+              c.status === 'rate_limited' ||
+              Boolean(c.cooldownUntil && new Date(c.cooldownUntil).getTime() > nowMs),
+          ).length;
+          const invalidKeysCount = pool.filter((c) => c.status === 'invalid').length;
           const stats = modelStats.get(p.id) ?? { total: 0, active: 0 };
+
           return {
             id: p.id,
             name: p.name,
@@ -88,9 +128,14 @@ export function createProviderRouter(): Router {
             priority: p.priority,
             createdAt: p.createdAt,
             updatedAt: p.updatedAt,
-            hasCredential: Boolean(cred),
-            maskedApiKey: cred?.maskedPreview ?? null,
-            keyVersion: cred?.keyVersion ?? null,
+            hasCredential: pool.length > 0,
+            maskedApiKey: primaryCred?.maskedPreview ?? null,
+            keyVersion: primaryCred?.keyVersion ?? null,
+            activeKeysCount: pool.length,
+            healthyKeysCount,
+            exhaustedKeysCount,
+            invalidKeysCount,
+            primaryCredentialStatus: primaryCred?.status ?? null,
             modelsTotal: stats.total,
             modelsActive: stats.active,
           };
@@ -102,7 +147,7 @@ export function createProviderRouter(): Router {
     }
   });
 
-  // Create provider + AES-256-GCM encrypted credential in a DB transaction
+  // Create provider + AES-256-GCM encrypted credential pool + optional live auto model sync
   router.post('/providers', requireRole('admin'), async (req: AdminRequest, res: Response) => {
     const ip = getClientIp(req);
     const ua = req.headers['user-agent'] ?? '';
@@ -129,8 +174,23 @@ export function createProviderRouter(): Router {
         });
         return;
       }
-      const encrypted = encryptSecret(data.apiKey);
-      const maskedPreview = maskSecret(data.apiKey);
+
+      const rawKeys = Array.from(
+        new Set(
+          [data.apiKey, ...(data.apiKeys ?? [])]
+            .map((k) => k.trim())
+            .filter((k) => k.length > 0),
+        ),
+      );
+
+      const encryptedPool = rawKeys.map((key, idx) => ({
+        label: idx === 0 ? 'primary' : `backup-${idx}`,
+        encrypted: encryptSecret(key),
+        maskedPreview: maskSecret(key),
+        keyVersion: idx + 1,
+        priority: 100 + idx,
+      }));
+
       const db = getDb();
 
       const created = await db.transaction(async (tx) => {
@@ -150,19 +210,88 @@ export function createProviderRouter(): Router {
 
         if (!provider) throw new Error('Insert provider failed');
 
-        await tx.insert(providerCredentials).values({
-          providerId: provider.id,
-          label: 'primary',
-          encryptedApiKey: encrypted.ciphertext,
-          iv: encrypted.iv,
-          authTag: encrypted.authTag,
-          keyVersion: 1,
-          maskedPreview,
-          isActive: true,
-        });
+        if (encryptedPool.length > 0) {
+          await tx.insert(providerCredentials).values(
+            encryptedPool.map((item) => ({
+              providerId: provider.id,
+              label: item.label,
+              encryptedApiKey: item.encrypted.ciphertext,
+              iv: item.encrypted.iv,
+              authTag: item.encrypted.authTag,
+              keyVersion: item.keyVersion,
+              maskedPreview: item.maskedPreview,
+              priority: item.priority,
+              status: 'active',
+              isActive: true,
+            })),
+          );
+        }
 
         return provider;
       });
+
+      let updatedProvider = created;
+      let testResult: Awaited<ReturnType<typeof testProviderConnection>> | null = null;
+      let syncResult: SyncModelsResult | null = null;
+
+      if (data.autoSyncModels !== false) {
+        const primaryRawKey = rawKeys[0] ?? '';
+        try {
+          testResult = await testProviderConnection({
+            providerType: created.providerType,
+            baseUrl: created.baseUrl,
+            apiKey: primaryRawKey,
+            organizationId: created.organizationId,
+            additionalHeaders: created.additionalHeaders ?? {},
+          });
+
+          const now = new Date();
+          const [savedProv] = await db
+            .update(aiProviders)
+            .set({
+              connectionStatus: testResult.status,
+              lastTestLatencyMs: testResult.latencyMs,
+              lastTestMessage: testResult.message,
+              lastTestedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(aiProviders.id, created.id))
+            .returning();
+          if (savedProv) updatedProvider = savedProv;
+        } catch {
+          // Best-effort initial probe; provider is still safely created
+        }
+
+        try {
+          const discovered = await discoverProviderModels({
+            providerType: created.providerType,
+            baseUrl: created.baseUrl,
+            apiKey: primaryRawKey,
+            organizationId: created.organizationId,
+            additionalHeaders: created.additionalHeaders ?? {},
+          });
+          if (discovered.ok && discovered.models.length > 0) {
+            syncResult = await syncProviderModelsToDatabase({
+              providerId: created.id,
+              providerType: created.providerType,
+              discoveredModels: discovered.models,
+              activateAll: true,
+            });
+          } else {
+            syncResult = {
+              discoveredCount: 0,
+              createdCount: 0,
+              skippedCount: 0,
+              createdModelIds: [],
+              discoveredModels: [],
+              resolvedBaseUrl: discovered.resolvedBaseUrl,
+              message: discovered.message,
+            };
+          }
+        } catch {
+          // Non-fatal auto-sync error
+        }
+      }
 
       await recordAuditLog({
         adminUserId: req.admin!.id,
@@ -177,20 +306,31 @@ export function createProviderRouter(): Router {
           name: created.name,
           providerType: created.providerType,
           baseUrl: created.baseUrl,
-          maskedApiKey: maskedPreview,
+          keysCount: encryptedPool.length,
+          maskedApiKey: encryptedPool[0]?.maskedPreview ?? null,
+          autoSyncedModels: syncResult?.createdCount ?? 0,
         },
-        extraSecretsToRedact: [data.apiKey],
+        extraSecretsToRedact: rawKeys,
       });
+
+      const createdCount = syncResult?.createdCount ?? 0;
 
       res.status(201).json({
         provider: {
-          ...created,
-          hasCredential: true,
-          maskedApiKey: maskedPreview,
-          keyVersion: 1,
-          modelsTotal: 0,
-          modelsActive: 0,
+          ...updatedProvider,
+          hasCredential: encryptedPool.length > 0,
+          maskedApiKey: encryptedPool[0]?.maskedPreview ?? null,
+          keyVersion: encryptedPool[0]?.keyVersion ?? null,
+          activeKeysCount: encryptedPool.length,
+          healthyKeysCount: encryptedPool.length,
+          exhaustedKeysCount: 0,
+          invalidKeysCount: 0,
+          primaryCredentialStatus: encryptedPool.length > 0 ? 'active' : null,
+          modelsTotal: createdCount,
+          modelsActive: createdCount,
         },
+        testResult,
+        syncResult,
       });
     } catch (err) {
       if (err instanceof EncryptionKeyUnavailableError) {
@@ -296,6 +436,399 @@ export function createProviderRouter(): Router {
     }
   });
 
+  // List credential pool for a specific provider
+  router.get('/providers/:id/credentials', async (req: AdminRequest, res: Response) => {
+    const providerId = String(req.params.id ?? '');
+    try {
+      const db = getDb();
+      const [provider] = await db
+        .select({ id: aiProviders.id, name: aiProviders.name, providerType: aiProviders.providerType })
+        .from(aiProviders)
+        .where(eq(aiProviders.id, providerId))
+        .limit(1);
+
+      if (!provider) {
+        res.status(404).json({ error: 'ارائه‌دهنده یافت نشد.' });
+        return;
+      }
+
+      const credentials = await db
+        .select({
+          id: providerCredentials.id,
+          providerId: providerCredentials.providerId,
+          label: providerCredentials.label,
+          keyVersion: providerCredentials.keyVersion,
+          maskedPreview: providerCredentials.maskedPreview,
+          priority: providerCredentials.priority,
+          status: providerCredentials.status,
+          cooldownUntil: providerCredentials.cooldownUntil,
+          failureCount: providerCredentials.failureCount,
+          lastUsedAt: providerCredentials.lastUsedAt,
+          lastErrorCode: providerCredentials.lastErrorCode,
+          lastErrorMessage: providerCredentials.lastErrorMessage,
+          isActive: providerCredentials.isActive,
+          rotatedAt: providerCredentials.rotatedAt,
+          revokedAt: providerCredentials.revokedAt,
+          createdAt: providerCredentials.createdAt,
+          updatedAt: providerCredentials.updatedAt,
+        })
+        .from(providerCredentials)
+        .where(eq(providerCredentials.providerId, providerId))
+        .orderBy(asc(providerCredentials.priority), desc(providerCredentials.keyVersion));
+
+      res.json({ provider, credentials });
+    } catch (err) {
+      console.error('[providers/credentials/list]', err instanceof Error ? err.message : 'unknown');
+      res.status(500).json({ error: 'خطا در دریافت استخر کلیدهای ارائه‌دهنده.' });
+    }
+  });
+
+  // Add one or multiple backup API keys to provider pool without revoking existing keys
+  router.post(
+    '/providers/:id/credentials',
+    requireRole('admin'),
+    async (req: AdminRequest, res: Response) => {
+      const providerId = String(req.params.id ?? '');
+      const ip = getClientIp(req);
+      const ua = req.headers['user-agent'] ?? '';
+      try {
+        const parsed = providerCredentialCreateSchema.safeParse(req.body);
+        if (!parsed.success) {
+          res.status(400).json({
+            error: parsed.error.issues[0]?.message ?? 'اطلاعات کلید API نامعتبر است.',
+            issues: parsed.error.issues,
+          });
+          return;
+        }
+
+        const rawKeys = Array.from(
+          new Set(
+            [parsed.data.apiKey, ...(parsed.data.apiKeys ?? [])]
+              .map((k) => k.trim())
+              .filter((k) => k.length > 0),
+          ),
+        );
+        if (rawKeys.length === 0) {
+          res.status(400).json({ error: 'حداقل یک کلید API معتبر وارد کنید.' });
+          return;
+        }
+
+        const db = getDb();
+        const [provider] = await db
+          .select({ id: aiProviders.id, name: aiProviders.name })
+          .from(aiProviders)
+          .where(eq(aiProviders.id, providerId))
+          .limit(1);
+
+        if (!provider) {
+          res.status(404).json({ error: 'ارائه‌دهنده یافت نشد.' });
+          return;
+        }
+
+        const encryptedItems = rawKeys.map((k) => ({
+          encrypted: encryptSecret(k),
+          maskedPreview: maskSecret(k),
+        }));
+
+        const inserted = await db.transaction(async (tx) => {
+          const existing = await tx
+            .select({ keyVersion: providerCredentials.keyVersion })
+            .from(providerCredentials)
+            .where(eq(providerCredentials.providerId, providerId))
+            .orderBy(desc(providerCredentials.keyVersion));
+
+          const startVersion = (existing[0]?.keyVersion ?? 0) + 1;
+          const basePriority = parsed.data.priority ?? 100;
+
+          return tx
+            .insert(providerCredentials)
+            .values(
+              encryptedItems.map((item, idx) => ({
+                providerId,
+                label:
+                  rawKeys.length > 1
+                    ? `${parsed.data.label}-${startVersion + idx}`
+                    : parsed.data.label,
+                encryptedApiKey: item.encrypted.ciphertext,
+                iv: item.encrypted.iv,
+                authTag: item.encrypted.authTag,
+                keyVersion: startVersion + idx,
+                maskedPreview: item.maskedPreview,
+                priority: basePriority + idx,
+                status: 'active',
+                isActive: true,
+              })),
+            )
+            .returning({
+              id: providerCredentials.id,
+              label: providerCredentials.label,
+              keyVersion: providerCredentials.keyVersion,
+              maskedPreview: providerCredentials.maskedPreview,
+              priority: providerCredentials.priority,
+              status: providerCredentials.status,
+              isActive: providerCredentials.isActive,
+              createdAt: providerCredentials.createdAt,
+            });
+        });
+
+        await recordAuditLog({
+          adminUserId: req.admin!.id,
+          actorEmail: req.admin!.email,
+          action: 'provider.credentials_added',
+          resourceType: 'provider_credential',
+          resourceId: providerId,
+          severity: 'info',
+          ipAddress: ip,
+          userAgent: ua,
+          details: {
+            providerName: provider.name,
+            addedCount: inserted.length,
+            maskedPreviews: inserted.map((c) => c.maskedPreview),
+          },
+          extraSecretsToRedact: rawKeys,
+        });
+
+        res.status(201).json({ ok: true, credentials: inserted });
+      } catch (err) {
+        if (err instanceof EncryptionKeyUnavailableError) {
+          res.status(503).json({ error: err.message, code: 'ENCRYPTION_KEY_MISSING' });
+          return;
+        }
+        console.error('[providers/credentials/create]', err instanceof Error ? err.message : 'unknown');
+        res.status(500).json({ error: 'خطا در افزودن کلید به استخر ارائه‌دهنده.' });
+      }
+    },
+  );
+
+  // Update credential priority, label, active flag, or reset cooldown/quota status
+  router.patch('/credentials/:id', requireRole('admin'), async (req: AdminRequest, res: Response) => {
+    const credId = String(req.params.id ?? '');
+    const ip = getClientIp(req);
+    const ua = req.headers['user-agent'] ?? '';
+    try {
+      const parsed = providerCredentialUpdateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'اطلاعات نامعتبر است.' });
+        return;
+      }
+
+      const db = getDb();
+      const now = new Date();
+      const patch: Partial<typeof providerCredentials.$inferInsert> = {
+        updatedAt: now,
+      };
+      if (parsed.data.label !== undefined) patch.label = parsed.data.label;
+      if (parsed.data.priority !== undefined) patch.priority = parsed.data.priority;
+      if (parsed.data.isActive !== undefined) {
+        patch.isActive = parsed.data.isActive;
+        patch.revokedAt = parsed.data.isActive ? null : now;
+      }
+      if (parsed.data.resetStatus) {
+        patch.status = 'active';
+        patch.cooldownUntil = null;
+        patch.failureCount = 0;
+        patch.lastErrorCode = null;
+        patch.lastErrorMessage = null;
+        if (parsed.data.isActive === undefined) {
+          patch.isActive = true;
+          patch.revokedAt = null;
+        }
+      }
+
+      const [updated] = await db
+        .update(providerCredentials)
+        .set(patch)
+        .where(eq(providerCredentials.id, credId))
+        .returning({
+          id: providerCredentials.id,
+          providerId: providerCredentials.providerId,
+          label: providerCredentials.label,
+          keyVersion: providerCredentials.keyVersion,
+          maskedPreview: providerCredentials.maskedPreview,
+          priority: providerCredentials.priority,
+          status: providerCredentials.status,
+          cooldownUntil: providerCredentials.cooldownUntil,
+          failureCount: providerCredentials.failureCount,
+          lastErrorCode: providerCredentials.lastErrorCode,
+          lastErrorMessage: providerCredentials.lastErrorMessage,
+          isActive: providerCredentials.isActive,
+          updatedAt: providerCredentials.updatedAt,
+        });
+
+      if (!updated) {
+        res.status(404).json({ error: 'اعتبارنامه یافت نشد.' });
+        return;
+      }
+
+      await recordAuditLog({
+        adminUserId: req.admin!.id,
+        actorEmail: req.admin!.email,
+        action: 'credential.updated',
+        resourceType: 'provider_credential',
+        resourceId: updated.id,
+        ipAddress: ip,
+        userAgent: ua,
+        details: {
+          maskedPreview: updated.maskedPreview,
+          priority: updated.priority,
+          status: updated.status,
+          isActive: updated.isActive,
+          resetStatus: Boolean(parsed.data.resetStatus),
+        },
+      });
+
+      res.json({ ok: true, credential: updated });
+    } catch (err) {
+      console.error('[credentials/update]', err instanceof Error ? err.message : 'unknown');
+      res.status(500).json({ error: 'خطا در به‌روزرسانی اعتبارنامه.' });
+    }
+  });
+
+  // Discover and optionally auto-register all models from provider endpoint
+  router.post(
+    '/providers/:id/sync-models',
+    requireRole('admin'),
+    async (req: AdminRequest, res: Response) => {
+      const providerId = String(req.params.id ?? '');
+      const ip = getClientIp(req);
+      const ua = req.headers['user-agent'] ?? '';
+      try {
+        const parsed = providerSyncModelsSchema.safeParse(req.body ?? {});
+        if (!parsed.success) {
+          res.status(400).json({ error: 'پارامترهای همگام‌سازی نامعتبر است.' });
+          return;
+        }
+
+        const db = getDb();
+        const [provider] = await db
+          .select()
+          .from(aiProviders)
+          .where(eq(aiProviders.id, providerId))
+          .limit(1);
+
+        if (!provider) {
+          res.status(404).json({ error: 'ارائه‌دهنده یافت نشد.' });
+          return;
+        }
+
+        const activeCreds = await db
+          .select()
+          .from(providerCredentials)
+          .where(
+            and(
+              eq(providerCredentials.providerId, providerId),
+              eq(providerCredentials.isActive, true),
+            ),
+          )
+          .orderBy(asc(providerCredentials.priority), desc(providerCredentials.keyVersion));
+
+        const nowMs = Date.now();
+        const bestCred =
+          activeCreds.find((c) => isCredentialHealthy(c, nowMs)) ?? activeCreds[0] ?? null;
+
+        if (!bestCred && provider.providerType !== 'huggingface_space') {
+          res.status(400).json({
+            error: 'هیچ کلید API فعالی برای این ارائه‌دهنده ثبت نشده است.',
+            code: 'NO_ACTIVE_CREDENTIAL',
+          });
+          return;
+        }
+
+        const rawApiKey = bestCred
+          ? decryptSecret({
+              ciphertext: bestCred.encryptedApiKey,
+              iv: bestCred.iv,
+              authTag: bestCred.authTag,
+            })
+          : '';
+
+        const discoverRes = await discoverProviderModels({
+          providerType: provider.providerType,
+          baseUrl: provider.baseUrl,
+          apiKey: rawApiKey,
+          organizationId: provider.organizationId,
+          additionalHeaders: provider.additionalHeaders ?? {},
+        });
+
+        const now = new Date();
+        if (discoverRes.ok) {
+          await db
+            .update(aiProviders)
+            .set({
+              connectionStatus: 'connected',
+              lastTestMessage: discoverRes.message,
+              lastTestedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(aiProviders.id, providerId));
+        }
+
+        if (!discoverRes.ok) {
+          res.status(502).json({
+            ok: false,
+            error: discoverRes.message,
+            discoveredModels: [],
+          });
+          return;
+        }
+
+        if (parsed.data.discoverOnly) {
+          res.json({
+            ok: true,
+            discoverOnly: true,
+            discoveredCount: discoverRes.models.length,
+            createdCount: 0,
+            skippedCount: 0,
+            createdModelIds: [],
+            discoveredModels: discoverRes.models,
+            resolvedBaseUrl: discoverRes.resolvedBaseUrl,
+            message: discoverRes.message,
+          });
+          return;
+        }
+
+        const syncResult = await syncProviderModelsToDatabase({
+          providerId: provider.id,
+          providerType: provider.providerType,
+          discoveredModels: discoverRes.models,
+          activateAll: parsed.data.activateAll,
+          defaultCreditCost: parsed.data.defaultCreditCost,
+        });
+
+        await recordAuditLog({
+          adminUserId: req.admin!.id,
+          actorEmail: req.admin!.email,
+          action: 'provider.models_synced',
+          resourceType: 'ai_provider',
+          resourceId: provider.id,
+          severity: 'info',
+          ipAddress: ip,
+          userAgent: ua,
+          details: {
+            providerName: provider.name,
+            discoveredCount: syncResult.discoveredCount,
+            createdCount: syncResult.createdCount,
+            skippedCount: syncResult.skippedCount,
+          },
+          extraSecretsToRedact: rawApiKey ? [rawApiKey] : [],
+        });
+
+        res.json({
+          ok: true,
+          ...syncResult,
+          resolvedBaseUrl: discoverRes.resolvedBaseUrl,
+        });
+      } catch (err) {
+        if (err instanceof EncryptionKeyUnavailableError) {
+          res.status(503).json({ error: err.message, code: 'ENCRYPTION_KEY_MISSING' });
+          return;
+        }
+        console.error('[providers/sync-models]', err instanceof Error ? err.message : 'unknown');
+        res.status(500).json({ error: 'خطا در شناسایی و همگام‌سازی خودکار مدل‌ها.' });
+      }
+    },
+  );
+
   // Secure Key Rotation (transactional)
   router.post(
     '/providers/:id/rotate-key',
@@ -338,7 +871,7 @@ export function createProviderRouter(): Router {
 
           await tx
             .update(providerCredentials)
-            .set({ isActive: false, revokedAt: now, updatedAt: now })
+            .set({ isActive: false, status: 'disabled', revokedAt: now, updatedAt: now })
             .where(
               and(
                 eq(providerCredentials.providerId, providerId),
@@ -356,6 +889,8 @@ export function createProviderRouter(): Router {
               authTag: encrypted.authTag,
               keyVersion: nextVersion,
               maskedPreview,
+              priority: 100,
+              status: 'active',
               isActive: true,
               rotatedAt: now,
             })
@@ -424,7 +959,7 @@ export function createProviderRouter(): Router {
           return;
         }
 
-        const [cred] = await db
+        const creds = await db
           .select()
           .from(providerCredentials)
           .where(
@@ -433,10 +968,12 @@ export function createProviderRouter(): Router {
               eq(providerCredentials.isActive, true),
             ),
           )
-          .orderBy(desc(providerCredentials.keyVersion))
-          .limit(1);
+          .orderBy(asc(providerCredentials.priority), desc(providerCredentials.keyVersion));
 
-        if (!cred) {
+        const nowMs = Date.now();
+        const cred = creds.find((c) => isCredentialHealthy(c, nowMs)) ?? creds[0] ?? null;
+
+        if (!cred && provider.providerType !== 'huggingface_space') {
           res.status(400).json({
             error: 'هیچ کلید API فعالی برای این ارائه‌دهنده ثبت نشده است.',
             code: 'NO_ACTIVE_CREDENTIAL',
@@ -444,11 +981,13 @@ export function createProviderRouter(): Router {
           return;
         }
 
-        const rawApiKey = decryptSecret({
-          ciphertext: cred.encryptedApiKey,
-          iv: cred.iv,
-          authTag: cred.authTag,
-        });
+        const rawApiKey = cred
+          ? decryptSecret({
+              ciphertext: cred.encryptedApiKey,
+              iv: cred.iv,
+              authTag: cred.authTag,
+            })
+          : '';
 
         const testResult = await testProviderConnection({
           providerType: provider.providerType,
@@ -487,7 +1026,7 @@ export function createProviderRouter(): Router {
             latencyMs: testResult.latencyMs,
             status: testResult.status,
           },
-          extraSecretsToRedact: [rawApiKey],
+          extraSecretsToRedact: rawApiKey ? [rawApiKey] : [],
         });
 
         res.json({ result: testResult });
@@ -502,7 +1041,7 @@ export function createProviderRouter(): Router {
     },
   );
 
-  // API Credentials Vault (strictly metadata + masked previews)
+  // API Credentials Vault (strictly metadata + masked previews + pool health)
   router.get('/credentials', async (_req: AdminRequest, res: Response) => {
     try {
       const db = getDb();
@@ -516,6 +1055,13 @@ export function createProviderRouter(): Router {
             label: providerCredentials.label,
             keyVersion: providerCredentials.keyVersion,
             maskedPreview: providerCredentials.maskedPreview,
+            priority: providerCredentials.priority,
+            status: providerCredentials.status,
+            cooldownUntil: providerCredentials.cooldownUntil,
+            failureCount: providerCredentials.failureCount,
+            lastUsedAt: providerCredentials.lastUsedAt,
+            lastErrorCode: providerCredentials.lastErrorCode,
+            lastErrorMessage: providerCredentials.lastErrorMessage,
             isActive: providerCredentials.isActive,
             rotatedAt: providerCredentials.rotatedAt,
             revokedAt: providerCredentials.revokedAt,
@@ -523,7 +1069,7 @@ export function createProviderRouter(): Router {
           })
           .from(providerCredentials)
           .innerJoin(aiProviders, eq(providerCredentials.providerId, aiProviders.id))
-          .orderBy(desc(providerCredentials.createdAt)),
+          .orderBy(asc(providerCredentials.priority), desc(providerCredentials.createdAt)),
         db
           .select({
             id: telegramBotSettings.id,
@@ -571,7 +1117,7 @@ export function createProviderRouter(): Router {
         const now = new Date();
         const [revoked] = await db
           .update(providerCredentials)
-          .set({ isActive: false, revokedAt: now, updatedAt: now })
+          .set({ isActive: false, status: 'disabled', revokedAt: now, updatedAt: now })
           .where(eq(providerCredentials.id, credId))
           .returning({ id: providerCredentials.id, maskedPreview: providerCredentials.maskedPreview });
 

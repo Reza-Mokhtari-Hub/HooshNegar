@@ -157,6 +157,8 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       anthropic: 'Anthropic بومی',
       replicate: 'Replicate',
       fal_ai: 'fal.ai',
+      huggingface: 'Hugging Face (مدل / Router)',
+      huggingface_space: 'Hugging Face Space (اسپیس / Gradio)',
       custom: 'ارائه‌دهنده سفارشی',
     },
     connectionStatuses: {
@@ -272,6 +274,8 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       anthropic: 'Anthropic Native',
       replicate: 'Replicate',
       fal_ai: 'fal.ai',
+      huggingface: 'Hugging Face (Models / Router)',
+      huggingface_space: 'Hugging Face Space (Gradio / ZeroGPU)',
       custom: 'Custom HTTP Provider',
     },
     connectionStatuses: {

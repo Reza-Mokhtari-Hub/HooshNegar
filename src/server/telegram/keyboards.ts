@@ -54,14 +54,35 @@ export function buildDynamicModelsKeyboard(
   models: DynamicAvailableModel[],
   selectedModelId: string | null,
   categoryKey: string,
+  page = 0,
 ): InlineKeyboard {
+  const PAGE_SIZE = 10;
+  const totalPages = Math.max(1, Math.ceil(models.length / PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = models.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+
+  const safeCatKey = categoryKey.slice(0, 10);
   const kb = new InlineKeyboard();
-  for (const m of models.slice(0, 24)) {
+  for (const m of slice) {
     const isSelected = m.id === selectedModelId;
     const prefix = isSelected ? '✅ ' : '';
-    const costLabel = m.creditCost > 0 ? ` (${m.creditCost} اعتبار)` : ' (رایگان)';
-    kb.text(`${prefix}${m.name} · ${m.providerName}${costLabel}`, `msel:${categoryKey}:${m.id}`).row();
+    const shortName = m.name.length > 26 ? `${m.name.slice(0, 24)}…` : m.name;
+    const shortProv = m.providerName.length > 14 ? `${m.providerName.slice(0, 12)}…` : m.providerName;
+    const costLabel = m.creditCost > 0 ? ` (${m.creditCost}💎)` : ' (رایگان)';
+    kb.text(`${prefix}${shortName} · ${shortProv}${costLabel}`, `msel:${safeCatKey}:${m.id}`).row();
   }
+
+  if (totalPages > 1) {
+    if (safePage > 0) {
+      kb.text('◀️ قبلی', `mcat:${safeCatKey}:${safePage - 1}`);
+    }
+    kb.text(`صفحه ${safePage + 1}/${totalPages}`, `mcat:${safeCatKey}:${safePage}`);
+    if (safePage < totalPages - 1) {
+      kb.text('بعدی ▶️', `mcat:${safeCatKey}:${safePage + 1}`);
+    }
+    kb.row();
+  }
+
   kb.text('🔙 بازگشت به دسته‌بندی مدل‌ها', 'mcat:menu');
   return kb;
 }
@@ -224,4 +245,12 @@ export function buildSupportCategoryKeyboard(): InlineKeyboard {
     .row()
     .text('💬 سوال عمومی و راهنمایی', 'support:cat:general');
 }
+
+export function buildMiniAppLauncherKeyboard(
+  miniAppUrl: string,
+  buttonText = '🚀 باز کردن مینی‌اپ هوش‌نگار',
+): InlineKeyboard {
+  return new InlineKeyboard().webApp(buttonText, miniAppUrl);
+}
+
 

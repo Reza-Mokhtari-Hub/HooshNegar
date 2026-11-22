@@ -19,6 +19,7 @@ export interface CloudflareBlobStore {
     dataBase64: string,
     expiresAtIso: string,
   ): Promise<void>;
+  getBlob(objectKey: string): Promise<{ mimeType: string; dataBase64: string } | null>;
   deleteBlob(objectKey: string): Promise<void>;
 }
 
@@ -27,6 +28,7 @@ export interface CloudflareRequestContext {
   blobStore?: CloudflareBlobStore;
   r2Bucket?: CloudflareR2Bucket;
   waitUntil?: (promise: Promise<unknown>) => void;
+  requestOrigin?: string;
 }
 
 declare global {

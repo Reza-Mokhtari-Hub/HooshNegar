@@ -5,6 +5,7 @@ export interface CloudflareFetcher {
 export interface CloudflareR2Object {
   key: string;
   size: number;
+  httpMetadata?: { contentType?: string };
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 

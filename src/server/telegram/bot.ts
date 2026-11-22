@@ -3,6 +3,8 @@ import type { Update } from 'grammy/types';
 import { and, desc, eq } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import {
+  aiModels,
+  aiProviders,
   aiRequests,
   conversationMessages,
   conversations,
@@ -15,7 +17,7 @@ import {
   telegramBotSettings,
   users,
 } from '../../db/schema.ts';
-import type { CapabilityType, ModelCategory } from '../../shared/validation.ts';
+import type { CapabilityType } from '../../shared/validation.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { enqueueBackgroundJob } from '../queue/qstash.ts';
 import {
@@ -42,6 +44,7 @@ import {
   resolveSelectedModelForCapability,
   updateTelegramUserState,
   type EnsuredTelegramUser,
+  type ModelCategoryGroup,
 } from './userService.ts';
 import {
   buildAudioStudioKeyboard,
@@ -51,6 +54,7 @@ import {
   buildDynamicModelsKeyboard,
   buildImageStudioKeyboard,
   buildMainMenuKeyboard,
+  buildMiniAppLauncherKeyboard,
   buildModelCategoryKeyboard,
   buildSettingsKeyboard,
   buildStopGenerationKeyboard,
@@ -60,6 +64,19 @@ import {
 } from './keyboards.ts';
 import { cancelActiveJobsForUser, executeQueuedGenerationJob } from './jobRunner.ts';
 import { escapeTelegramHtml } from './formatter.ts';
+import { normalizeMiniAppUrl } from '../services/telegramService.ts';
+import { getCloudflareRequestContext } from '../cloudflare/requestContext.ts';
+
+type CachedBotInfo = NonNullable<NonNullable<ConstructorParameters<typeof Bot>[1]>['botInfo']>;
+const botInfoCache = new Map<string, CachedBotInfo>();
+
+function resolveMiniAppUrlFromConfig(cfg: Awaited<ReturnType<typeof loadBotConfig>>): string {
+  return (
+    normalizeMiniAppUrl(cfg?.webhookUrl) ||
+    normalizeMiniAppUrl(getCloudflareRequestContext()?.requestOrigin) ||
+    normalizeMiniAppUrl(process.env.APP_URL)
+  );
+}
 
 async function loadBotConfig() {
   const db = getDb();
@@ -179,7 +196,11 @@ async function enqueueAiJobFromContext(params: {
   );
 }
 
-async function sendModelsMenu(ctx: Context, ensured: EnsuredTelegramUser, categoryKey = 'menu') {
+async function sendModelsMenu(ctx: Context, ensured: EnsuredTelegramUser, rawCategory = 'menu') {
+  const [catPartRaw, pagePart] = rawCategory.split(':');
+  const categoryKey = catPartRaw || 'menu';
+  const page = Math.max(0, Number.parseInt(pagePart ?? '0', 10) || 0);
+
   if (categoryKey === 'menu') {
     await ctx.reply(
       '🧠 <b>انتخاب مدل هوش مصنوعی</b>\n\nفهرست زیر به‌صورت زنده از پایگاه‌داده سامانه و متناسب با اشتراک فعال شما بارگذاری می‌شود. دسته‌بندی مورد نظر را انتخاب کنید:',
@@ -191,23 +212,36 @@ async function sendModelsMenu(ctx: Context, ensured: EnsuredTelegramUser, catego
     return;
   }
 
-  const categoryMap: Record<string, ModelCategory | undefined> = {
-    text: 'llm',
+  const groupMap: Record<string, ModelCategoryGroup> = {
+    text: 'text',
     image: 'image',
     video: 'video',
     audio: 'audio',
     multimodal: 'multimodal',
-    document: 'document',
-    all: undefined,
+    document: 'multimodal',
+    all: 'all',
   };
+  const categoryGroup: ModelCategoryGroup = groupMap[categoryKey] ?? 'all';
   const models = await getAvailableModelsForUser({
     userId: ensured.user.id,
-    category: categoryMap[categoryKey],
+    categoryGroup,
   });
 
   if (models.length === 0) {
+    const db = getDb();
+    const activeRows = await db
+      .select({ id: aiModels.id })
+      .from(aiModels)
+      .innerJoin(aiProviders, eq(aiModels.providerId, aiProviders.id))
+      .where(and(eq(aiModels.isActive, true), eq(aiProviders.isActive, true)));
+
+    const reasonHint =
+      activeRows.length > 0
+        ? `(${activeRows.length} مدل فعال در سامانه ثبت شده است؛ احتمالاً در این دسته‌بندی مدلی نیست یا محدودیت پلن اشتراک شما مانع نمایش آن شده است — گزینه «نمایش همه مدل‌های فعال» را بررسی کنید.)`
+        : 'هنوز هیچ مدل فعالی با ارائه‌دهنده فعال در پنل مدیریت ثبت یا همگام‌سازی نشده است.';
+
     await ctx.reply(
-      '⚠️ هیچ مدل فعالی در این دسته‌بندی برای پلن فعلی شما در دسترس نیست.',
+      `⚠️ هیچ مدل فعالی در این دسته‌بندی برای پلن فعلی شما در دسترس نیست.\n\n${reasonHint}`,
       { reply_markup: buildModelCategoryKeyboard() },
     );
     return;
@@ -221,14 +255,14 @@ async function sendModelsMenu(ctx: Context, ensured: EnsuredTelegramUser, catego
         : categoryKey === 'audio'
           ? ensured.telegramAccount.selectedAudioModelId
           : categoryKey === 'multimodal'
-            ? ensured.telegramAccount.selectedDocumentModelId
+            ? ensured.telegramAccount.selectedDocumentModelId ?? ensured.telegramAccount.selectedTextModelId
             : ensured.telegramAccount.selectedTextModelId;
 
   await ctx.reply(
     `🧠 <b>مدل‌های فعال (${models.length} مدل)</b>\nروی مدل مورد نظر کلیک کنید تا به عنوان مدل پیش‌فرض شما ذخیره شود:`,
     {
       parse_mode: 'HTML',
-      reply_markup: buildDynamicModelsKeyboard(models, selectedId, categoryKey),
+      reply_markup: buildDynamicModelsKeyboard(models, selectedId, categoryKey, page),
     },
   );
 }
@@ -471,6 +505,37 @@ export function createTelegramBotInstance(botToken: string): Bot {
       parse_mode: 'HTML',
       reply_markup: buildMainMenuKeyboard(),
     });
+
+    const miniAppUrl = resolveMiniAppUrlFromConfig(cfg);
+    if (miniAppUrl) {
+      await ctx.reply(
+        '📱 <b>مینی‌اپ هوش‌نگار (Mini App)</b>\nبرای دسترسی به رابط گرافیکی چت، استودیو تصویر/صوت/ویدیو، انتخاب مدل‌ها و خرید آنی با استارز، روی دکمه زیر بزنید:',
+        {
+          parse_mode: 'HTML',
+          reply_markup: buildMiniAppLauncherKeyboard(miniAppUrl),
+        },
+      );
+    }
+  });
+
+  bot.command(['app', 'miniapp'], async (ctx) => {
+    await resolveContextUser(ctx);
+    const cfg = await loadBotConfig();
+    const miniAppUrl = resolveMiniAppUrlFromConfig(cfg);
+    if (!miniAppUrl) {
+      await ctx.reply(
+        '⚠️ آدرس HTTPS مینی‌اپ هنوز ثبت نشده است. لطفاً ابتدا در پنل مدیریت وب‌هوک را همگام‌سازی کنید.',
+        { reply_markup: buildMainMenuKeyboard() },
+      );
+      return;
+    }
+    await ctx.reply(
+      '🚀 <b>ورود به مینی‌اپ هوش‌نگار</b>\nنسخه گرافیکی کامل متصل به کیف‌پول، اشتراک و گفتگوهای ربات شما:',
+      {
+        parse_mode: 'HTML',
+        reply_markup: buildMiniAppLauncherKeyboard(miniAppUrl),
+      },
+    );
   });
 
   bot.command('help', async (ctx) => {
@@ -479,6 +544,7 @@ export function createTelegramBotInstance(botToken: string): Bot {
       '📖 <b>راهنمای دستورات ربات هوش‌نگار</b>',
       '',
       '/start — شروع و نمایش منوی اصلی',
+      '/app — باز کردن مینی‌اپ گرافیکی (Mini App)',
       '/models — انتخاب مدل هوش مصنوعی (متن، تصویر، ویدیو، صوت، سند)',
       '/plan — مشاهده وضعیت اشتراک و سهمیه‌ها',
       '/balance — مشاهده موجودی کیف‌پول اعتبار',
@@ -492,7 +558,7 @@ export function createTelegramBotInstance(botToken: string): Bot {
     await ctx.reply(helpText, { parse_mode: 'HTML', reply_markup: buildMainMenuKeyboard() });
   });
 
-  bot.command('models', async (ctx) => {
+  bot.command(['models', 'model'], async (ctx) => {
     const ensured = await resolveContextUser(ctx);
     if (!ensured) return;
     await sendModelsMenu(ctx, ensured, 'menu');
@@ -743,11 +809,14 @@ export function createTelegramBotInstance(botToken: string): Bot {
           updateCol.selectedAudioModelId = chosen.id;
         } else if (categoryKey === 'multimodal' || chosen.category === 'multimodal') {
           updateCol.selectedDocumentModelId = chosen.id;
-          if (chosen.capabilities.includes('chat')) {
+          if (chosen.capabilities.includes('chat') || chosen.capabilities.includes('text_generation')) {
             updateCol.selectedTextModelId = chosen.id;
           }
         } else {
           updateCol.selectedTextModelId = chosen.id;
+          if (chosen.capabilities.includes('document_analysis') || chosen.capabilities.includes('vision')) {
+            updateCol.selectedDocumentModelId = chosen.id;
+          }
         }
 
         await updateTelegramUserState(ensured.telegramAccount.id, {}, updateCol);
@@ -1586,6 +1655,7 @@ export function createTelegramBotInstance(botToken: string): Bot {
 
   bot.catch((err) => {
     console.error('[telegram:bot]', redactSecrets(err.message));
+    throw err.error ?? err;
   });
 
   return bot;
@@ -1607,8 +1677,16 @@ export async function processTelegramUpdate(update: Update): Promise<{ ok: boole
     authTag: cfg.tokenAuthTag,
   });
 
+  const cachedInfo = botInfoCache.get(botToken);
   const bot = createTelegramBotInstance(botToken);
-  await bot.init();
+  if (cachedInfo) {
+    bot.botInfo = cachedInfo;
+  } else {
+    await bot.init();
+    if (bot.botInfo) {
+      botInfoCache.set(botToken, bot.botInfo);
+    }
+  }
   await bot.handleUpdate(update);
   return { ok: true };
 }

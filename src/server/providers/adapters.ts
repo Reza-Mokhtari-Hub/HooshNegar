@@ -1,3 +1,11 @@
+import {
+  extractHuggingFaceRepoFromUrl,
+  normalizeBaseUrl,
+  normalizeGeminiRootBaseUrl,
+  normalizeOpenAiRootBaseUrl,
+  parseHuggingFaceSpaceUrl,
+  resolveHfSpaceRootUrl,
+} from './discovery.ts';
 import type { ProviderType } from '../../shared/validation.ts';
 import { redactSecrets } from '../security/crypto.ts';
 import { SsrfProtectionError, validatePublicHttpsUrl } from '../security/ssrf.ts';
@@ -18,6 +26,7 @@ export interface ProviderTestResult {
   message: string;
   discoveredModelsCount?: number;
   protocol: string;
+  resolvedBaseUrl?: string;
 }
 
 export interface ProviderRequestSpec {
@@ -33,10 +42,6 @@ export interface AIProviderAdapter {
   readonly defaultBaseUrl: string;
   buildTestRequest(config: ProviderConnectionConfig): ProviderRequestSpec;
   parseTestResponse(status: number, bodyText: string, latencyMs: number, apiKey: string): ProviderTestResult;
-}
-
-function normalizeBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/, '');
 }
 
 function mergeSafeHeaders(
@@ -56,6 +61,7 @@ function mergeSafeHeaders(
 }
 
 function extractSafeErrorMessage(bodyText: string, apiKey: string): string {
+  const secrets = apiKey ? [apiKey] : [];
   try {
     const parsed = JSON.parse(bodyText) as Record<string, unknown>;
     const errObj = parsed.error as Record<string, unknown> | string | undefined;
@@ -69,9 +75,9 @@ function extractSafeErrorMessage(bodyText: string, apiKey: string): string {
             : typeof parsed.message === 'string'
               ? parsed.message
               : bodyText.slice(0, 220);
-    return redactSecrets(rawMsg, [apiKey]).slice(0, 260);
+    return redactSecrets(rawMsg, secrets).slice(0, 260);
   } catch {
-    return redactSecrets(bodyText.slice(0, 220), [apiKey]);
+    return redactSecrets(bodyText.slice(0, 220), secrets);
   }
 }
 
@@ -80,8 +86,8 @@ export const openaiCompatibleAdapter: AIProviderAdapter = {
   protocolName: 'OpenAI REST v1',
   defaultBaseUrl: 'https://api.openai.com/v1',
   buildTestRequest(config) {
-    const base = normalizeBaseUrl(config.baseUrl);
-    const url = base.endsWith('/models') ? base : `${base}/models`;
+    const base = normalizeOpenAiRootBaseUrl(config.baseUrl);
+    const url = `${base}/models`;
     const headers: Record<string, string> = {
       Authorization: `Bearer ${config.apiKey}`,
       Accept: 'application/json',
@@ -134,8 +140,8 @@ export const googleGeminiAdapter: AIProviderAdapter = {
   protocolName: 'Google Gemini Native v1beta',
   defaultBaseUrl: 'https://generativelanguage.googleapis.com',
   buildTestRequest(config) {
-    const base = normalizeBaseUrl(config.baseUrl);
-    const url = base.includes('/models') ? base : `${base}/v1beta/models?pageSize=20`;
+    const root = normalizeGeminiRootBaseUrl(config.baseUrl);
+    const url = `${root}/v1beta/models?pageSize=50`;
     return {
       url,
       method: 'GET',
@@ -246,13 +252,7 @@ export const replicateAdapter: AIProviderAdapter = {
     return {
       url,
       method: 'GET',
-      headers: mergeSafeHeaders(
-        {
-          Authorization: `Bearer ${config.apiKey}`,
-          Accept: 'application/json',
-        },
-        config.additionalHeaders,
-      ),
+      headers: mergeHeadersSafe(config.apiKey, config.additionalHeaders),
       protocol: this.protocolName,
     };
   },
@@ -284,6 +284,14 @@ export const replicateAdapter: AIProviderAdapter = {
     };
   },
 };
+
+function mergeHeadersSafe(apiKey: string, extra?: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = { Accept: 'application/json' };
+  if (apiKey.trim()) {
+    base.Authorization = `Bearer ${apiKey.trim()}`;
+  }
+  return mergeSafeHeaders(base, extra);
+}
 
 export const falAiAdapter: AIProviderAdapter = {
   type: 'fal_ai',
@@ -323,6 +331,118 @@ export const falAiAdapter: AIProviderAdapter = {
       latencyMs,
       protocol: this.protocolName,
       message: `خطای fal.ai HTTP ${status}: ${extractSafeErrorMessage(bodyText, apiKey)}`,
+    };
+  },
+};
+
+export const huggingfaceAdapter: AIProviderAdapter = {
+  type: 'huggingface',
+  protocolName: 'Hugging Face Router & Inference API',
+  defaultBaseUrl: 'https://router.huggingface.co',
+  buildTestRequest(config) {
+    const repo = extractHuggingFaceRepoFromUrl(config.baseUrl);
+    const url = repo
+      ? `https://huggingface.co/api/models/${repo}`
+      : `${normalizeOpenAiRootBaseUrl(config.baseUrl).replace(/\/v1$/i, '')}/v1/models`;
+    return {
+      url,
+      method: 'GET',
+      headers: mergeHeadersSafe(config.apiKey, config.additionalHeaders),
+      protocol: this.protocolName,
+    };
+  },
+  parseTestResponse(status, bodyText, latencyMs, apiKey) {
+    if (status >= 200 && status < 300) {
+      let count: number | undefined;
+      let modelTag = '';
+      try {
+        const parsed = JSON.parse(bodyText) as { data?: unknown[]; id?: string };
+        if (Array.isArray(parsed.data)) {
+          count = parsed.data.length;
+        } else if (parsed.id) {
+          count = 1;
+          modelTag = ` (${parsed.id})`;
+        }
+      } catch {
+        // ignore
+      }
+      return {
+        ok: true,
+        status: 'connected',
+        httpStatus: status,
+        latencyMs,
+        discoveredModelsCount: count,
+        protocol: this.protocolName,
+        message:
+          count !== undefined
+            ? `اتصال به Hugging Face برقرار شد${modelTag} (${count} مدل در دسترس).`
+            : 'اتصال به Hugging Face تأیید شد.',
+      };
+    }
+    return {
+      ok: false,
+      status: status === 429 ? 'degraded' : 'failed',
+      httpStatus: status,
+      latencyMs,
+      protocol: this.protocolName,
+      message: `خطای Hugging Face HTTP ${status}: ${extractSafeErrorMessage(bodyText, apiKey)}`,
+    };
+  },
+};
+
+export const huggingfaceSpaceAdapter: AIProviderAdapter = {
+  type: 'huggingface_space',
+  protocolName: 'Hugging Face Space (Gradio / ZeroGPU)',
+  defaultBaseUrl: 'https://huggingface.co/spaces/owner/space',
+  buildTestRequest(config) {
+    const parsedSpace = parseHuggingFaceSpaceUrl(config.baseUrl);
+    const base = normalizeBaseUrl(parsedSpace?.directHostUrl ?? config.baseUrl);
+    const url = base.endsWith('/gradio_api/info') || base.endsWith('/config')
+      ? base
+      : `${base}/gradio_api/info`;
+    return {
+      url,
+      method: 'GET',
+      headers: mergeHeadersSafe(config.apiKey, config.additionalHeaders),
+      protocol: this.protocolName,
+    };
+  },
+  parseTestResponse(status, bodyText, latencyMs, apiKey) {
+    if (status >= 200 && status < 300) {
+      let count: number | undefined;
+      try {
+        const parsed = JSON.parse(bodyText) as {
+          named_endpoints?: Record<string, unknown>;
+          dependencies?: unknown[];
+        };
+        if (parsed.named_endpoints && typeof parsed.named_endpoints === 'object') {
+          count = Object.keys(parsed.named_endpoints).length;
+        } else if (Array.isArray(parsed.dependencies)) {
+          count = parsed.dependencies.length;
+        }
+      } catch {
+        // ignore non-json HTML root probe
+      }
+      return {
+        ok: true,
+        status: 'connected',
+        httpStatus: status,
+        latencyMs,
+        discoveredModelsCount: count,
+        protocol: this.protocolName,
+        message:
+          count !== undefined
+            ? `اتصال به Hugging Face Space برقرار شد (${count} اندپوینت قابل فراخوانی).`
+            : 'اتصال به Hugging Face Space تأیید شد.',
+      };
+    }
+    return {
+      ok: false,
+      status: status === 429 ? 'degraded' : 'failed',
+      httpStatus: status,
+      latencyMs,
+      protocol: this.protocolName,
+      message: `خطای Hugging Face Space HTTP ${status}: ${extractSafeErrorMessage(bodyText, apiKey)}`,
     };
   },
 };
@@ -375,6 +495,8 @@ const ADAPTER_REGISTRY: Record<ProviderType, AIProviderAdapter> = {
   anthropic: anthropicAdapter,
   replicate: replicateAdapter,
   fal_ai: falAiAdapter,
+  huggingface: huggingfaceAdapter,
+  huggingface_space: huggingfaceSpaceAdapter,
   custom: customAdapter,
 };
 
@@ -387,8 +509,37 @@ export async function testProviderConnection(
   fetchImpl: typeof fetch = fetch,
 ): Promise<ProviderTestResult> {
   const adapter = getProviderAdapter(config.providerType);
-  const spec = adapter.buildTestRequest(config);
   const startedAt = Date.now();
+
+  let effectiveConfig = config;
+  let resolvedBaseUrl: string | undefined;
+
+  if (config.providerType === 'huggingface_space') {
+    try {
+      const resolved = await resolveHfSpaceRootUrl(
+        config.baseUrl,
+        config.apiKey,
+        config.additionalHeaders,
+        fetchImpl,
+      );
+      resolvedBaseUrl = resolved.resolvedRootUrl;
+      effectiveConfig = { ...config, baseUrl: resolved.resolvedRootUrl };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 'failed',
+        httpStatus: null,
+        latencyMs: Date.now() - startedAt,
+        protocol: adapter.protocolName,
+        message:
+          err instanceof SsrfProtectionError
+            ? err.message
+            : 'آدرس Hugging Face Space نامعتبر یا غیرقابل دسترسی است.',
+      };
+    }
+  }
+
+  const spec = adapter.buildTestRequest(effectiveConfig);
   try {
     validatePublicHttpsUrl(spec.url);
   } catch (err) {
@@ -404,18 +555,42 @@ export async function testProviderConnection(
           : 'آدرس ارائه‌دهنده به دلیل قوانین امنیتی مسدود شد.',
     };
   }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
 
   try {
-    const response = await fetchImpl(spec.url, {
+    let response = await fetchImpl(spec.url, {
       method: spec.method,
       headers: spec.headers,
       signal: controller.signal,
     });
+
+    // Gradio spaces on older versions expose `/info` or `/config` instead of `/gradio_api/info`
+    if (
+      config.providerType === 'huggingface_space' &&
+      response.status === 404 &&
+      resolvedBaseUrl
+    ) {
+      for (const fallbackPath of ['/info', '/config', '/']) {
+        const candidateUrl = `${resolvedBaseUrl}${fallbackPath === '/' ? '' : fallbackPath}`;
+        validatePublicHttpsUrl(candidateUrl);
+        const probe = await fetchImpl(candidateUrl, {
+          method: 'GET',
+          headers: spec.headers,
+          signal: controller.signal,
+        });
+        if (probe.ok || probe.status !== 404) {
+          response = probe;
+          break;
+        }
+      }
+    }
+
     const latencyMs = Date.now() - startedAt;
     const bodyText = await response.text();
-    return adapter.parseTestResponse(response.status, bodyText, latencyMs, config.apiKey);
+    const parsed = adapter.parseTestResponse(response.status, bodyText, latencyMs, config.apiKey);
+    return resolvedBaseUrl ? { ...parsed, resolvedBaseUrl } : parsed;
   } catch (err) {
     const latencyMs = Date.now() - startedAt;
     const rawMessage = err instanceof Error ? err.message : 'خطای شبکه در ارتباط با ارائه‌دهنده';
@@ -428,7 +603,7 @@ export async function testProviderConnection(
       protocol: adapter.protocolName,
       message: isTimeout
         ? 'پاسخ ارائه‌دهنده بیش از ۱۲ ثانیه طول کشید (Timeout).'
-        : `عدم دسترسی به سرویس: ${redactSecrets(rawMessage, [config.apiKey])}`,
+        : `عدم دسترسی به سرویس: ${redactSecrets(rawMessage, config.apiKey ? [config.apiKey] : [])}`,
     };
   } finally {
     clearTimeout(timeout);

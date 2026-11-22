@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Plus, Pencil, Trash2, Search } from 'lucide-react';
+import { Plus, Pencil, Trash2, Search, RefreshCw, Sparkles } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
 import { DICTIONARIES, formatNumber, type Locale } from '../../i18n';
 import {
@@ -53,6 +53,30 @@ export interface ModelRecord {
   updatedAt: string;
 }
 
+interface DiscoveredModelItem {
+  name: string;
+  modelIdentifier: string;
+  category: ModelCategory;
+  capabilities: CapabilityType[];
+  description: string;
+  maxInputSize: number;
+  maxOutputSize: number;
+  creditCost: number;
+  inputPricePerMillion: number;
+  outputPricePerMillion: number;
+  modelParameters: Record<string, unknown>;
+}
+
+const DEFAULT_CAPS_BY_CATEGORY: Record<ModelCategory, CapabilityType[]> = {
+  llm: ['text_generation', 'chat'],
+  multimodal: ['text_generation', 'chat', 'vision', 'document_analysis'],
+  image: ['image_generation', 'image_editing'],
+  audio: ['speech_generation', 'audio_transcription'],
+  video: ['video_generation'],
+  embedding: ['embeddings'],
+  document: ['document_analysis', 'vision', 'chat'],
+};
+
 export function ModelsSection({ locale }: { locale: Locale }) {
   const t = DICTIONARIES[locale];
   const [models, setModels] = useState<ModelRecord[]>([]);
@@ -86,6 +110,12 @@ export function ModelsSection({ locale }: { locale: Locale }) {
   const [paramsJson, setParamsJson] = useState('{}');
   const [saving, setSaving] = useState(false);
 
+  // Discovery picker inside Add Model modal
+  const [discovering, setDiscovering] = useState(false);
+  const [syncingAll, setSyncingAll] = useState(false);
+  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModelItem[]>([]);
+  const [discoverNote, setDiscoverNote] = useState<string | null>(null);
+
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
@@ -113,7 +143,7 @@ export function ModelsSection({ locale }: { locale: Locale }) {
     setModelIdentifier('');
     setCategory('llm');
     setDescription('');
-    setCapabilities(['text_generation', 'chat']);
+    setCapabilities(DEFAULT_CAPS_BY_CATEGORY.llm);
     setInputPrice(0);
     setOutputPrice(0);
     setCreditCost(1);
@@ -128,6 +158,8 @@ export function ModelsSection({ locale }: { locale: Locale }) {
     setFallbackProviderId('');
     setFallbackModelIdentifier('');
     setParamsJson('{}');
+    setDiscoveredModels([]);
+    setDiscoverNote(null);
     setFormOpen(true);
   };
 
@@ -153,7 +185,66 @@ export function ModelsSection({ locale }: { locale: Locale }) {
     setFallbackProviderId(m.fallbackProviderId ?? '');
     setFallbackModelIdentifier(m.fallbackModelIdentifier ?? '');
     setParamsJson(JSON.stringify(m.modelParameters ?? {}, null, 2));
+    setDiscoveredModels([]);
+    setDiscoverNote(null);
     setFormOpen(true);
+  };
+
+  const handleDiscoverFromProvider = async () => {
+    if (!providerId) return;
+    setDiscovering(true);
+    setDiscoverNote(null);
+    try {
+      const res = await apiRequest<{
+        ok: boolean;
+        discoveredModels: DiscoveredModelItem[];
+        message: string;
+      }>(`/api/providers/${providerId}/sync-models`, {
+        method: 'POST',
+        body: { discoverOnly: true },
+      });
+      setDiscoveredModels(res.discoveredModels ?? []);
+      setDiscoverNote(res.message);
+    } catch (err) {
+      setDiscoverNote(err instanceof Error ? err.message : 'خطا در دریافت لیست مدل‌ها');
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const handleSyncAllFromProvider = async () => {
+    if (!providerId) return;
+    setSyncingAll(true);
+    setDiscoverNote(null);
+    try {
+      const res = await apiRequest<{
+        ok: boolean;
+        createdCount: number;
+        message: string;
+      }>(`/api/providers/${providerId}/sync-models`, {
+        method: 'POST',
+        body: { activateAll: true },
+      });
+      setFeedback({ tone: 'success', text: res.message });
+      setFormOpen(false);
+      await loadData();
+    } catch (err) {
+      setDiscoverNote(err instanceof Error ? err.message : 'خطا در همگام‌سازی همه مدل‌ها');
+    } finally {
+      setSyncingAll(false);
+    }
+  };
+
+  const applyDiscoveredSpec = (spec: DiscoveredModelItem) => {
+    setName(spec.name);
+    setModelIdentifier(spec.modelIdentifier);
+    setCategory(spec.category);
+    setCapabilities(spec.capabilities);
+    setDescription(spec.description ?? '');
+    setMaxInputSize(spec.maxInputSize);
+    setMaxOutputSize(spec.maxOutputSize);
+    setCreditCost(spec.creditCost);
+    setParamsJson(JSON.stringify(spec.modelParameters ?? {}, null, 2));
   };
 
   const toggleCapability = (cap: CapabilityType) => {
@@ -479,12 +570,16 @@ export function ModelsSection({ locale }: { locale: Locale }) {
                 id="model-provider"
                 required
                 value={providerId}
-                onChange={(e) => setProviderId(e.target.value)}
+                onChange={(e) => {
+                  setProviderId(e.target.value);
+                  setDiscoveredModels([]);
+                  setDiscoverNote(null);
+                }}
               >
                 <option value="">{locale === 'fa' ? 'انتخاب ارائه‌دهنده...' : 'Select provider...'}</option>
                 {providers.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} ({t.providerTypes[p.providerType]})
+                    {p.name} — {t.providerTypes[p.providerType]}
                   </option>
                 ))}
               </Select>
@@ -496,7 +591,13 @@ export function ModelsSection({ locale }: { locale: Locale }) {
               <Select
                 id="model-category"
                 value={category}
-                onChange={(e) => setCategory(e.target.value as ModelCategory)}
+                onChange={(e) => {
+                  const nextCat = e.target.value as ModelCategory;
+                  setCategory(nextCat);
+                  if (!editing) {
+                    setCapabilities(DEFAULT_CAPS_BY_CATEGORY[nextCat] ?? ['text_generation', 'chat']);
+                  }
+                }}
               >
                 {MODEL_CATEGORIES.map((cat) => (
                   <option key={cat} value={cat}>
@@ -506,6 +607,81 @@ export function ModelsSection({ locale }: { locale: Locale }) {
               </Select>
             </div>
           </div>
+
+          {!editing && providerId && (
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                  {locale === 'fa'
+                    ? 'شناسایی خودکار مدل‌ها از ارائه‌دهنده'
+                    : 'Auto-discover models from provider'}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleDiscoverFromProvider}
+                    disabled={discovering || syncingAll}
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${discovering ? 'animate-spin' : ''}`} />
+                    <span>
+                      {discovering
+                        ? locale === 'fa'
+                          ? 'در حال دریافت...'
+                          : 'Discovering...'
+                        : locale === 'fa'
+                          ? 'دریافت لیست مدل‌ها'
+                          : 'Fetch Models'}
+                    </span>
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleSyncAllFromProvider}
+                    disabled={syncingAll || discovering}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>
+                      {syncingAll
+                        ? locale === 'fa'
+                          ? 'در حال ثبت...'
+                          : 'Syncing...'
+                        : locale === 'fa'
+                          ? 'افزودن خودکار همه'
+                          : 'Sync All Automatically'}
+                    </span>
+                  </Button>
+                </div>
+              </div>
+
+              {discoverNote && (
+                <div className="text-[11px] text-slate-600 dark:text-slate-400">{discoverNote}</div>
+              )}
+
+              {discoveredModels.length > 0 && (
+                <div className="max-h-40 overflow-y-auto divide-y divide-slate-200 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900">
+                  {discoveredModels.map((item) => (
+                    <button
+                      key={item.modelIdentifier}
+                      type="button"
+                      onClick={() => applyDiscoveredSpec(item)}
+                      className="w-full px-3 py-2 text-start flex items-center justify-between gap-2 hover:bg-blue-50/70 dark:hover:bg-blue-950/30 transition-colors cursor-pointer text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-900 dark:text-slate-100 truncate">{item.name}</div>
+                        <div dir="ltr" className="font-mono text-[11px] text-slate-500 truncate">
+                          {item.modelIdentifier}
+                        </div>
+                      </div>
+                      <span className="text-[11px] text-blue-700 dark:text-blue-400 shrink-0">
+                        {t.modelCategories[item.category]}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>

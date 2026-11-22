@@ -331,15 +331,71 @@ export async function getUserActivePlan(userId: string) {
   return activeSub ?? null;
 }
 
+export type ModelCategoryGroup = 'text' | 'image' | 'video' | 'audio' | 'multimodal' | 'all';
+
+function capabilityMatches(modelCaps: CapabilityType[], target: CapabilityType): boolean {
+  if (modelCaps.includes(target)) return true;
+  if (target === 'chat') return modelCaps.includes('text_generation');
+  if (target === 'text_generation') return modelCaps.includes('chat');
+  if (target === 'document_analysis') {
+    return modelCaps.includes('vision') || modelCaps.includes('chat');
+  }
+  return false;
+}
+
+function matchesCategoryGroup(
+  model: { category: ModelCategory; capabilities: CapabilityType[] },
+  group: ModelCategoryGroup,
+): boolean {
+  if (group === 'all') return true;
+  if (group === 'text') {
+    if (model.category === 'embedding') return false;
+    return (
+      model.category === 'llm' ||
+      model.category === 'multimodal' ||
+      model.capabilities.includes('chat') ||
+      model.capabilities.includes('text_generation')
+    );
+  }
+  if (group === 'image') {
+    return (
+      model.category === 'image' ||
+      model.capabilities.includes('image_generation') ||
+      model.capabilities.includes('image_editing') ||
+      model.capabilities.includes('image_variation')
+    );
+  }
+  if (group === 'video') {
+    return model.category === 'video' || model.capabilities.includes('video_generation');
+  }
+  if (group === 'audio') {
+    return (
+      model.category === 'audio' ||
+      model.capabilities.includes('speech_generation') ||
+      model.capabilities.includes('audio_transcription')
+    );
+  }
+  if (group === 'multimodal') {
+    return (
+      model.category === 'multimodal' ||
+      model.category === 'document' ||
+      model.capabilities.includes('vision') ||
+      model.capabilities.includes('document_analysis')
+    );
+  }
+  return true;
+}
+
 /**
- * Dynamically fetches enabled AI models from PostgreSQL for a user,
+ * Dynamically fetches enabled AI models from database for a user,
  * strictly honoring provider active status, model active status,
- * capability filter, plan allowedProviderIds, availableModelIds, and model allowedPlanTiers.
+ * capability/categoryGroup filter, plan allowedProviderIds, availableModelIds, and model allowedPlanTiers.
  */
 export async function getAvailableModelsForUser(params: {
   userId: string;
   capability?: CapabilityType;
   category?: ModelCategory;
+  categoryGroup?: ModelCategoryGroup;
 }): Promise<DynamicAvailableModel[]> {
   const db = getDb();
   const now = new Date();
@@ -426,7 +482,8 @@ export async function getAvailableModelsForUser(params: {
       if (modelAllowlist && !modelAllowlist.has(m.id)) return false;
       if (m.allowedPlanTiers.length > 0 && !m.allowedPlanTiers.includes(userTier)) return false;
       if (params.category && m.category !== params.category) return false;
-      if (params.capability && !m.capabilities.includes(params.capability)) return false;
+      if (params.categoryGroup && !matchesCategoryGroup(m, params.categoryGroup)) return false;
+      if (params.capability && !capabilityMatches(m.capabilities, params.capability)) return false;
       return true;
     })
     .map(({ allowedPlanTiers: _ignored, ...rest }) => rest);

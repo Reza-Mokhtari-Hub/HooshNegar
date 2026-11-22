@@ -40,6 +40,8 @@ export const providerTypeEnum = pgEnum('provider_type', [
   'anthropic',
   'replicate',
   'fal_ai',
+  'huggingface',
+  'huggingface_space',
   'custom',
 ]);
 
@@ -350,6 +352,13 @@ export const providerCredentials = pgTable(
     authTag: varchar('auth_tag', { length: 64 }).notNull(),
     keyVersion: integer('key_version').notNull().default(1),
     maskedPreview: varchar('masked_preview', { length: 64 }).notNull(),
+    priority: integer('priority').notNull().default(100),
+    status: varchar('status', { length: 32 }).notNull().default('active'),
+    cooldownUntil: timestamp('cooldown_until', { withTimezone: true }),
+    failureCount: integer('failure_count').notNull().default(0),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    lastErrorCode: varchar('last_error_code', { length: 64 }),
+    lastErrorMessage: text('last_error_message'),
     isActive: boolean('is_active').notNull().default(true),
     rotatedAt: timestamp('rotated_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
@@ -358,6 +367,7 @@ export const providerCredentials = pgTable(
   },
   (t) => [
     index('provider_credentials_provider_active_idx').on(t.providerId, t.isActive),
+    index('provider_credentials_pool_order_idx').on(t.providerId, t.isActive, t.priority),
   ],
 );
 

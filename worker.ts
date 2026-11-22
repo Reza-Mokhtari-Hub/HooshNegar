@@ -314,9 +314,15 @@ async function syncWorkerEnvToProcessEnv(
     }
   }
 
-  if (!procEnv['APP_URL']?.trim() && requestUrl) {
+  if (requestUrl) {
     try {
-      procEnv['APP_URL'] = new URL(requestUrl).origin;
+      const parsedOrigin = new URL(requestUrl).origin;
+      if (parsedOrigin.startsWith('https://')) {
+        reqCtx.requestOrigin = parsedOrigin;
+      }
+      if (!procEnv['APP_URL']?.trim() || (!procEnv['APP_URL'].startsWith('https://') && parsedOrigin.startsWith('https://'))) {
+        procEnv['APP_URL'] = parsedOrigin;
+      }
     } catch {
       // Ignore malformed request URL
     }

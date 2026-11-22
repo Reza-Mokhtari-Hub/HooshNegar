@@ -43,6 +43,63 @@ describe('Multi-Provider Protocol Adapters', () => {
       apiKey: 'fal_secret_key_12345',
     });
     expect(fal.headers.Authorization).toBe('Key fal_secret_key_12345');
+
+    const hf = getProviderAdapter('huggingface').buildTestRequest({
+      providerType: 'huggingface',
+      baseUrl: 'https://router.huggingface.co',
+      apiKey: 'hf_test_token_123456',
+    });
+    expect(hf.url).toBe('https://router.huggingface.co/v1/models');
+    expect(hf.headers.Authorization).toBe('Bearer hf_test_token_123456');
+
+    const hfSpace = getProviderAdapter('huggingface_space').buildTestRequest({
+      providerType: 'huggingface_space',
+      baseUrl: 'https://huggingface.co/spaces/Qwen/Qwen2.5-Max-Demo',
+      apiKey: '',
+    });
+    expect(hfSpace.url).toContain('qwen-qwen2-5-max-demo.hf.space/gradio_api/info');
+  });
+
+  it('normalizes Gemini base URLs containing /v1beta and resolves public HF Space info', async () => {
+    const geminiWithV1Beta = getProviderAdapter('google_gemini').buildTestRequest({
+      providerType: 'google_gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      apiKey: 'AIzaTest1234567890',
+    });
+    expect(geminiWithV1Beta.url).toBe('https://generativelanguage.googleapis.com/v1beta/models?pageSize=50');
+
+    const spaceFetch = (async (url: RequestInfo | URL) => {
+      const href = String(url);
+      if (href.includes('/api/spaces/')) {
+        return new Response(JSON.stringify({ host: 'https://qwen-demo.hf.space', sdk: 'gradio' }), {
+          status: 200,
+        });
+      }
+      if (href.endsWith('/gradio_api/info')) {
+        return new Response(
+          JSON.stringify({
+            named_endpoints: {
+              '/chat': { parameters: [{ label: 'Prompt' }], returns: [{ label: 'Reply' }] },
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const spaceRes = await testProviderConnection(
+      {
+        providerType: 'huggingface_space',
+        baseUrl: 'https://huggingface.co/spaces/Qwen/Demo',
+        apiKey: '',
+      },
+      spaceFetch,
+    );
+    expect(spaceRes.ok).toBe(true);
+    expect(spaceRes.status).toBe('connected');
+    expect(spaceRes.resolvedBaseUrl).toBe('https://qwen-demo.hf.space');
+    expect(spaceRes.discoveredModelsCount).toBe(1);
   });
 
   it('tests connection cleanly and redacts secrets on provider failure', async () => {

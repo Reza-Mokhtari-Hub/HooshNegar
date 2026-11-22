@@ -50,9 +50,15 @@ export interface StoragePutInput {
   ttlHours?: number;
 }
 
+export interface StorageObjectData {
+  buffer: Buffer;
+  mimeType: string;
+}
+
 export interface StorageAdapter {
   readonly providerName: 'r2' | 'local_temp';
   putObject(input: StoragePutInput): Promise<StoredObjectResult>;
+  getObject(objectKey: string): Promise<StorageObjectData | null>;
   getSignedDownloadUrl(objectKey: string, expiresInSeconds?: number): Promise<string | null>;
   deleteObject(objectKey: string): Promise<void>;
   cleanupExpiredFiles(): Promise<number>;
@@ -130,6 +136,25 @@ class CloudflareR2StorageAdapter implements StorageAdapter {
       localPath: null,
       expiresAt,
     };
+  }
+
+  async getObject(objectKey: string): Promise<StorageObjectData | null> {
+    try {
+      const out = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucketName,
+          Key: objectKey,
+        }),
+      );
+      if (!out.Body) return null;
+      const bytes = await out.Body.transformToByteArray();
+      return {
+        buffer: Buffer.from(bytes),
+        mimeType: out.ContentType ?? 'application/octet-stream',
+      };
+    } catch {
+      return null;
+    }
   }
 
   async getSignedDownloadUrl(objectKey: string, expiresInSeconds = 3600): Promise<string | null> {
@@ -227,6 +252,16 @@ class CloudflareNativeR2BindingAdapter implements StorageAdapter {
     };
   }
 
+  async getObject(objectKey: string): Promise<StorageObjectData | null> {
+    const obj = await this.bucket.get(objectKey);
+    if (!obj) return null;
+    const buf = Buffer.from(await obj.arrayBuffer());
+    return {
+      buffer: buf,
+      mimeType: obj.httpMetadata?.contentType ?? 'application/octet-stream',
+    };
+  }
+
   async getSignedDownloadUrl(objectKey: string): Promise<string | null> {
     if (this.publicBaseUrl) {
       return `${this.publicBaseUrl.replace(/\/+$/, '')}/${objectKey}`;
@@ -314,6 +349,15 @@ class CloudflareDurableObjectBlobAdapter implements StorageAdapter {
     };
   }
 
+  async getObject(objectKey: string): Promise<StorageObjectData | null> {
+    const blob = await this.getStore().getBlob(objectKey);
+    if (!blob) return null;
+    return {
+      buffer: Buffer.from(blob.dataBase64, 'base64'),
+      mimeType: blob.mimeType,
+    };
+  }
+
   async getSignedDownloadUrl(_objectKey: string): Promise<string | null> {
     return null;
   }
@@ -392,6 +436,34 @@ class LocalTempStorageAdapter implements StorageAdapter {
       localPath: fullPath,
       expiresAt,
     };
+  }
+
+  async getObject(objectKey: string): Promise<StorageObjectData | null> {
+    const safeRel = path.normalize(objectKey).replace(/^(\.\.(\/|\\|$))+/, '');
+    const fullPath = path.join(LOCAL_TEMP_DIR, safeRel);
+    try {
+      const buffer = await fs.readFile(fullPath);
+      const ext = path.extname(fullPath).toLowerCase();
+      const mimeType =
+        ext === '.png'
+          ? 'image/png'
+          : ext === '.webp'
+            ? 'image/webp'
+            : ext === '.jpg' || ext === '.jpeg'
+              ? 'image/jpeg'
+              : ext === '.mp3'
+                ? 'audio/mpeg'
+                : ext === '.ogg'
+                  ? 'audio/ogg'
+                  : ext === '.wav'
+                    ? 'audio/wav'
+                    : ext === '.mp4'
+                      ? 'video/mp4'
+                      : 'application/octet-stream';
+      return { buffer, mimeType };
+    } catch {
+      return null;
+    }
   }
 
   async getSignedDownloadUrl(_objectKey: string): Promise<string | null> {

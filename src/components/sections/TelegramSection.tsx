@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { PlugZap, Webhook, Save, RefreshCw } from 'lucide-react';
+import { PlugZap, Webhook, Save, RefreshCw, Smartphone, Copy, Check, ExternalLink } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
 import { DICTIONARIES, formatDateTime, formatNumber, type Locale } from '../../i18n';
 import type { ModelRecord } from './ModelsSection';
@@ -61,25 +61,34 @@ export function TelegramSection({ locale }: { locale: Locale }) {
 
   const [botToken, setBotToken] = useState('');
   const [webhookSecret, setWebhookSecret] = useState('');
+  const [miniAppUrl, setMiniAppUrl] = useState('');
+  const [copiedMiniApp, setCopiedMiniApp] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const [tgRes, modelsRes, whRes] = await Promise.all([
-        apiRequest<{ settings: TelegramSettingsDTO; suggestedWebhookUrl?: string }>('/api/telegram'),
+        apiRequest<{ settings: TelegramSettingsDTO; suggestedWebhookUrl?: string; miniAppUrl?: string }>('/api/telegram'),
         apiRequest<{ models: ModelRecord[] }>('/api/models'),
         apiRequest<LiveWebhookStatusDTO>('/api/telegram/webhook-status').catch(() => null),
       ]);
-      const browserHttpsWebhook =
+      const browserHttpsOrigin =
         typeof window !== 'undefined' && window.location.origin.startsWith('https://')
-          ? `${window.location.origin}/api/telegram/webhook`
+          ? window.location.origin
           : '';
+      const browserHttpsWebhook = browserHttpsOrigin
+        ? `${browserHttpsOrigin}/api/telegram/webhook`
+        : '';
       const resolvedWebhookUrl =
         tgRes.settings.webhookUrl || tgRes.suggestedWebhookUrl || browserHttpsWebhook;
       setSettings({
         ...tgRes.settings,
         webhookUrl: resolvedWebhookUrl,
       });
+      setMiniAppUrl(
+        tgRes.miniAppUrl ||
+          (browserHttpsOrigin ? `${browserHttpsOrigin}/miniapp` : typeof window !== 'undefined' ? `${window.location.origin}/miniapp` : ''),
+      );
       setModels(modelsRes.models);
       if (whRes) setWebhookStatus(whRes);
     } catch (err) {
@@ -101,8 +110,10 @@ export function TelegramSection({ locale }: { locale: Locale }) {
     try {
       const res = await apiRequest<{
         settings: TelegramSettingsDTO;
+        miniAppUrl?: string;
         connectionResult?: { ok: boolean; message: string; latencyMs: number } | null;
         webhookSyncResult?: { ok: boolean; message: string } | null;
+        menuButtonSyncResult?: { ok: boolean; message: string } | null;
       }>('/api/telegram', {
         method: 'PUT',
         body: {
@@ -120,6 +131,7 @@ export function TelegramSection({ locale }: { locale: Locale }) {
         },
       });
       if (res.settings) setSettings(res.settings);
+      if (res.miniAppUrl) setMiniAppUrl(res.miniAppUrl);
       setBotToken('');
       setWebhookSecret('');
 
@@ -134,9 +146,10 @@ export function TelegramSection({ locale }: { locale: Locale }) {
           text: `${res.connectionResult?.message ?? ''} — خطا در ثبت وب‌هوک: ${res.webhookSyncResult.message}`,
         });
       } else if (res.connectionResult?.ok && res.webhookSyncResult?.ok) {
+        const menuSuffix = res.menuButtonSyncResult?.ok ? ` — ${res.menuButtonSyncResult.message}` : '';
         setFeedback({
           tone: 'success',
-          text: `${res.connectionResult.message} (${res.connectionResult.latencyMs}ms) — ${res.webhookSyncResult.message}`,
+          text: `${res.connectionResult.message} (${res.connectionResult.latencyMs}ms) — ${res.webhookSyncResult.message}${menuSuffix}`,
         });
       } else if (res.connectionResult?.ok) {
         setFeedback({
@@ -190,11 +203,18 @@ export function TelegramSection({ locale }: { locale: Locale }) {
     setSyncingWebhook(true);
     setFeedback(null);
     try {
-      const res = await apiRequest<{ ok: boolean; message: string }>('/api/telegram/set-webhook', {
+      const res = await apiRequest<{
+        ok: boolean;
+        message: string;
+        miniAppUrl?: string;
+        menuButtonSyncResult?: { ok: boolean; message: string } | null;
+      }>('/api/telegram/set-webhook', {
         method: 'POST',
         body: { webhookUrl: settings?.webhookUrl },
       });
-      setFeedback({ tone: res.ok ? 'success' : 'danger', text: res.message });
+      if (res.miniAppUrl) setMiniAppUrl(res.miniAppUrl);
+      const menuNote = res.menuButtonSyncResult?.ok ? ` — ${res.menuButtonSyncResult.message}` : '';
+      setFeedback({ tone: res.ok ? 'success' : 'danger', text: `${res.message}${menuNote}` });
       await load();
     } catch (err) {
       setFeedback({ tone: 'danger', text: err instanceof Error ? err.message : 'خطا در ثبت وب‌هوک' });
@@ -329,6 +349,57 @@ export function TelegramSection({ locale }: { locale: Locale }) {
             </div>
           </div>
         )}
+      </Surface>
+
+      {/* Telegram Mini App Integration Info */}
+      <Surface className="p-4 flex flex-wrap items-center justify-between gap-4 text-xs">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-400 flex items-center justify-center shrink-0">
+            <Smartphone className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold text-slate-900 dark:text-slate-100">
+              {locale === 'fa' ? 'مینی‌اپ تلگرام (Telegram Mini App)' : 'Telegram Mini App'}
+            </div>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
+              {locale === 'fa'
+                ? 'با همگام‌سازی وب‌هوک، دکمه منوی چت تلگرام و دکمه شیشه‌ای دستور /start و /app به‌صورت خودکار به این مینی‌اپ متصل می‌شوند.'
+                : 'Syncing the webhook automatically binds Telegram Chat Menu Button and /start /app inline buttons to this Mini App.'}
+            </p>
+            {miniAppUrl && (
+              <div className="mt-1.5 flex items-center gap-2 text-[11px]">
+                <span className="text-slate-500">{locale === 'fa' ? 'آدرس مینی‌اپ: ' : 'Mini App URL: '}</span>
+                <span dir="ltr" className="font-mono text-slate-800 dark:text-slate-200 truncate max-w-md">
+                  {miniAppUrl}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {miniAppUrl && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                void navigator.clipboard?.writeText(miniAppUrl);
+                setCopiedMiniApp(true);
+                setTimeout(() => setCopiedMiniApp(false), 1800);
+              }}
+            >
+              {copiedMiniApp ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{copiedMiniApp ? (locale === 'fa' ? 'کپی شد' : 'Copied') : locale === 'fa' ? 'کپی لینک' : 'Copy URL'}</span>
+            </Button>
+          )}
+          <a
+            href="/miniapp"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 transition-colors"
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+            <span>{locale === 'fa' ? 'پیش‌نمایش مینی‌اپ' : 'Open Mini App'}</span>
+          </a>
+        </div>
       </Surface>
 
       <form onSubmit={handleSave} className="space-y-6">

@@ -64,6 +64,76 @@ export function normalizeWebhookUrl(rawUrl: string, fallbackHttpsOrigin?: string
   }
 }
 
+/**
+ * Resolves the HTTPS Mini App URL (`/miniapp`) from a webhook URL or HTTPS origin.
+ */
+export function normalizeMiniAppUrl(originOrWebhookUrl?: string | null): string {
+  const raw = originOrWebhookUrl?.trim() ?? '';
+  if (!raw || !raw.startsWith('https://')) return '';
+  try {
+    const parsed = new URL(raw);
+    return `${parsed.origin}/miniapp`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Configures the persistent Telegram Chat Menu Button (`setChatMenuButton`) to launch
+ * the HooshNegar Telegram Mini App alongside the bot.
+ */
+export async function syncTelegramChatMenuButton(
+  botToken: string,
+  miniAppUrl: string,
+  buttonText = 'اپ هوش‌نگار',
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: boolean; message: string }> {
+  const cleanToken = normalizeBotToken(botToken);
+  const cleanUrl = normalizeMiniAppUrl(miniAppUrl);
+  if (!cleanToken || !cleanUrl) {
+    return {
+      ok: false,
+      message: 'برای تنظیم دکمه منوی مینی‌اپ، آدرس HTTPS معتبر الزامی است.',
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetchImpl(`https://api.telegram.org/bot${cleanToken}/setChatMenuButton`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        menu_button: {
+          type: 'web_app',
+          text: buttonText.slice(0, 64),
+          web_app: { url: cleanUrl },
+        },
+      }),
+      signal: controller.signal,
+    });
+    const json = (await res.json()) as { ok?: boolean; description?: string };
+    if (!res.ok || !json.ok) {
+      return {
+        ok: false,
+        message: redactSecrets(json.description ?? `HTTP ${res.status}`, [cleanToken]),
+      };
+    }
+    return {
+      ok: true,
+      message: `دکمه منوی مینی‌اپ روی ${cleanUrl} تنظیم شد.`,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'خطا در تنظیم دکمه منوی مینی‌اپ';
+    return {
+      ok: false,
+      message: redactSecrets(msg, [cleanToken]),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function formatTelegramApiErrorFa(statusCode: number, description: string | undefined, botToken: string): string {
   const cleanDesc = redactSecrets(description ?? `HTTP ${statusCode}`, [botToken]);
   if (statusCode === 401 || /unauthorized/i.test(cleanDesc)) {

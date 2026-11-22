@@ -12,11 +12,14 @@ import {
   generateWebhookSecret,
   getTelegramWebhookStatus,
   normalizeBotToken,
+  normalizeMiniAppUrl,
   normalizeWebhookUrl,
+  syncTelegramChatMenuButton,
   syncTelegramWebhook,
   testTelegramBotConnection,
 } from '../services/telegramService.ts';
 import { recordAuditLog } from '../security/audit.ts';
+import { getCloudflareRequestContext } from '../cloudflare/requestContext.ts';
 import {
   getClientIp,
   requireAdminAuth,
@@ -25,6 +28,10 @@ import {
 } from '../middleware/auth.ts';
 
 function resolveHttpsOrigin(req: AdminRequest): string | null {
+  const cfOrigin = getCloudflareRequestContext()?.requestOrigin?.trim();
+  if (cfOrigin && cfOrigin.startsWith('https://')) {
+    return cfOrigin;
+  }
   const envUrl = process.env.APP_URL?.trim();
   if (envUrl && envUrl.startsWith('https://')) {
     try {
@@ -116,19 +123,26 @@ export function createTelegramAdminRouter(): Router {
         await db.update(telegramBotSettings).set(patch).where(eq(telegramBotSettings.id, row.id));
 
         const syncRes = await syncTelegramWebhook(botToken, requestedUrl, webhookSecret);
-        if (syncRes.ok && (row.connectionStatus !== 'connected' || !row.botUsername)) {
-          const testRes = await testTelegramBotConnection(botToken);
-          await db
-            .update(telegramBotSettings)
-            .set({
-              connectionStatus: testRes.status,
-              lastTestedAt: new Date(),
-              lastTestMessage: testRes.message,
-              botUsername: testRes.botInfo?.username || row.botUsername,
-              botDisplayName: testRes.botInfo?.firstName || row.botDisplayName,
-              updatedAt: new Date(),
-            })
-            .where(eq(telegramBotSettings.id, row.id));
+        const miniAppUrl = normalizeMiniAppUrl(requestedUrl);
+        let menuButtonRes: { ok: boolean; message: string } | null = null;
+        if (syncRes.ok) {
+          if (miniAppUrl) {
+            menuButtonRes = await syncTelegramChatMenuButton(botToken, miniAppUrl);
+          }
+          if (row.connectionStatus !== 'connected' || !row.botUsername) {
+            const testRes = await testTelegramBotConnection(botToken);
+            await db
+              .update(telegramBotSettings)
+              .set({
+                connectionStatus: testRes.status,
+                lastTestedAt: new Date(),
+                lastTestMessage: testRes.message,
+                botUsername: testRes.botInfo?.username || row.botUsername,
+                botDisplayName: testRes.botInfo?.firstName || row.botDisplayName,
+                updatedAt: new Date(),
+              })
+              .where(eq(telegramBotSettings.id, row.id));
+          }
         }
 
         await recordAuditLog({
@@ -141,11 +155,15 @@ export function createTelegramAdminRouter(): Router {
           status: syncRes.ok ? 'success' : 'failure',
           ipAddress: ip,
           userAgent: ua,
-          details: { webhookUrl: requestedUrl, ok: syncRes.ok },
+          details: { webhookUrl: requestedUrl, miniAppUrl, ok: syncRes.ok, menuButtonOk: menuButtonRes?.ok ?? null },
           extraSecretsToRedact: [botToken, webhookSecret ?? ''],
         });
 
-        res.status(syncRes.ok ? 200 : 400).json(syncRes);
+        res.status(syncRes.ok ? 200 : 400).json({
+          ...syncRes,
+          miniAppUrl,
+          menuButtonSyncResult: menuButtonRes,
+        });
       } catch (err) {
         if (err instanceof EncryptionKeyUnavailableError) {
           res.status(503).json({ error: err.message, code: 'ENCRYPTION_KEY_MISSING' });

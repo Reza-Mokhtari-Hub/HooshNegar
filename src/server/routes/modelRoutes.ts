@@ -11,6 +11,7 @@ import {
   type AdminRequest,
 } from '../middleware/auth.ts';
 import { getSystemBillingSettings } from '../services/walletService.ts';
+import { normalizeModelIdentifierForProvider } from '../providers/discovery.ts';
 
 export function createModelRouter(): Router {
   const router = Router();
@@ -107,7 +108,11 @@ export function createModelRouter(): Router {
 
       // Verify provider exists
       const [provider] = await db
-        .select({ id: aiProviders.id, name: aiProviders.name })
+        .select({
+          id: aiProviders.id,
+          name: aiProviders.name,
+          providerType: aiProviders.providerType,
+        })
         .from(aiProviders)
         .where(eq(aiProviders.id, data.providerId))
         .limit(1);
@@ -117,6 +122,10 @@ export function createModelRouter(): Router {
         return;
       }
 
+      const normalizedModelIdentifier = normalizeModelIdentifierForProvider(
+        provider.providerType,
+        data.modelIdentifier,
+      );
       const uniqueCaps = Array.from(new Set(data.capabilities));
 
       const created = await db.transaction(async (tx) => {
@@ -132,7 +141,7 @@ export function createModelRouter(): Router {
           .values({
             providerId: data.providerId,
             name: data.name,
-            modelIdentifier: data.modelIdentifier,
+            modelIdentifier: normalizedModelIdentifier,
             category: data.category,
             description: data.description,
             inputPricePerMillion: String(data.inputPricePerMillion),
@@ -232,7 +241,17 @@ export function createModelRouter(): Router {
         };
         if (data.providerId !== undefined) updatePayload.providerId = data.providerId;
         if (data.name !== undefined) updatePayload.name = data.name;
-        if (data.modelIdentifier !== undefined) updatePayload.modelIdentifier = data.modelIdentifier;
+        if (data.modelIdentifier !== undefined) {
+          const targetProviderId = data.providerId ?? existing.providerId;
+          const [targetProv] = await tx
+            .select({ providerType: aiProviders.providerType })
+            .from(aiProviders)
+            .where(eq(aiProviders.id, targetProviderId))
+            .limit(1);
+          updatePayload.modelIdentifier = targetProv
+            ? normalizeModelIdentifierForProvider(targetProv.providerType, data.modelIdentifier)
+            : data.modelIdentifier;
+        }
         if (data.category !== undefined) updatePayload.category = data.category;
         if (data.description !== undefined) updatePayload.description = data.description;
         if (data.inputPricePerMillion !== undefined)

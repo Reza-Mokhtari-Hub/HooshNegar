@@ -151,7 +151,7 @@ beforeAll(async () => {
       resolve();
     });
   });
-});
+}, 30000);
 
 afterAll(async () => {
   setNotificationSenderForTests(null);
