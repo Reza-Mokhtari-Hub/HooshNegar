@@ -188,6 +188,7 @@ export interface VideoJobPollOutput {
   videoUrl?: string;
   mimeType?: string;
   errorMessage?: string;
+  sessionExpired?: boolean;
   costUsd?: number;
 }
 

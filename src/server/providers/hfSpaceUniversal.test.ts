@@ -4,6 +4,8 @@ import {
   editImageWithRoute,
   extractGradioMediaUrl,
   extractGradioOutputText,
+  generateImageWithRoute,
+  generateSpeechWithRoute,
   generateTextWithRoute,
   pollMediaGenerationJob,
   pollVideoGenerationJob,
@@ -639,25 +641,25 @@ describe('Universal Hugging Face Space Engine', () => {
     }
   });
 
-  it('hands off slow HF Space image jobs to async pending and finishes via pollMediaGenerationJob', async () => {
+  it('hands off slow HF Space image jobs to async pending without prematurely aborting SSE and finishes via pollMediaGenerationJob', async () => {
     const originalFetch = globalThis.fetch;
     try {
-      let pollHit = false;
+      let sseGetCountDuringStart = 0;
+      let startedCompleted = false;
       globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
         if (url.endsWith('/gradio_api/call/generate') && init?.method === 'POST') {
-          return new Response(JSON.stringify({ event_id: 'evt_slow_img_77' }), { status: 200 });
+          return new Response(JSON.stringify({ event_id: 'evt_slow_img_77' }), {
+            status: 200,
+            headers: { 'set-cookie': 'hf_rep=replica-a; Path=/; HttpOnly' },
+          });
         }
         if (url.endsWith('/gradio_api/call/generate/evt_slow_img_77')) {
-          if (!pollHit) {
-            pollHit = true;
-            // Hold SSE open until abort signal fires from syncWaitCapMs
-            return new Promise<Response>((_, reject) => {
-              init?.signal?.addEventListener('abort', () => {
-                reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
-              });
-            });
+          if (!startedCompleted) {
+            sseGetCountDuringStart += 1;
           }
+          const sentCookie = new Headers(init?.headers).get('cookie') ?? '';
+          expect(sentCookie).toContain('hf_rep=replica-a');
           const sse = `event: complete\ndata: [{"url":"https://slow-img.hf.space/gradio_api/file=/tmp/final_img.png","path":"/tmp/final_img.png"}]\n\n`;
           return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
         }
@@ -685,13 +687,25 @@ describe('Universal Hugging Face Space Engine', () => {
         { prompt: 'Epic mountain sunset' },
         { syncWaitCapMs: 500 },
       );
+      startedCompleted = true;
+      expect(sseGetCountDuringStart).toBe(0);
       expect(started.kind).toBe('pending');
       if (started.kind !== 'pending') throw new Error('Expected pending');
       expect(started.providerJobId).toBe('evt_slow_img_77');
+      expect(started.metadata.spaceCookie).toBe('hf_rep=replica-a');
 
       const polled = await pollMediaGenerationJob(ctx, started.providerJobId, started.metadata);
       expect(polled.status).toBe('succeeded');
       expect(polled.images?.length).toBe(1);
+
+      // Verify Gradio 404 SSE event ("404: Not Found" / "404: Session not found.") marks sessionExpired: true
+      globalThis.fetch = (async () => {
+        const sse = `event: error\ndata: "404: Session not found."\n\n`;
+        return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }) as typeof fetch;
+      const expiredPoll = await pollMediaGenerationJob(ctx, 'evt_gone', started.metadata);
+      expect(expiredPoll.status).toBe('failed');
+      expect(expiredPoll.sessionExpired).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -796,4 +810,87 @@ describe('Universal Hugging Face Space Engine', () => {
       globalThis.fetch = originalFetch;
     }
   }, 15_000);
+
+  it('maps OpenAI voice names cleanly for Gemini TTS and classifies Cloudflare 8007 NSFW errors as INVALID_PROMPT', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let capturedVoice = '';
+      globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        const parsed = JSON.parse(String(init?.body)) as {
+          generationConfig?: { speechConfig?: { voiceConfig?: { prebuiltVoiceConfig?: { voiceName?: string } } } };
+        };
+        capturedVoice =
+          parsed.generationConfig?.speechConfig?.voiceConfig?.prebuiltVoiceConfig?.voiceName ?? '';
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      inlineData: {
+                        mimeType: 'audio/wav',
+                        data: Buffer.from([0x52, 0x49, 0x46, 0x46]).toString('base64'),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }) as typeof fetch;
+
+      const geminiTtsCtx: ProviderExecutionContext = {
+        providerId: 'prov-gem-tts',
+        providerName: 'Gemini',
+        providerType: 'google_gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        apiKey: 'AIzaTestKey123456',
+        modelId: 'mod-gem-tts',
+        modelName: 'Gemini 2.5 Flash Preview TTS',
+        modelIdentifier: 'gemini-2.5-flash-preview-tts',
+        supportedCapabilities: ['speech_generation'],
+      };
+      const ttsOut = await generateSpeechWithRoute(
+        { primary: geminiTtsCtx, fallback: null },
+        { text: 'سلام کاربر عزیز', voice: 'alloy' },
+      );
+      expect(capturedVoice).toBe('Aoede');
+      expect(ttsOut.result.audioBuffer.byteLength).toBeGreaterThan(0);
+
+      const cfCtx: ProviderExecutionContext = {
+        providerId: 'prov-cf-ai',
+        providerName: 'Cloudflare Workers AI',
+        providerType: 'cloudflare_workers_ai',
+        baseUrl: 'https://workers-ai.cloudflare.internal',
+        apiKey: 'cf_binding',
+        modelId: 'mod-cf-flux',
+        modelName: 'FLUX.1 Schnell',
+        modelIdentifier: '@cf/black-forest-labs/flux-1-schnell',
+        supportedCapabilities: ['image_generation'],
+      };
+      let cfErr: unknown = null;
+      try {
+        await runWithCloudflareRequestContext(
+          {
+            aiBinding: {
+              run: async () => {
+                throw new Error('8007: Input prompt contains NSFW content.');
+              },
+            },
+          },
+          () => generateImageWithRoute({ primary: cfCtx, fallback: null }, { prompt: 'unsafe test' }),
+        );
+      } catch (err) {
+        cfErr = err;
+      }
+      expect(cfErr).toBeInstanceOf(AIProviderError);
+      expect((cfErr as AIProviderError).code).toBe('INVALID_PROMPT');
+      expect((cfErr as AIProviderError).credentialFailureKind).toBe('prompt_error');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

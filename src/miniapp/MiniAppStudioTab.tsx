@@ -129,7 +129,10 @@ export function MiniAppStudioTab({
   useEffect(() => {
     if (!pollingJobId) return;
     let cancelled = false;
+    let inFlight = false;
     const timer = setInterval(async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         const res = await miniAppRequest<{
           job: {
@@ -175,6 +178,8 @@ export function MiniAppStudioTab({
         }
       } catch {
         // Keep polling on transient glitch
+      } finally {
+        inFlight = false;
       }
     }, 3500);
 

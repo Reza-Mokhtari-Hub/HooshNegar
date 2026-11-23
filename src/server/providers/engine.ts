@@ -273,6 +273,17 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
     return classifyHttpError(numericStatus, rawMsg, apiKey);
   }
 
+  if (/\b8007\b|input prompt contains nsfw|nsfw content|content policy|safety filter|flagged for safety/i.test(rawMsg)) {
+    return new AIProviderError({
+      code: 'INVALID_PROMPT',
+      message: msg,
+      userMessageFa:
+        'پرامپت واردشده توسط فیلتر ایمنی این مدل مجاز شناخته نشد. لطفاً متن خود را تغییر دهید یا از مدل‌های بدون محدودیت استفاده کنید.',
+      retryable: false,
+      credentialFailureKind: 'prompt_error',
+    });
+  }
+
   if (isInvalidKeySignal(rawMsg)) {
     return new AIProviderError({
       code: 'INVALID_API_KEY',
@@ -1160,18 +1171,21 @@ interface StoredGradioParamSpec {
 
 function createHfDeadline(mode: 'sync' | 'video_poll', ctx?: ProviderExecutionContext): number {
   const cfCtx = getCloudflareRequestContext();
-  const isCfRuntime = isCloudflareWorker() || Boolean(cfCtx?.waitUntil) || Boolean(cfCtx?.childWaitUntilTasks);
+  const isCfWaitUntil = Boolean(cfCtx?.childWaitUntilTasks);
+  const isCfRuntime = isCloudflareWorker() || Boolean(cfCtx?.waitUntil) || isCfWaitUntil;
   const storeDeadline = attemptBudgetAls.getStore()?.deadlineAtMs;
   const ctxDeadline = ctx?.attemptDeadlineAtMs;
 
+  // Inside an inbound HTTP request (including QStash /api/jobs/poll on Cloudflare Workers), upstream fetch I/O
+  // has no 30s wall-clock waitUntil cap, so give the single Gradio SSE stream enough room to complete cleanly.
   const baseMs =
     mode === 'video_poll'
-      ? isCfRuntime
-        ? 17_000
-        : 28_000
+      ? isCfWaitUntil
+        ? 23_000
+        : 75_000
       : isCfRuntime
         ? 18_500
-        : 70_000;
+        : 75_000;
 
   let deadline = Date.now() + baseMs;
   if (typeof ctxDeadline === 'number') deadline = Math.min(deadline, ctxDeadline);
@@ -2277,7 +2291,29 @@ export function buildGradioInputPayload(
 
 type GradioSubmitResult =
   | { kind: 'immediate'; outputData: unknown[]; spaceHost: string; endpointPrefix: string }
-  | { kind: 'event'; eventId: string; callUrl: string; spaceHost: string; endpointPrefix: string };
+  | {
+      kind: 'event';
+      eventId: string;
+      callUrl: string;
+      spaceHost: string;
+      endpointPrefix: string;
+      spaceCookie?: string;
+    };
+
+function extractResponseCookieHeader(headers: Headers): string | undefined {
+  const anyHeaders = headers as Headers & { getSetCookie?: () => string[] };
+  const rawList =
+    typeof anyHeaders.getSetCookie === 'function'
+      ? anyHeaders.getSetCookie()
+      : headers.get('set-cookie')
+        ? [headers.get('set-cookie')!]
+        : [];
+  if (!rawList || rawList.length === 0) return undefined;
+  const pairs = rawList
+    .map((line) => line.split(';')[0]?.trim())
+    .filter((pair): pair is string => Boolean(pair && pair.includes('=')));
+  return pairs.length > 0 ? pairs.join('; ') : undefined;
+}
 
 async function submitGradioSpaceCall(
   ctx: ProviderExecutionContext,
@@ -2436,12 +2472,14 @@ async function submitGradioSpaceCall(
     });
   }
 
+  const spaceCookie = extractResponseCookieHeader(submitRes.headers);
   return {
     kind: 'event',
     eventId: parsedSubmit.event_id,
     callUrl: activeCallUrl,
     spaceHost,
     endpointPrefix: normalizedPrefix,
+    ...(spaceCookie ? { spaceCookie } : {}),
   };
 }
 
@@ -2469,16 +2507,30 @@ function parseGradioSseBlock(
   return null;
 }
 
+function isGradio404SessionErrorText(raw: string): boolean {
+  const cleaned = raw.replace(/^["'\s]+|["'\s]+$/g, '').toLowerCase();
+  return (
+    cleaned.startsWith('404:') ||
+    cleaned === '404' ||
+    cleaned.includes('session not found') ||
+    cleaned === 'not found'
+  );
+}
+
 function buildGradioSseError(raw: string, apiKey: string): AIProviderError {
   const isQuota = isQuotaExhaustedSignal(raw);
+  const isSession404 = isGradio404SessionErrorText(raw);
   const safeDetail = redactSecrets(raw.slice(0, 300), apiKey ? [apiKey] : []);
   return new AIProviderError({
     code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
     message: `HF Space error: ${safeDetail}`,
     userMessageFa: isQuota
       ? 'سرویس این مدل موقتاً شلوغ است (محدودیت سهمیه GPU). لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
-      : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
+      : isSession404
+        ? 'نشست پردازش روی سرور مدل منقضی شد. لطفاً دوباره تلاش کنید.'
+        : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
     retryable: true,
+    httpStatus: isSession404 ? 404 : undefined,
     credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
   });
 }
@@ -2488,6 +2540,7 @@ async function readGradioSpaceSse(params: {
   eventId: string;
   apiKey: string;
   additionalHeaders?: Record<string, string>;
+  cookieHeader?: string;
   deadlineAtMs: number;
   signal?: AbortSignal;
 }): Promise<{ status: 'complete'; outputData: unknown[] } | { status: 'timeout' }> {
@@ -2521,6 +2574,7 @@ async function readGradioSpaceSse(params: {
 
   const authHeaders: Record<string, string> = { Accept: 'text/event-stream' };
   if (params.apiKey.trim()) authHeaders.Authorization = `Bearer ${params.apiKey.trim()}`;
+  if (params.cookieHeader?.trim()) authHeaders.Cookie = params.cookieHeader.trim();
   const mergedHeaders = mergeHeaders(authHeaders, params.additionalHeaders);
 
   const sseUrl = `${params.callUrl}/${encodeURIComponent(params.eventId)}`;
@@ -4227,14 +4281,22 @@ async function executeHfSpaceImageInternal(
     credentialId: ctx.credentialId ?? null,
     aspectRatio: params.aspectRatio ?? '1:1',
     modelName: ctx.modelName,
+    submittedAtMs: Date.now(),
+    ...(submitted.spaceCookie ? { spaceCookie: submitted.spaceCookie } : {}),
   };
 
   const attemptRemainingMs =
     typeof attemptBudgetAls.getStore()?.deadlineAtMs === 'number'
       ? attemptBudgetAls.getStore()!.deadlineAtMs! - Date.now()
       : deadlineAtMs - Date.now();
+  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
+  const hasShortSyncCap = typeof params.syncWaitCapMs === 'number' && params.syncWaitCapMs <= 20_000;
 
-  if (params.allowPending && attemptRemainingMs < 1500) {
+  // Gradio 5/6 /gradio_api/call/<api>/<event_id> SSE streams are one-shot: aborting GET mid-generation
+  // causes Gradio to evict the session and fail subsequent polls with "404: Session not found" / "404: Not Found".
+  // When running under a short sync cap or Cloudflare waitUntil, hand off immediately after POST so the
+  // single uninterrupted GET opens later in pollMediaGenerationJob and collects the buffered result cleanly.
+  if (params.allowPending && (isCfBackgroundWaitUntil || hasShortSyncCap || attemptRemainingMs < 20_000)) {
     return {
       kind: 'pending',
       providerJobId: submitted.eventId,
@@ -4243,12 +4305,13 @@ async function executeHfSpaceImageInternal(
     };
   }
 
-  // Check if we still have enough time to wait briefly on SSE for quick Spaces
+  // Full background / Node.js run: hold ONE uninterrupted SSE stream to completion
   const sseResult = await readGradioSpaceSse({
     callUrl: submitted.callUrl,
     eventId: submitted.eventId,
     apiKey: resolvedCtx.apiKey,
     additionalHeaders: resolvedCtx.additionalHeaders,
+    cookieHeader: submitted.spaceCookie,
     deadlineAtMs,
     signal: params.signal,
   });
@@ -4910,6 +4973,98 @@ export async function transcribeAudioWithRoute(
   return runWithFailover(route, (ctx) => executeTranscribeOnProvider(ctx, input));
 }
 
+const GEMINI_ALLOWED_VOICES = [
+  'Achernar',
+  'Achird',
+  'Algenib',
+  'Algieba',
+  'Alnilam',
+  'Aoede',
+  'Autonoe',
+  'Callirrhoe',
+  'Charon',
+  'Despina',
+  'Enceladus',
+  'Erinome',
+  'Fenrir',
+  'Gacrux',
+  'Iapetus',
+  'Kore',
+  'Laomedeia',
+  'Leda',
+  'Orus',
+  'Puck',
+  'Pulcherrima',
+  'Rasalgethi',
+  'Sadachbia',
+  'Sadaltager',
+  'Schedar',
+  'Sulafat',
+  'Umbriel',
+  'Vindemiatrix',
+  'Zephyr',
+  'Zubenelgenubi',
+] as const;
+
+const OPENAI_TO_GEMINI_VOICE_MAP: Record<string, string> = {
+  alloy: 'Aoede',
+  echo: 'Charon',
+  fable: 'Leda',
+  onyx: 'Fenrir',
+  nova: 'Zephyr',
+  shimmer: 'Kore',
+  ash: 'Orus',
+  coral: 'Callirrhoe',
+  sage: 'Puck',
+  ballad: 'Gacrux',
+  verse: 'Autonoe',
+};
+
+const GEMINI_TO_OPENAI_VOICE_MAP: Record<string, string> = {
+  kore: 'nova',
+  puck: 'echo',
+  aoede: 'alloy',
+  charon: 'onyx',
+  fenrir: 'onyx',
+  zephyr: 'shimmer',
+  leda: 'fable',
+  orus: 'ash',
+  callirrhoe: 'coral',
+};
+
+const OPENAI_ALLOWED_VOICES = new Set([
+  'alloy',
+  'ash',
+  'ballad',
+  'coral',
+  'echo',
+  'fable',
+  'onyx',
+  'nova',
+  'sage',
+  'shimmer',
+  'verse',
+  'marin',
+  'cedar',
+]);
+
+function normalizeGeminiVoiceName(voice?: string): string {
+  const clean = (voice ?? '').trim();
+  if (!clean) return 'Kore';
+  const lower = clean.toLowerCase();
+  const mapped = OPENAI_TO_GEMINI_VOICE_MAP[lower];
+  if (mapped) return mapped;
+  const matched = GEMINI_ALLOWED_VOICES.find((v) => v.toLowerCase() === lower);
+  return matched ?? 'Kore';
+}
+
+function normalizeOpenAiVoiceName(voice?: string): string {
+  const clean = (voice ?? '').trim().toLowerCase();
+  if (!clean) return 'alloy';
+  if (OPENAI_ALLOWED_VOICES.has(clean)) return clean;
+  return GEMINI_TO_OPENAI_VOICE_MAP[clean] ?? 'alloy';
+}
+
 async function executeSpeechOnProvider(
   ctx: ProviderExecutionContext,
   input: SpeechGenerationInput,
@@ -4922,7 +5077,7 @@ async function executeSpeechOnProvider(
     if (ctx.providerType === 'google_gemini') {
       const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
       const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
-      const voiceName = input.voice || 'Kore';
+      const voiceName = normalizeGeminiVoiceName(input.voice);
       const url = `${root}/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
       const res = await fetchWithTimeout(
         url,
@@ -4983,7 +5138,7 @@ async function executeSpeechOnProvider(
           body: JSON.stringify({
             model: ctx.modelIdentifier,
             input: input.text,
-            voice: input.voice || 'alloy',
+            voice: normalizeOpenAiVoiceName(input.voice),
             response_format: 'mp3',
           }),
         },
@@ -5429,6 +5584,8 @@ export async function startVideoGenerationWithRoute(
           spaceHost: submitted.spaceHost,
           endpointPrefix: submitted.endpointPrefix,
           credentialId: ctx.credentialId ?? null,
+          submittedAtMs: Date.now(),
+          ...(submitted.spaceCookie ? { spaceCookie: submitted.spaceCookie } : {}),
         };
 
         // On Cloudflare Workers (30s waitUntil ceiling), return immediately after POST so Gradio
@@ -5450,6 +5607,7 @@ export async function startVideoGenerationWithRoute(
           eventId: submitted.eventId,
           apiKey: resolvedCtx.apiKey,
           additionalHeaders: resolvedCtx.additionalHeaders,
+          cookieHeader: submitted.spaceCookie,
           deadlineAtMs,
           signal: input.signal,
         });
@@ -5679,12 +5837,16 @@ export async function pollVideoGenerationJob(
           ? metadata.callUrl
           : `${spaceHost}${normalizedPrefix}/call/${apiName}`;
 
+      const spaceCookie =
+        typeof metadata?.spaceCookie === 'string' && metadata.spaceCookie ? metadata.spaceCookie : undefined;
+
       try {
         const sseResult = await readGradioSpaceSse({
           callUrl,
           eventId: providerJobId,
           apiKey: ctx.apiKey,
           additionalHeaders: ctx.additionalHeaders,
+          cookieHeader: spaceCookie,
           deadlineAtMs,
         });
 
@@ -5722,10 +5884,11 @@ export async function pollVideoGenerationJob(
         };
       } catch (pollErr) {
         if (pollErr instanceof AIProviderError) {
-          if (pollErr.httpStatus === 404) {
+          if (pollErr.httpStatus === 404 || isGradio404SessionErrorText(pollErr.message)) {
             return {
               status: 'failed',
               progressPercent: 0,
+              sessionExpired: true,
               errorMessage: 'شناسه پردازش ویدیو در سرور منقضی شد. لطفاً دوباره تلاش کنید.',
             };
           }
@@ -5753,7 +5916,7 @@ export async function pollMediaGenerationJob(
   providerJobId: string,
   metadata?: Record<string, unknown>,
   options?: { maxWaitMs?: number },
-): Promise<MediaJobPollOutput> {
+): Promise<MediaJobPollOutput & { sessionExpired?: boolean }> {
   try {
     if (
       isHuggingFaceSpaceContext(ctx) ||
@@ -5762,7 +5925,7 @@ export async function pollMediaGenerationJob(
     ) {
       let deadlineAtMs = createHfDeadline('video_poll', ctx);
       if (typeof options?.maxWaitMs === 'number' && options.maxWaitMs > 0) {
-        deadlineAtMs = Math.min(deadlineAtMs, Date.now() + options.maxWaitMs);
+        deadlineAtMs = Date.now() + options.maxWaitMs;
       }
 
       const spaceHost =
@@ -5790,6 +5953,8 @@ export async function pollMediaGenerationJob(
         typeof metadata?.callUrl === 'string' && metadata.callUrl
           ? metadata.callUrl
           : `${spaceHost}${normalizedPrefix}/call/${apiName}`;
+      const spaceCookie =
+        typeof metadata?.spaceCookie === 'string' && metadata.spaceCookie ? metadata.spaceCookie : undefined;
 
       try {
         const sseResult = await readGradioSpaceSse({
@@ -5797,6 +5962,7 @@ export async function pollMediaGenerationJob(
           eventId: providerJobId,
           apiKey: ctx.apiKey,
           additionalHeaders: ctx.additionalHeaders,
+          cookieHeader: spaceCookie,
           deadlineAtMs,
         });
 
@@ -5838,10 +6004,11 @@ export async function pollMediaGenerationJob(
         };
       } catch (pollErr) {
         if (pollErr instanceof AIProviderError) {
-          if (pollErr.httpStatus === 404) {
+          if (pollErr.httpStatus === 404 || isGradio404SessionErrorText(pollErr.message)) {
             return {
               status: 'failed',
               progressPercent: 0,
+              sessionExpired: true,
               errorMessage: 'شناسه پردازش تصویر در سرور منقضی شد. لطفاً دوباره تلاش کنید.',
             };
           }

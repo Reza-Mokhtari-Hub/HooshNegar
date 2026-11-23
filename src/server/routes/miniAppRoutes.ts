@@ -971,18 +971,45 @@ export function createMiniAppRouter(): Router {
         }
       }
 
-      // Active client-driven polling fallback when no durable external queue is configured (or rescue if delayed >25s)
+      // Active client-driven polling fallback when no durable external queue is configured (or rescue if stalled >95s)
       if ((job.status === 'running' || job.status === 'queued') && job.providerJobId) {
         const meta = (job.resultMetadata ?? {}) as Record<string, unknown>;
+        const isHfGradio =
+          meta.kind === 'hf_space_gradio_media' || meta.kind === 'hf_space_gradio';
+        const submittedAtMs =
+          typeof meta.submittedAtMs === 'number'
+            ? meta.submittedAtMs
+            : new Date(job.createdAt).getTime();
         const lastPolledAtMs =
           typeof meta.lastPolledAtMs === 'number'
             ? meta.lastPolledAtMs
             : new Date(job.updatedAt).getTime();
-        const ageSincePollMs = Date.now() - lastPolledAtMs;
-        const shouldAdvancePoll =
-          (!hasDurableAsyncQueue() && ageSincePollMs >= 2_200) || ageSincePollMs >= 25_000;
+        const pollLockUntilMs =
+          typeof meta.pollLockUntilMs === 'number' ? meta.pollLockUntilMs : 0;
+        const nowMs = Date.now();
+        const ageSincePollMs = nowMs - lastPolledAtMs;
+        const ageSinceSubmitMs = nowMs - submittedAtMs;
+        const lockFree = nowMs >= pollLockUntilMs;
+
+        const shouldAdvancePoll = isHfGradio
+          ? lockFree &&
+            (hasDurableAsyncQueue()
+              ? ageSincePollMs >= 95_000
+              : ageSinceSubmitMs >= 12_000 && ageSincePollMs >= 2_500)
+          : (!hasDurableAsyncQueue() && ageSincePollMs >= 2_200) || ageSincePollMs >= 25_000;
 
         if (shouldAdvancePoll) {
+          if (isHfGradio) {
+            await db
+              .update(generationJobs)
+              .set({
+                resultMetadata: { ...meta, pollLockUntilMs: nowMs + 50_000 },
+                updatedAt: new Date(),
+              })
+              .where(eq(generationJobs.id, job.id))
+              .catch(() => null);
+          }
+
           if (job.capability === 'video_generation') {
             await executeVideoPollJob(job.id, { scheduleNextPoll: false }).catch(() => null);
           } else if (
@@ -991,7 +1018,7 @@ export function createMiniAppRouter(): Router {
             job.capability === 'image_variation'
           ) {
             await executeMediaPollJob(job.id, {
-              maxWaitMs: 6_500,
+              maxWaitMs: isHfGradio ? 45_000 : 6_500,
               scheduleNextPoll: false,
             }).catch(() => null);
           }

@@ -528,6 +528,7 @@ export async function executeQueuedGenerationJob(
         }
 
         if (hasDurableAsyncQueue() || !silentDelivery) {
+          const isHfGradio = outcome.metadata?.kind === 'hf_space_gradio_media';
           await enqueueBackgroundJob(
             {
               kind: 'media_poll_job',
@@ -535,7 +536,10 @@ export async function executeQueuedGenerationJob(
               jobId: job.id,
               requestId: reqRow.id,
             },
-            { delaySeconds: hasDurableAsyncQueue() ? 5 : 2, retries: 3 },
+            {
+              delaySeconds: isHfGradio ? (hasDurableAsyncQueue() ? 14 : 6) : hasDurableAsyncQueue() ? 5 : 2,
+              retries: 3,
+            },
           );
         }
 
@@ -917,6 +921,7 @@ export async function executeQueuedGenerationJob(
       }
 
       if (hasDurableAsyncQueue() || !silentDelivery) {
+        const isHfVideo = result.metadata?.kind === 'hf_space_gradio';
         await enqueueBackgroundJob(
           {
             kind: 'video_poll_job',
@@ -924,7 +929,7 @@ export async function executeQueuedGenerationJob(
             jobId: job.id,
             requestId: reqRow.id,
           },
-          { delaySeconds: 8, retries: 3 },
+          { delaySeconds: isHfVideo && hasDurableAsyncQueue() ? 18 : 8, retries: 3 },
         );
       }
 
@@ -1093,6 +1098,85 @@ export async function executeMediaPollJob(
       return { ok: true, status: 'succeeded', storageObjectKey: firstKey };
     }
 
+    if (
+      pollRes.status === 'failed' &&
+      pollRes.sessionExpired &&
+      Number(meta.hfResubmitCount ?? 0) < 1 &&
+      typeof payload.prompt === 'string' &&
+      payload.prompt.trim().length > 0
+    ) {
+      const prompt = payload.prompt.trim();
+      const aspectRatio = typeof payload.aspectRatio === 'string' ? payload.aspectRatio : '1:1';
+      const resolution = typeof payload.resolution === 'string' ? payload.resolution : '1K';
+      const countNum = Number(payload.count ?? 1);
+      try {
+        let retryOutcome: ImageJobOutcome | null = null;
+        if (job.capability === 'image_generation') {
+          retryOutcome = await startImageGenerationWithRoute(
+            route,
+            { prompt, aspectRatio, resolution, count: countNum },
+            { syncWaitCapMs: 5_000 },
+          );
+        } else if (
+          (job.capability === 'image_editing' || job.capability === 'image_variation') &&
+          typeof payload.sourceImageBase64 === 'string'
+        ) {
+          retryOutcome = await startImageEditWithRoute(
+            route,
+            {
+              prompt,
+              sourceImageBuffer: Buffer.from(payload.sourceImageBase64, 'base64'),
+              sourceMimeType:
+                typeof payload.sourceMimeType === 'string' ? payload.sourceMimeType : 'image/jpeg',
+              mode: job.capability === 'image_variation' ? 'variation' : 'edit',
+              aspectRatio,
+              resolution,
+            },
+            { syncWaitCapMs: 5_000 },
+          );
+        }
+
+        if (retryOutcome?.kind === 'pending') {
+          await db
+            .update(generationJobs)
+            .set({
+              providerJobId: retryOutcome.providerJobId,
+              progressPercent: Math.max(25, job.progressPercent),
+              resultMetadata: {
+                ...retryOutcome.metadata,
+                pollCount,
+                hfResubmitCount: Number(meta.hfResubmitCount ?? 0) + 1,
+                providerId: retryOutcome.providerId,
+                usedFallback: retryOutcome.usedFallback,
+                aspectRatio,
+                lastPolledAtMs: Date.now(),
+              },
+              updatedAt: new Date(),
+            })
+            .where(eq(generationJobs.id, job.id));
+
+          const shouldScheduleRetry =
+            options?.scheduleNextPoll !== undefined
+              ? options.scheduleNextPoll
+              : hasDurableAsyncQueue() || !silentDelivery;
+          if (shouldScheduleRetry) {
+            await enqueueBackgroundJob(
+              {
+                kind: 'media_poll_job',
+                idempotencyKey: `mediapoll:${job.id}:resubmit:${pollCount + 1}`,
+                jobId: job.id,
+                requestId: reqRow.id,
+              },
+              { delaySeconds: hasDurableAsyncQueue() ? 14 : 6, retries: 3 },
+            );
+          }
+          return { ok: true, status: 'running' };
+        }
+      } catch {
+        // Fall through to standard failed-refund handling
+      }
+    }
+
     if (pollRes.status === 'failed' || pollCount >= 20) {
       const reason =
         pollRes.errorMessage ?? 'زمان پردازش تصویر در سرور مدل به پایان رسید (Timeout).';
@@ -1117,7 +1201,12 @@ export async function executeMediaPollJob(
       .set({
         status: 'running',
         progressPercent: nextProgress,
-        resultMetadata: { ...meta, pollCount, lastPolledAtMs: Date.now() },
+        resultMetadata: {
+          ...meta,
+          pollCount,
+          pollLockUntilMs: 0,
+          lastPolledAtMs: Date.now(),
+        },
         updatedAt: new Date(),
       })
       .where(eq(generationJobs.id, job.id));
@@ -1140,6 +1229,7 @@ export async function executeMediaPollJob(
         : hasDurableAsyncQueue() || !silentDelivery;
 
     if (shouldSchedule) {
+      const isHfGradio = meta.kind === 'hf_space_gradio_media';
       await enqueueBackgroundJob(
         {
           kind: 'media_poll_job',
@@ -1147,7 +1237,7 @@ export async function executeMediaPollJob(
           jobId: job.id,
           requestId: reqRow.id,
         },
-        { delaySeconds: hasDurableAsyncQueue() ? 6 : 2, retries: 3 },
+        { delaySeconds: isHfGradio ? 12 : hasDurableAsyncQueue() ? 6 : 2, retries: 3 },
       );
     }
 
