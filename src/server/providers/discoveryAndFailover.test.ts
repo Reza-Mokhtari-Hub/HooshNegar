@@ -1599,8 +1599,8 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     expect(editArgs[1]).toBe('Edit Image (1 Ref)');
     expect(editArgs[2]).toEqual({ path: '/tmp/source.png', meta: { _type: 'gradio.FileData' } });
     expect(editArgs[3]).toBeNull();
-    expect(editArgs[4]).toBe('None (Base Uncensored)');
-    expect(Number(editArgs[9])).toBeLessThanOrEqual(16);
+    expect(editArgs[4]).toBe('Viggle Turbo (6-Step)');
+    expect(Number(editArgs[9])).toBe(6);
   });
 
   it('auto-promotes Space URLs saved under providerType="huggingface" in testProviderConnection and discoverProviderModels', async () => {

@@ -904,7 +904,13 @@ export async function executeVideoPollJob(jobId: string): Promise<{
     const meta = (job.resultMetadata ?? {}) as Record<string, unknown>;
     const pollCount = Number(meta.pollCount ?? 0) + 1;
 
-    const pollRes = await pollVideoGenerationJob(route.primary, job.providerJobId, meta);
+    const targetCredentialId = typeof meta.credentialId === 'string' ? meta.credentialId : null;
+    const pollCtx =
+      (targetCredentialId &&
+        route.primary.credentialPool?.find((c) => c.credentialId === targetCredentialId)) ||
+      route.primary;
+
+    const pollRes = await pollVideoGenerationJob(pollCtx, job.providerJobId, meta);
 
     if (pollRes.status === 'succeeded') {
       let videoBuffer = pollRes.videoBuffer;

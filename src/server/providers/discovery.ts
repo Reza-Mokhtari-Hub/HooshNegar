@@ -967,7 +967,7 @@ export async function discoverProviderModels(
       };
     }
 
-    // 4. HUGGING FACE SPACES (Gradio / ZeroGPU / Custom API)
+    // 4. HUGGING FACE SPACES (Gradio 4/5 / ZeroGPU / Docker OpenAI / Custom API)
     if (effectiveProviderType === 'huggingface_space') {
       const resolved = await resolveHfSpaceRootUrl(
         config.baseUrl,
@@ -994,25 +994,149 @@ export async function discoverProviderModels(
         }
       }
 
-      const discovered: DiscoveredModelSpec[] = [];
-      const namedEndpoints = (apiInfoJson?.named_endpoints ?? {}) as Record<
-        string,
-        {
-          parameters?: Array<{
-            label?: string;
-            parameter_name?: string;
-            type?: { type?: string };
-            component?: string;
-            parameter_has_default?: boolean;
-            parameter_default?: unknown;
-          }>;
-          returns?: Array<{
-            label?: string;
-            type?: { type?: string };
-            component?: string;
-          }>;
+      type RawGradioParam = {
+        label?: string;
+        parameter_name?: string;
+        type?: { type?: string; enum?: unknown[]; minimum?: number; maximum?: number; items?: { type?: string } };
+        python_type?: { type?: string; description?: string };
+        component?: string;
+        parameter_has_default?: boolean;
+        parameter_default?: unknown;
+      };
+      type RawGradioReturn = {
+        label?: string;
+        type?: { type?: string };
+        python_type?: { type?: string };
+        component?: string;
+      };
+      type RawGradioEndpoint = {
+        parameters?: RawGradioParam[];
+        returns?: RawGradioReturn[];
+      };
+
+      const serializeGradioParam = (p: RawGradioParam, idx: number) => {
+        const comp = (p.component || p.type?.type || 'textbox').toLowerCase();
+        const pyType = String(p.python_type?.type ?? '').toLowerCase();
+        const schemaType = String(p.type?.type ?? '').toLowerCase();
+        const labelText = `${p.parameter_name || ''} ${p.label || ''}`.toLowerCase();
+        const isImageEditor =
+          /imageeditor|paint|sketchpad|inpaint/.test(comp) || pyType.includes('editordata');
+        const isMultimodalTextbox = comp.includes('multimodal') || pyType.includes('multimodal');
+        const isChatbotMessages =
+          (comp.includes('chatbot') || labelText.includes('history')) &&
+          (pyType.includes('role') ||
+            pyType.includes('chatmessage') ||
+            pyType.includes('dict[str') ||
+            pyType.includes('messagedict'));
+        const isFileList =
+          comp === 'files' ||
+          comp.includes('gallery') ||
+          ((comp.includes('file') || comp.includes('image')) &&
+            (schemaType === 'array' || pyType.includes('list[')));
+
+        return {
+          index: idx,
+          name: p.parameter_name || p.label || `arg_${idx}`,
+          label: p.label || p.parameter_name || `arg_${idx}`,
+          component: comp,
+          hasDefault: Boolean(p.parameter_has_default),
+          defaultValue: p.parameter_default ?? null,
+          ...(Array.isArray(p.type?.enum) ? { enum: p.type.enum } : {}),
+          ...(typeof p.type?.minimum === 'number' ? { min: p.type.minimum } : {}),
+          ...(typeof p.type?.maximum === 'number' ? { max: p.type.maximum } : {}),
+          ...(pyType ? { pythonType: pyType } : {}),
+          ...(schemaType ? { schemaType } : {}),
+          ...(isImageEditor ? { isImageEditor: true } : {}),
+          ...(isMultimodalTextbox ? { isMultimodalTextbox: true } : {}),
+          ...(isChatbotMessages ? { isChatbotMessages: true } : {}),
+          ...(isFileList ? { isFileList: true } : {}),
+        };
+      };
+
+      const inferSpaceEndpointMeta = (
+        paramsList: RawGradioParam[],
+        returnsList: RawGradioReturn[],
+        apiName: string,
+      ): { category: ModelCategory; capabilities: CapabilityType[]; creditCost: number } => {
+        const inputSummary = paramsList.map((p) =>
+          `${p.component || ''} ${p.type?.type || ''} ${p.python_type?.type || ''} ${p.label || ''} ${p.parameter_name || ''}`.toLowerCase(),
+        );
+        const returnSummary = returnsList.map((r) =>
+          `${r.component || ''} ${r.type?.type || ''} ${r.python_type?.type || ''} ${r.label || ''}`.toLowerCase(),
+        );
+        const enumValues = paramsList
+          .flatMap((p) => (Array.isArray(p.type?.enum) ? p.type.enum : []))
+          .filter((v): v is string => typeof v === 'string')
+          .join(' ')
+          .toLowerCase();
+        const lowerName = apiName.toLowerCase();
+
+        const hasVideoOutput =
+          returnSummary.some((r) => r.includes('video')) ||
+          /\b(t2v|i2v|text_to_video|image_to_video|video_gen|generate_video)\b/.test(lowerName);
+        const hasImageOutput = returnSummary.some(
+          (r) =>
+            r.includes('image') ||
+            r.includes('gallery') ||
+            r.includes('annotatedimage') ||
+            r.includes('imageeditor'),
+        );
+        const hasAudioOutput = returnSummary.some((r) => r.includes('audio'));
+        const hasImageInput = inputSummary.some(
+          (i) =>
+            i.includes('image') ||
+            i.includes('paint') ||
+            i.includes('sketch') ||
+            i.includes('inpaint') ||
+            i.includes('gallery') ||
+            i.includes('multimodal') ||
+            i.includes('file'),
+        );
+        const hasAudioInput = inputSummary.some((i) => i.includes('audio'));
+        const hasTextInput = inputSummary.some(
+          (i) => i.includes('textbox') || i.includes('text') || i.includes('prompt') || i.includes('multimodal'),
+        );
+        const hasEditSignal =
+          hasImageInput ||
+          /edit|img2img|inpaint|upscale|transform|variation|ref/.test(`${lowerName} ${enumValues}`);
+
+        if (hasVideoOutput) {
+          return { category: 'video', capabilities: ['video_generation'], creditCost: 10 };
         }
-      >;
+        if (hasImageOutput) {
+          const isPureEditOrUpscale =
+            hasImageInput &&
+            !hasTextInput &&
+            /upscale|remove_bg|inpaint|restore|edit/.test(lowerName);
+          return {
+            category: 'image',
+            capabilities: isPureEditOrUpscale
+              ? ['image_editing', 'image_variation']
+              : hasEditSignal
+                ? ['image_generation', 'image_editing', 'image_variation']
+                : ['image_generation'],
+            creditCost: 4,
+          };
+        }
+        if (hasAudioOutput) {
+          return { category: 'audio', capabilities: ['speech_generation'], creditCost: 2 };
+        }
+        if (hasAudioInput && !hasImageInput) {
+          return { category: 'audio', capabilities: ['audio_transcription'], creditCost: 1.5 };
+        }
+        if (hasImageInput) {
+          return {
+            category: 'multimodal',
+            capabilities: ['text_generation', 'chat', 'vision', 'document_analysis'],
+            creditCost: 2,
+          };
+        }
+        return { category: 'llm', capabilities: ['text_generation', 'chat'], creditCost: 1 };
+      };
+
+      const discovered: DiscoveredModelSpec[] = [];
+      const namedEndpoints = (apiInfoJson?.named_endpoints ?? {}) as Record<string, RawGradioEndpoint>;
+      const unnamedEndpoints = (apiInfoJson?.unnamed_endpoints ?? {}) as Record<string, RawGradioEndpoint>;
 
       const isGradioUiHelperEndpoint = (
         apiName: string,
@@ -1045,50 +1169,34 @@ export async function discoverProviderModels(
         return !isGradioUiHelperEndpoint(apiName, (ep.parameters ?? []).length, (ep.returns ?? []).length);
       });
 
-      const endpointEntries = realEndpointEntries.length > 0 ? realEndpointEntries : rawEndpointEntries;
+      const endpointEntries: Array<{ key: string; ep: RawGradioEndpoint; fnIndex?: number }> =
+        (realEndpointEntries.length > 0 ? realEndpointEntries : rawEndpointEntries).map(([key, ep]) => ({
+          key,
+          ep,
+        }));
 
-      for (const [rawApiPath, ep] of endpointEntries) {
-        const apiName = rawApiPath.replace(/^\/+/, '');
+      // Fallback to unnamed_endpoints (Gradio Spaces using fn_index without explicit api_name)
+      if (endpointEntries.length === 0) {
+        const unnamedList = Object.entries(unnamedEndpoints)
+          .filter(([, ep]) => (ep.parameters ?? []).length > 0 && (ep.returns ?? []).length > 0)
+          .slice(0, 8);
+        for (const [fnIdxKey, ep] of unnamedList) {
+          const fnIdx = Number.parseInt(fnIdxKey, 10);
+          endpointEntries.push({
+            key: `fn_${fnIdxKey}`,
+            ep,
+            fnIndex: Number.isFinite(fnIdx) ? fnIdx : undefined,
+          });
+        }
+      }
+
+      for (const item of endpointEntries) {
+        const apiName = item.key.replace(/^\/+/, '');
         if (!apiName || apiName.startsWith('gradio_') || apiName.startsWith('_')) continue;
 
-        const paramsList = ep.parameters ?? [];
-        const returnsList = ep.returns ?? [];
-        const inputSummary = paramsList.map((p) => (p.component || p.type?.type || p.label || '').toLowerCase());
-        const returnSummary = returnsList.map((r) => (r.component || r.type?.type || r.label || '').toLowerCase());
-
-        const hasImageOutput = returnSummary.some((r) => r.includes('image') || r.includes('gallery'));
-        const hasAudioOutput = returnSummary.some((r) => r.includes('audio'));
-        const hasVideoOutput = returnSummary.some((r) => r.includes('video'));
-        const hasImageInput = inputSummary.some((i) => i.includes('image') || i.includes('file'));
-        const hasAudioInput = inputSummary.some((i) => i.includes('audio'));
-
-        let category: ModelCategory = 'llm';
-        let capabilities: CapabilityType[] = ['text_generation', 'chat'];
-        let creditCost = 1;
-
-        if (hasVideoOutput) {
-          category = 'video';
-          capabilities = ['video_generation'];
-          creditCost = 10;
-        } else if (hasImageOutput) {
-          category = 'image';
-          capabilities = hasImageInput
-            ? ['image_generation', 'image_editing', 'image_variation']
-            : ['image_generation'];
-          creditCost = 4;
-        } else if (hasAudioOutput) {
-          category = 'audio';
-          capabilities = ['speech_generation'];
-          creditCost = 2;
-        } else if (hasAudioInput && !hasImageInput) {
-          category = 'audio';
-          capabilities = ['audio_transcription'];
-          creditCost = 1.5;
-        } else if (hasImageInput) {
-          category = 'multimodal';
-          capabilities = ['text_generation', 'chat', 'vision', 'document_analysis'];
-          creditCost = 2;
-        }
+        const paramsList = item.ep.parameters ?? [];
+        const returnsList = item.ep.returns ?? [];
+        const { category, capabilities, creditCost } = inferSpaceEndpointMeta(paramsList, returnsList, apiName);
 
         const spaceShortName = resolved.spaceId.split('/').pop() || 'HF Space';
         const endpointLabel = endpointEntries.length === 1 ? spaceShortName : `${spaceShortName} (${apiName})`;
@@ -1109,18 +1217,8 @@ export async function discoverProviderModels(
             spaceId: resolved.spaceId,
             apiName,
             endpointPrefix,
-            parameters: paramsList.map((p, idx) => {
-              const pType = p.type as { type?: string; enum?: unknown[] } | undefined;
-              return {
-                index: idx,
-                name: p.parameter_name || p.label || `arg_${idx}`,
-                label: p.label || p.parameter_name || `arg_${idx}`,
-                component: (p.component || pType?.type || 'textbox').toLowerCase(),
-                hasDefault: Boolean(p.parameter_has_default),
-                defaultValue: p.parameter_default ?? null,
-                ...(Array.isArray(pType?.enum) ? { enum: pType.enum } : {}),
-              };
-            }),
+            ...(typeof item.fnIndex === 'number' ? { fnIndex: item.fnIndex } : {}),
+            parameters: paramsList.map(serializeGradioParam),
             returns: returnsList.map((r, idx) => ({
               index: idx,
               label: r.label || `out_${idx}`,
@@ -1130,23 +1228,116 @@ export async function discoverProviderModels(
         });
       }
 
-      // Fallback probe via /config if named_endpoints wasn't populated
+      // Fallback probe via /config if /info endpoints weren't populated
       if (discovered.length === 0) {
         const cfgRes = await fetchJsonSafe(`${resolved.resolvedRootUrl}/config`, headers, apiKey, fetchImpl, 10000);
         if (cfgRes.ok && cfgRes.data && typeof cfgRes.data === 'object') {
           const cfg = cfgRes.data as {
-            dependencies?: Array<{ api_name?: string | false; inputs?: unknown[]; outputs?: unknown[] }>;
+            components?: Array<{
+              id?: number;
+              type?: string;
+              props?: {
+                label?: string;
+                value?: unknown;
+                choices?: unknown[];
+                minimum?: number;
+                maximum?: number;
+              };
+            }>;
+            dependencies?: Array<{
+              id?: number;
+              api_name?: string | false;
+              inputs?: number[];
+              outputs?: number[];
+            }>;
           };
-          const deps = (cfg.dependencies ?? []).filter((d) => typeof d.api_name === 'string' && d.api_name);
+          const compById = new Map<number, NonNullable<typeof cfg.components>[number]>();
+          for (const c of cfg.components ?? []) {
+            if (typeof c.id === 'number') compById.set(c.id, c);
+          }
+
+          const allDeps = (cfg.dependencies ?? []).filter(
+            (d) => typeof d.api_name === 'string' && d.api_name && !isGradioUiHelperEndpoint(String(d.api_name), (d.inputs ?? []).length, (d.outputs ?? []).length),
+          );
+          const deps =
+            allDeps.length > 0
+              ? allDeps
+              : (cfg.dependencies ?? []).filter((d) => typeof d.api_name === 'string' && d.api_name);
+
           for (const dep of deps.slice(0, 10)) {
             const apiName = String(dep.api_name).replace(/^\/+/, '');
+            const inParams: RawGradioParam[] = (dep.inputs ?? []).map((cid, idx) => {
+              const comp = compById.get(cid);
+              const rawChoices = Array.isArray(comp?.props?.choices)
+                ? comp.props.choices.map((ch) => (Array.isArray(ch) ? ch[1] ?? ch[0] : ch))
+                : undefined;
+              return {
+                label: comp?.props?.label || `arg_${idx}`,
+                parameter_name: comp?.props?.label || `arg_${idx}`,
+                component: comp?.type || 'textbox',
+                parameter_has_default: comp?.props?.value !== undefined,
+                parameter_default: comp?.props?.value ?? null,
+                type: {
+                  type: comp?.type || 'string',
+                  ...(rawChoices ? { enum: rawChoices } : {}),
+                  ...(typeof comp?.props?.minimum === 'number' ? { minimum: comp.props.minimum } : {}),
+                  ...(typeof comp?.props?.maximum === 'number' ? { maximum: comp.props.maximum } : {}),
+                },
+              };
+            });
+            const outReturns: RawGradioReturn[] = (dep.outputs ?? []).map((cid, idx) => {
+              const comp = compById.get(cid);
+              return {
+                label: comp?.props?.label || `out_${idx}`,
+                component: comp?.type || 'textbox',
+              };
+            });
+            const { category, capabilities, creditCost } = inferSpaceEndpointMeta(inParams, outReturns, apiName);
             const spaceShortName = resolved.spaceId.split('/').pop() || 'HF Space';
             discovered.push({
               name: deps.length === 1 ? spaceShortName : `${spaceShortName} (${apiName})`,
               modelIdentifier: `${resolved.spaceId}::${apiName}`.slice(0, 195),
+              category,
+              capabilities,
+              description: `مدل اختصاصی /${apiName} (${inParams.length} پارامتر)`,
+              maxInputSize: 32000,
+              maxOutputSize: 4096,
+              creditCost,
+              inputPricePerMillion: 0,
+              outputPricePerMillion: 0,
+              modelParameters: {
+                spaceHost: resolved.resolvedRootUrl,
+                spaceId: resolved.spaceId,
+                apiName,
+                endpointPrefix: '/gradio_api',
+                parameters: inParams.map(serializeGradioParam),
+                returns: outReturns.map((r, idx) => ({
+                  index: idx,
+                  label: r.label || `out_${idx}`,
+                  component: (r.component || 'textbox').toLowerCase(),
+                })),
+              },
+            });
+          }
+        }
+      }
+
+      // Probe OpenAI-compatible Docker HF Spaces (/v1/models)
+      if (discovered.length === 0) {
+        const oaiRes = await fetchJsonSafe(`${resolved.resolvedRootUrl}/v1/models`, headers, apiKey, fetchImpl, 8000);
+        if (oaiRes.ok && oaiRes.data && typeof oaiRes.data === 'object') {
+          const list = Array.isArray((oaiRes.data as { data?: unknown[] }).data)
+            ? ((oaiRes.data as { data: Array<{ id?: string }> }).data)
+            : [];
+          const spaceShortName = resolved.spaceId.split('/').pop() || 'HF Space';
+          for (const m of list.slice(0, 10)) {
+            if (!m.id) continue;
+            discovered.push({
+              name: `${spaceShortName} (${m.id})`.slice(0, 130),
+              modelIdentifier: `${resolved.spaceId}::openai::${m.id}`.slice(0, 195),
               category: 'llm',
               capabilities: ['text_generation', 'chat'],
-              description: `Hugging Face Space Gradio endpoint /${apiName}`,
+              description: `Hugging Face Docker OpenAI-compatible Space (${m.id})`,
               maxInputSize: 32000,
               maxOutputSize: 4096,
               creditCost: 1,
@@ -1155,8 +1346,8 @@ export async function discoverProviderModels(
               modelParameters: {
                 spaceHost: resolved.resolvedRootUrl,
                 spaceId: resolved.spaceId,
-                apiName,
-                endpointPrefix: '/gradio_api',
+                openAiCompatible: true,
+                openAiModelId: m.id,
               },
             });
           }

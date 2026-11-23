@@ -55,6 +55,8 @@ const chatBodySchema = z.object({
 const generateBodySchema = z.object({
   capability: z.enum([
     'image_generation',
+    'image_editing',
+    'image_variation',
     'speech_generation',
     'audio_transcription',
     'video_generation',
@@ -68,6 +70,8 @@ const generateBodySchema = z.object({
   durationSeconds: z.number().int().min(3).max(15).optional(),
   quality: z.string().trim().max(16).optional(),
   audioBase64: z.string().max(12_000_000).optional(),
+  sourceImageBase64: z.string().max(12_000_000).optional(),
+  sourceMimeType: z.string().trim().max(100).optional(),
   mimeType: z.string().trim().max(100).optional(),
   fileName: z.string().trim().max(160).optional(),
 });
@@ -674,12 +678,23 @@ export function createMiniAppRouter(): Router {
       const d = parsed.data;
       const db = getDb();
 
-      if (d.capability !== 'audio_transcription' && !d.prompt.trim()) {
+      if (
+        d.capability !== 'audio_transcription' &&
+        d.capability !== 'image_variation' &&
+        !d.prompt.trim()
+      ) {
         res.status(400).json({ error: 'لطفاً متن توصیفی (پرامپت) را وارد کنید.' });
         return;
       }
       if (d.capability === 'audio_transcription' && !d.audioBase64) {
         res.status(400).json({ error: 'فایل صوتی برای تبدیل به متن ارسال نشده است.' });
+        return;
+      }
+      if (
+        (d.capability === 'image_editing' || d.capability === 'image_variation') &&
+        !d.sourceImageBase64
+      ) {
+        res.status(400).json({ error: 'تصویر مرجع برای ویرایش ارسال نشده است.' });
         return;
       }
 
@@ -720,6 +735,10 @@ export function createMiniAppRouter(): Router {
         jobPayload.audioBase64 = d.audioBase64;
         jobPayload.mimeType = d.mimeType ?? 'audio/webm';
         jobPayload.fileName = d.fileName ?? 'recording.webm';
+      }
+      if (d.sourceImageBase64) {
+        jobPayload.sourceImageBase64 = d.sourceImageBase64;
+        jobPayload.sourceMimeType = d.sourceMimeType ?? d.mimeType ?? 'image/jpeg';
       }
 
       const idempotencyKey = `miniapp:${d.capability}:${ensured.user.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;

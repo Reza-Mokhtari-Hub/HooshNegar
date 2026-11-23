@@ -904,6 +904,8 @@ async function tryExecutionPool<T>(
 ): Promise<T> {
   const pool = baseCtx.credentialPool && baseCtx.credentialPool.length > 0 ? baseCtx.credentialPool : [baseCtx];
   let lastError: AIProviderError | null = null;
+  const poolStartedAt = Date.now();
+  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
 
   for (const candidate of pool) {
     try {
@@ -923,6 +925,12 @@ async function tryExecutionPool<T>(
         throw aiErr;
       }
       await markCredentialFailure(candidate.credentialId, aiErr);
+      // Inside Cloudflare Workers waitUntil (30s hard kill), if a slow TIMEOUT already consumed >17s,
+      // stop rotating keys so error reporting + credit refund always complete safely before Worker termination.
+      // Fast 429 / ZeroGPU quota / 401 failures still rotate through all accounts immediately!
+      if (isCfBackgroundWaitUntil && aiErr.code === 'TIMEOUT' && Date.now() - poolStartedAt >= 17_000) {
+        break;
+      }
     }
   }
 
@@ -968,23 +976,178 @@ async function runWithFailover<T>(
 }
 
 // =============================================================================
-// HUGGING FACE GRADIO SPACE EXECUTION HELPER
+// UNIVERSAL HUGGING FACE SPACE EXECUTION ENGINE (Gradio 4/5 + ZeroGPU + OpenAI)
 // =============================================================================
 
-function extractGradioOutputText(val: unknown): string {
-  if (typeof val === 'string') return val;
-  if (Array.isArray(val)) {
-    const last = val[val.length - 1];
-    if (Array.isArray(last)) {
-      return last.map((x) => (typeof x === 'string' ? x : '')).filter(Boolean).join('\n');
-    }
-    return val.map(extractGradioOutputText).filter(Boolean).join('\n');
+export interface GradioFileData {
+  path?: string;
+  url?: string;
+  orig_name?: string;
+  size?: number;
+  mime_type?: string;
+  is_stream?: boolean;
+  meta: { _type: 'gradio.FileData' };
+}
+
+type GradioPreferredKind =
+  | 'text'
+  | 'vision'
+  | 'image_generate'
+  | 'image_edit'
+  | 'video_t2v'
+  | 'video_i2v'
+  | 'tts'
+  | 'stt';
+
+interface StoredGradioParamSpec {
+  index?: number;
+  name?: string;
+  label?: string;
+  component?: string;
+  hasDefault?: boolean;
+  defaultValue?: unknown;
+  enum?: unknown[];
+  min?: number;
+  max?: number;
+  pythonType?: string;
+  schemaType?: string;
+  isImageEditor?: boolean;
+  isMultimodalTextbox?: boolean;
+  isChatbotMessages?: boolean;
+  isFileList?: boolean;
+}
+
+function createHfDeadline(mode: 'sync' | 'video_poll'): number {
+  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
+  if (mode === 'video_poll') {
+    return Date.now() + (isCfBackgroundWaitUntil ? 19_000 : 28_000);
   }
-  if (val && typeof val === 'object') {
-    const obj = val as Record<string, unknown>;
-    if (typeof obj.value === 'string') return obj.value;
+  // Inside Cloudflare Workers waitUntil (30s hard kill), budget max 21.5s total across
+  // resolve + upload + POST + SSE + download so catch + refund + Telegram error ALWAYS execute!
+  return Date.now() + (isCfBackgroundWaitUntil ? 21_500 : 85_000);
+}
+
+function getRemainingBudgetMs(deadlineAtMs: number | undefined, fallbackMs: number, minMs = 1500): number {
+  if (typeof deadlineAtMs !== 'number') return fallbackMs;
+  return Math.max(minMs, Math.min(fallbackMs, deadlineAtMs - Date.now()));
+}
+
+function safeParseJsonText(rawText: string): unknown {
+  const trimmed = rawText.trim();
+  if (!trimmed || trimmed.startsWith('<')) return null;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function isGradioFileDataObject(val: unknown): boolean {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+  const obj = val as Record<string, unknown>;
+  const meta = obj.meta as Record<string, unknown> | undefined;
+  return meta?._type === 'gradio.FileData' || (typeof obj.path === 'string' && typeof obj.url === 'string');
+}
+
+function extractTextFromGradioContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const part of content) {
+      if (typeof part === 'string') {
+        parts.push(part);
+      } else if (part && typeof part === 'object') {
+        const obj = part as Record<string, unknown>;
+        if (typeof obj.text === 'string') parts.push(obj.text);
+        else if (typeof obj.content === 'string') parts.push(obj.content);
+      }
+    }
+    return parts.filter(Boolean).join('\n');
+  }
+  if (content && typeof content === 'object') {
+    const obj = content as Record<string, unknown>;
     if (typeof obj.text === 'string') return obj.text;
+    if (typeof obj.value === 'string') return obj.value;
     if (typeof obj.content === 'string') return obj.content;
+  }
+  return '';
+}
+
+export function extractGradioOutputText(val: unknown): string {
+  if (typeof val === 'string') return val.trim();
+  if (val === null || val === undefined || typeof val === 'boolean' || typeof val === 'number') {
+    return '';
+  }
+
+  if (Array.isArray(val)) {
+    if (val.length === 0) return '';
+
+    // 1. Gradio 5 Chatbot `messages` format: [{ role: 'user'|'assistant', content: ... }]
+    const isMessagesList = val.every(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        !Array.isArray(item) &&
+        typeof (item as Record<string, unknown>).role === 'string' &&
+        'content' in (item as Record<string, unknown>),
+    );
+    if (isMessagesList) {
+      for (let i = val.length - 1; i >= 0; i--) {
+        const msg = val[i] as Record<string, unknown>;
+        if (msg.role === 'assistant' || msg.role === 'model' || msg.role === 'bot') {
+          const text = extractTextFromGradioContent(msg.content).trim();
+          if (text) return text;
+        }
+      }
+      const last = val[val.length - 1] as Record<string, unknown>;
+      return extractTextFromGradioContent(last.content).trim();
+    }
+
+    // 2. Gradio 4 Chatbot tuple history format: [[userMsg, assistantMsg], ...]
+    const isTupleTurnLeaf = (x: unknown): boolean =>
+      x === null || x === undefined || typeof x === 'string' || (typeof x === 'object' && !Array.isArray(x));
+    const isTupleHistory = val.every(
+      (item) =>
+        Array.isArray(item) &&
+        item.length === 2 &&
+        isTupleTurnLeaf(item[0]) &&
+        isTupleTurnLeaf(item[1]),
+    );
+    if (isTupleHistory) {
+      for (let i = val.length - 1; i >= 0; i--) {
+        const pair = val[i] as [unknown, unknown];
+        const assistantPart = extractTextFromGradioContent(pair[1]).trim();
+        if (assistantPart) return assistantPart;
+      }
+      const lastPair = val[val.length - 1] as [unknown, unknown];
+      return extractTextFromGradioContent(lastPair[0]).trim();
+    }
+
+    // 3. Multi-output endpoint array (e.g. [chatbotOutput, textboxState] or [text, metadata])
+    const candidates: string[] = [];
+    for (const item of val) {
+      if (isGradioFileDataObject(item)) continue;
+      const extracted = extractGradioOutputText(item);
+      if (extracted) candidates.push(extracted);
+    }
+    if (candidates.length === 0) return '';
+    // Prefer the first substantive non-empty candidate (usually primary output slot 0),
+    // unless slot 0 is a tiny status token and a later slot holds the real reply.
+    return candidates[0]!;
+  }
+
+  if (typeof val === 'object') {
+    if (isGradioFileDataObject(val)) return '';
+    const obj = val as Record<string, unknown>;
+    if (obj.__type__ === 'update') {
+      return obj.value !== undefined ? extractGradioOutputText(obj.value) : '';
+    }
+    if (typeof obj.text === 'string' && obj.text.trim()) return obj.text.trim();
+    if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
+    if (typeof obj.value === 'string' && obj.value.trim()) return obj.value.trim();
+    if (obj.value !== undefined && obj.value !== null) {
+      return extractGradioOutputText(obj.value);
+    }
   }
   return '';
 }
@@ -1002,49 +1165,128 @@ function isGradioUiHelperName(apiName: string): boolean {
   return /(_ui|_visibility|_selection|_dropdown|_slider|_preset|_tab|_panel|_state|_change|_click)$/i.test(lower);
 }
 
-function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
+type ExpectedGradioMediaKind = 'image' | 'video' | 'audio';
+
+function detectMediaKindFromUrlOrMime(urlOrPath: string, mimeType?: string): ExpectedGradioMediaKind | null {
+  const m = (mimeType ?? '').toLowerCase();
+  if (m.startsWith('video/')) return 'video';
+  if (m.startsWith('audio/')) return 'audio';
+  if (m.startsWith('image/')) return 'image';
+
+  const clean = urlOrPath.split('?')[0]?.split('#')[0]?.toLowerCase() ?? '';
+  if (clean.startsWith('data:video/')) return 'video';
+  if (clean.startsWith('data:audio/')) return 'audio';
+  if (clean.startsWith('data:image/')) return 'image';
+  if (/\.(mp4|webm|mov|mkv|avi|m4v)$/.test(clean)) return 'video';
+  if (/\.(mp3|wav|ogg|flac|m4a|aac|opus)$/.test(clean)) return 'audio';
+  if (/\.(png|jpe?g|webp|gif|bmp|avif)$/.test(clean)) return 'image';
+  return null;
+}
+
+function looksLikeStrictMediaString(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed || /\s/.test(trimmed)) return false;
+  if (/^data:(image|video|audio)\//i.test(trimmed)) return true;
+  if (trimmed.includes('/file=') || trimmed.startsWith('/gradio_api/file=') || trimmed.startsWith('/tmp/')) {
+    return true;
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return detectMediaKindFromUrlOrMime(trimmed) !== null || /\/(file=|gradio_api|media|download|output)/i.test(trimmed);
+  }
+  return detectMediaKindFromUrlOrMime(trimmed) !== null;
+}
+
+export function extractGradioMediaUrl(
+  val: unknown,
+  spaceHost: string,
+  expectedKind?: ExpectedGradioMediaKind,
+  endpointPrefix = '/gradio_api',
+): string | null {
+  const cleanHost = normalizeBaseUrl(spaceHost);
+  const normalizedPrefix = endpointPrefix === '' ? '' : `/${endpointPrefix.replace(/^\/+|\/+$/g, '')}`;
+
   const resolvePath = (p: string): string => {
     if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
-    const cleanHost = normalizeBaseUrl(spaceHost);
     if (p.startsWith('/gradio_api/')) return `${cleanHost}${p}`;
-    if (p.startsWith('/file=')) return `${cleanHost}/gradio_api${p}`;
-    return `${cleanHost}/gradio_api/file=${p}`;
+    if (p.startsWith('/file=')) return `${cleanHost}${normalizedPrefix}${p}`;
+    return `${cleanHost}${normalizedPrefix}/file=${p}`;
   };
-  if (typeof val === 'string' && (val.startsWith('http') || val.startsWith('data:') || val.includes('/'))) {
-    return resolvePath(val);
+
+  interface MediaCandidate {
+    url: string;
+    score: number;
+    kind: ExpectedGradioMediaKind | null;
   }
-  if (Array.isArray(val)) {
-    for (const item of val) {
-      const found = extractGradioMediaUrl(item, spaceHost);
-      if (found) return found;
+
+  const candidates: MediaCandidate[] = [];
+
+  const collect = (node: unknown, inheritedHint: ExpectedGradioMediaKind | null, depth: number): void => {
+    if (depth > 8 || node === null || node === undefined) return;
+
+    if (typeof node === 'string') {
+      const trimmed = node.trim();
+      if (!looksLikeStrictMediaString(trimmed)) return;
+      const detected = detectMediaKindFromUrlOrMime(trimmed) ?? inheritedHint;
+      const resolved = resolvePath(trimmed);
+      let score = 10;
+      if (expectedKind && detected === expectedKind) score += 30;
+      else if (expectedKind && detected && detected !== expectedKind) score -= 20;
+      candidates.push({ url: resolved, score, kind: detected });
+      return;
     }
-  }
-  if (val && typeof val === 'object') {
-    const obj = val as Record<string, unknown>;
-    // Ignore empty Gradio UI update payloads that carry no media file
-    if (obj.__type__ === 'update' && !obj.url && !obj.path && !obj.value && !obj.image) {
-      return null;
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        collect(item, inheritedHint, depth + 1);
+      }
+      return;
     }
-    if (typeof obj.url === 'string' && obj.url.trim()) return resolvePath(obj.url.trim());
-    if (typeof obj.path === 'string' && obj.path.trim()) return resolvePath(obj.path.trim());
-    if (obj.image) {
-      const found = extractGradioMediaUrl(obj.image, spaceHost);
-      if (found) return found;
+
+    if (typeof node === 'object') {
+      const obj = node as Record<string, unknown>;
+      if (
+        obj.__type__ === 'update' &&
+        !obj.url &&
+        !obj.path &&
+        !obj.value &&
+        !obj.image &&
+        !obj.video &&
+        !obj.audio
+      ) {
+        return;
+      }
+
+      const mimeType = typeof obj.mime_type === 'string' ? obj.mime_type : undefined;
+      const directUrl = typeof obj.url === 'string' && obj.url.trim() ? obj.url.trim() : null;
+      const directPath = typeof obj.path === 'string' && obj.path.trim() ? obj.path.trim() : null;
+
+      if (directUrl || directPath) {
+        const chosen = directUrl ?? directPath!;
+        const detected =
+          detectMediaKindFromUrlOrMime(chosen, mimeType) ??
+          (directPath ? detectMediaKindFromUrlOrMime(directPath, mimeType) : null) ??
+          inheritedHint;
+        let score = 50; // Structured Gradio FileData objects always outrank raw strings
+        if (directUrl) score += 5;
+        if (expectedKind && detected === expectedKind) score += 40;
+        else if (expectedKind && detected && detected !== expectedKind) score -= 30;
+        candidates.push({ url: resolvePath(chosen), score, kind: detected });
+      }
+
+      if (obj.video) collect(obj.video, 'video', depth + 1);
+      if (obj.audio) collect(obj.audio, 'audio', depth + 1);
+      if (obj.image) collect(obj.image, 'image', depth + 1);
+      if (obj.composite) collect(obj.composite, 'image', depth + 1);
+      if (obj.background) collect(obj.background, 'image', depth + 1);
+      if (obj.value) collect(obj.value, inheritedHint, depth + 1);
     }
-    if (obj.video) {
-      const found = extractGradioMediaUrl(obj.video, spaceHost);
-      if (found) return found;
-    }
-    if (obj.audio) {
-      const found = extractGradioMediaUrl(obj.audio, spaceHost);
-      if (found) return found;
-    }
-    if (obj.value) {
-      const found = extractGradioMediaUrl(obj.value, spaceHost);
-      if (found) return found;
-    }
-  }
-  return null;
+  };
+
+  collect(val, null, 0);
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]!.url;
 }
 
 function isHuggingFaceSpaceContext(
@@ -1066,11 +1308,115 @@ function isDirectGradioHostUrl(url: string): boolean {
   }
 }
 
+function serializeResolvedGradioParam(
+  p: {
+    label?: string;
+    parameter_name?: string;
+    type?: { type?: string; enum?: unknown[]; minimum?: number; maximum?: number };
+    python_type?: { type?: string };
+    component?: string;
+    parameter_has_default?: boolean;
+    parameter_default?: unknown;
+  },
+  idx: number,
+): StoredGradioParamSpec {
+  const comp = (p.component || p.type?.type || 'textbox').toLowerCase();
+  const pyType = String(p.python_type?.type ?? '').toLowerCase();
+  const schemaType = String(p.type?.type ?? '').toLowerCase();
+  const labelText = `${p.parameter_name || ''} ${p.label || ''}`.toLowerCase();
+  const isImageEditor = /imageeditor|paint|sketchpad|inpaint/.test(comp) || pyType.includes('editordata');
+  const isMultimodalTextbox = comp.includes('multimodal') || pyType.includes('multimodal');
+  const isChatbotMessages =
+    (comp.includes('chatbot') || labelText.includes('history')) &&
+    (pyType.includes('role') ||
+      pyType.includes('chatmessage') ||
+      pyType.includes('dict[str') ||
+      pyType.includes('messagedict'));
+  const isFileList =
+    comp === 'files' ||
+    comp.includes('gallery') ||
+    ((comp.includes('file') || comp.includes('image')) &&
+      (schemaType === 'array' || pyType.includes('list[')));
+
+  return {
+    index: idx,
+    name: p.parameter_name || p.label || `arg_${idx}`,
+    label: p.label || p.parameter_name || `arg_${idx}`,
+    component: comp,
+    hasDefault: Boolean(p.parameter_has_default),
+    defaultValue: p.parameter_default ?? null,
+    ...(Array.isArray(p.type?.enum) ? { enum: p.type.enum } : {}),
+    ...(typeof p.type?.minimum === 'number' ? { min: p.type.minimum } : {}),
+    ...(typeof p.type?.maximum === 'number' ? { max: p.type.maximum } : {}),
+    ...(pyType ? { pythonType: pyType } : {}),
+    ...(schemaType ? { schemaType } : {}),
+    ...(isImageEditor ? { isImageEditor: true } : {}),
+    ...(isMultimodalTextbox ? { isMultimodalTextbox: true } : {}),
+    ...(isChatbotMessages ? { isChatbotMessages: true } : {}),
+    ...(isFileList ? { isFileList: true } : {}),
+  };
+}
+
+function scoreGradioEndpointForKind(
+  apiName: string,
+  params: Array<{ component?: string; label?: string; parameter_name?: string; type?: { type?: string } }>,
+  returns: Array<{ component?: string; label?: string; type?: { type?: string } }>,
+  preferredKind?: GradioPreferredKind,
+): number {
+  const lower = apiName.replace(/^\/+/, '').toLowerCase();
+  const inStr = params.map((p) => `${p.component ?? ''} ${p.label ?? ''} ${p.parameter_name ?? ''}`).join(' ').toLowerCase();
+  const outStr = returns.map((r) => `${r.component ?? ''} ${r.label ?? ''}`).join(' ').toLowerCase();
+
+  let score = 0;
+  if (/^(generate|infer|predict|run|chat|respond|synthesize|transcribe)/.test(lower)) score += 10;
+
+  switch (preferredKind) {
+    case 'image_edit':
+      if (outStr.includes('image') || outStr.includes('gallery')) score += 20;
+      if (/image|paint|sketch|file|gallery/.test(inStr)) score += 25;
+      if (/edit|img2img|inpaint|transform|variation|upscale/.test(lower)) score += 20;
+      break;
+    case 'image_generate':
+      if (outStr.includes('image') || outStr.includes('gallery')) score += 25;
+      if (/txt2img|text_to_image|generate|infer/.test(lower)) score += 15;
+      break;
+    case 'video_i2v':
+      if (outStr.includes('video')) score += 30;
+      if (/image|file/.test(inStr)) score += 25;
+      if (/i2v|img2vid|image_to_video/.test(lower)) score += 25;
+      break;
+    case 'video_t2v':
+      if (outStr.includes('video')) score += 30;
+      if (/t2v|txt2vid|text_to_video|generate/.test(lower)) score += 20;
+      break;
+    case 'tts':
+      if (outStr.includes('audio')) score += 35;
+      if (/tts|speak|synth|voice|speech/.test(lower)) score += 20;
+      break;
+    case 'stt':
+      if (inStr.includes('audio')) score += 35;
+      if (/stt|transcribe|whisper|asr/.test(lower)) score += 20;
+      break;
+    case 'vision':
+      if (/image|multimodal|file/.test(inStr) && !outStr.includes('image') && !outStr.includes('video')) score += 30;
+      break;
+    case 'text':
+      if (!outStr.includes('image') && !outStr.includes('video') && !outStr.includes('audio')) score += 20;
+      if (/chat|respond|bot|predict|generate/.test(lower)) score += 15;
+      break;
+  }
+  return score;
+}
+
 async function resolveGradioContext(
   ctx: ProviderExecutionContext,
   signal?: AbortSignal,
-  options?: { forceRefresh?: boolean },
+  options?: { forceRefresh?: boolean; preferredKind?: GradioPreferredKind; deadlineAtMs?: number },
 ): Promise<ProviderExecutionContext> {
+  if (ctx.modelParameters?.openAiCompatible === true) {
+    return ctx;
+  }
+
   const rawApiName = (
     typeof ctx.modelParameters?.apiName === 'string'
       ? ctx.modelParameters.apiName
@@ -1079,15 +1425,13 @@ async function resolveGradioContext(
   const isStaleUiHelper = isGradioUiHelperName(rawApiName);
 
   const rawParams = Array.isArray(ctx.modelParameters?.parameters)
-    ? (ctx.modelParameters.parameters as Array<{ component?: string; enum?: unknown[] }>)
+    ? (ctx.modelParameters.parameters as StoredGradioParamSpec[])
     : [];
   const hasParams = rawParams.length > 0;
   const paramSpaceHost =
     typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost.trim() : '';
   const hasValidSpaceHost = Boolean(paramSpaceHost) && isDirectGradioHostUrl(paramSpaceHost);
 
-  // If the stored schema has dropdown/radio components but zero `enum` metadata (legacy sync),
-  // refresh `/gradio_api/info` so mode/aspect-ratio/turbo-LoRA matching works accurately.
   const hasDropdownOrRadio = rawParams.some((p) =>
     /dropdown|radio/i.test(String(p.component ?? '')),
   );
@@ -1128,44 +1472,94 @@ async function resolveGradioContext(
       const res = await fetchWithTimeout(
         `${spaceHost}${candidate.path}`,
         { method: 'GET', headers: merged },
-        8000,
+        getRemainingBudgetMs(options?.deadlineAtMs, 7500),
         signal,
       );
       if (!res.ok) continue;
-      const info = (await res.json()) as {
+      const rawText = await res.text();
+      const parsedInfo = safeParseJsonText(rawText) as {
         named_endpoints?: Record<
           string,
           {
             parameters?: Array<{
               label?: string;
               parameter_name?: string;
-              type?: { type?: string; enum?: unknown[] };
+              type?: { type?: string; enum?: unknown[]; minimum?: number; maximum?: number };
+              python_type?: { type?: string };
               component?: string;
               parameter_has_default?: boolean;
               parameter_default?: unknown;
             }>;
-            returns?: Array<{ label?: string; component?: string }>;
+            returns?: Array<{ label?: string; component?: string; type?: { type?: string } }>;
           }
         >;
-      };
-      const endpoints = info.named_endpoints ?? {};
+        unnamed_endpoints?: Record<
+          string,
+          {
+            parameters?: Array<{
+              label?: string;
+              parameter_name?: string;
+              type?: { type?: string; enum?: unknown[]; minimum?: number; maximum?: number };
+              python_type?: { type?: string };
+              component?: string;
+              parameter_has_default?: boolean;
+              parameter_default?: unknown;
+            }>;
+            returns?: Array<{ label?: string; component?: string; type?: { type?: string } }>;
+          }
+        >;
+      } | null;
+
+      if (!parsedInfo || typeof parsedInfo !== 'object') continue;
+      const endpoints = parsedInfo.named_endpoints ?? {};
       const realEntries = Object.entries(endpoints).filter(([k, v]) => {
         const clean = k.replace(/^\/+/, '');
         return !isGradioUiHelperName(clean) && ((v.parameters?.length ?? 0) > 0 || (v.returns?.length ?? 0) > 0);
       });
 
       let matchedKey = rawApiName;
+      let matchedFnIndex: number | undefined =
+        typeof ctx.modelParameters?.fnIndex === 'number' ? ctx.modelParameters.fnIndex : undefined;
       let entry = !isStaleUiHelper ? (endpoints[`/${rawApiName}`] ?? endpoints[rawApiName]) : undefined;
 
-      if (!entry) {
-        // Prefer inference endpoints like generate, infer, predict, run
-        const preferred =
-          realEntries.find(([k]) => /^\/?(generate|infer|predict|run|txt2img|create|synthesize|transcribe)/i.test(k)) ??
-          realEntries[0] ??
-          Object.entries(endpoints)[0];
-        if (preferred) {
-          matchedKey = preferred[0].replace(/^\/+/, '');
-          entry = preferred[1];
+      if (!entry && realEntries.length > 0) {
+        const ranked = [...realEntries].sort(
+          (a, b) =>
+            scoreGradioEndpointForKind(b[0], b[1].parameters ?? [], b[1].returns ?? [], options?.preferredKind) -
+            scoreGradioEndpointForKind(a[0], a[1].parameters ?? [], a[1].returns ?? [], options?.preferredKind),
+        );
+        const best = ranked[0];
+        if (best) {
+          matchedKey = best[0].replace(/^\/+/, '');
+          entry = best[1];
+          matchedFnIndex = undefined;
+        }
+      }
+
+      // Check unnamed_endpoints if named_endpoints has no usable match
+      if (!entry && parsedInfo.unnamed_endpoints) {
+        const unnamedEntries = Object.entries(parsedInfo.unnamed_endpoints).filter(
+          ([, v]) => (v.parameters?.length ?? 0) > 0,
+        );
+        if (unnamedEntries.length > 0) {
+          const directUnnamed =
+            matchedFnIndex !== undefined ? parsedInfo.unnamed_endpoints[String(matchedFnIndex)] : undefined;
+          if (directUnnamed) {
+            entry = directUnnamed;
+          } else {
+            const rankedUnnamed = [...unnamedEntries].sort(
+              (a, b) =>
+                scoreGradioEndpointForKind(b[0], b[1].parameters ?? [], b[1].returns ?? [], options?.preferredKind) -
+                scoreGradioEndpointForKind(a[0], a[1].parameters ?? [], a[1].returns ?? [], options?.preferredKind),
+            );
+            const best = rankedUnnamed[0];
+            if (best) {
+              const idxNum = Number.parseInt(best[0], 10);
+              matchedKey = `fn_${best[0]}`;
+              matchedFnIndex = Number.isFinite(idxNum) ? idxNum : 0;
+              entry = best[1];
+            }
+          }
         }
       }
 
@@ -1177,15 +1571,8 @@ async function resolveGradioContext(
             spaceHost,
             apiName: matchedKey,
             endpointPrefix: candidate.prefix,
-            parameters: entry.parameters.map((p, idx) => ({
-              index: idx,
-              name: p.parameter_name || p.label || `arg_${idx}`,
-              label: p.label || p.parameter_name || `arg_${idx}`,
-              component: (p.component || p.type?.type || 'textbox').toLowerCase(),
-              hasDefault: Boolean(p.parameter_has_default),
-              defaultValue: p.parameter_default ?? null,
-              ...(Array.isArray(p.type?.enum) ? { enum: p.type.enum } : {}),
-            })),
+            ...(typeof matchedFnIndex === 'number' ? { fnIndex: matchedFnIndex } : {}),
+            parameters: entry.parameters.map(serializeResolvedGradioParam),
           },
         };
       }
@@ -1206,7 +1593,8 @@ async function uploadMediaToGradioSpace(
   mimeType: string,
   fileName: string,
   signal?: AbortSignal,
-): Promise<{ path?: string; url?: string; meta: { _type: 'gradio.FileData' } }> {
+  deadlineAtMs?: number,
+): Promise<GradioFileData> {
   const spaceHost =
     typeof ctx.modelParameters?.spaceHost === 'string' && ctx.modelParameters.spaceHost
       ? normalizeBaseUrl(ctx.modelParameters.spaceHost)
@@ -1220,20 +1608,34 @@ async function uploadMediaToGradioSpace(
   if (ctx.apiKey.trim()) headers.Authorization = `Bearer ${ctx.apiKey.trim()}`;
   const mergedHeaders = mergeHeaders(headers, ctx.additionalHeaders);
 
-  for (const uploadUrl of [`${spaceHost}${prefix}/upload`, `${spaceHost}/upload`]) {
+  const normalizedPrefix = prefix === '' ? '' : `/${prefix.replace(/^\/+|\/+$/g, '')}`;
+  const uploadCandidates = Array.from(
+    new Set([`${spaceHost}${normalizedPrefix}/upload`, `${spaceHost}/upload`]),
+  );
+
+  for (const uploadUrl of uploadCandidates) {
     try {
       const form = new FormData();
       form.append('files', new Blob([new Uint8Array(buffer)], { type: mimeType }), fileName);
       const res = await fetchWithTimeout(
         uploadUrl,
         { method: 'POST', headers: mergedHeaders, body: form },
-        20000,
+        getRemainingBudgetMs(deadlineAtMs, 14_000),
         signal,
       );
       if (!res.ok) continue;
-      const uploaded = (await res.json()) as unknown;
+      const uploaded = safeParseJsonText(await res.text());
       if (Array.isArray(uploaded) && typeof uploaded[0] === 'string' && uploaded[0].trim()) {
-        return { path: uploaded[0].trim(), meta: { _type: 'gradio.FileData' } };
+        const uploadedPath = uploaded[0].trim();
+        return {
+          path: uploadedPath,
+          url: `${spaceHost}${normalizedPrefix}/file=${uploadedPath}`,
+          orig_name: fileName,
+          size: buffer.byteLength,
+          mime_type: mimeType,
+          is_stream: false,
+          meta: { _type: 'gradio.FileData' },
+        };
       }
     } catch {
       // fall through to next upload path or data URI fallback
@@ -1242,6 +1644,10 @@ async function uploadMediaToGradioSpace(
 
   return {
     url: `data:${mimeType};base64,${buffer.toString('base64')}`,
+    orig_name: fileName,
+    size: buffer.byteLength,
+    mime_type: mimeType,
+    is_stream: false,
     meta: { _type: 'gradio.FileData' },
   };
 }
@@ -1261,29 +1667,79 @@ function mapAspectRatioToDimensions(aspectRatio?: string): { width: number; heig
   }
 }
 
+function clampNumericToSpec(val: number, spec: StoredGradioParamSpec): number {
+  let out = val;
+  if (typeof spec.min === 'number') out = Math.max(spec.min, out);
+  if (typeof spec.max === 'number') out = Math.min(spec.max, out);
+  return out;
+}
+
+function matchLanguageChoice(enumValues: unknown[], language?: string): unknown {
+  if (!language) return undefined;
+  const code = language.trim().toLowerCase();
+  const aliases: Record<string, string[]> = {
+    fa: ['fa', 'persian', 'farsi', 'فارسی'],
+    en: ['en', 'english', 'en-us', 'en-gb'],
+    ar: ['ar', 'arabic', 'عربی'],
+    tr: ['tr', 'turkish'],
+    de: ['de', 'german'],
+    fr: ['fr', 'french'],
+    es: ['es', 'spanish'],
+    ru: ['ru', 'russian'],
+    zh: ['zh', 'chinese', 'mandarin'],
+    ja: ['ja', 'japanese'],
+    ko: ['ko', 'korean'],
+  };
+  const targets = aliases[code] ?? [code];
+  return enumValues.find((v) => {
+    if (typeof v !== 'string') return false;
+    const low = v.trim().toLowerCase();
+    return targets.some((t) => low === t || low.includes(t));
+  });
+}
+
+function pairGradio4TupleHistory(history?: Array<{ role: string; content: string }>): Array<[string | null, string | null]> {
+  if (!history || history.length === 0) return [];
+  const pairs: Array<[string | null, string | null]> = [];
+  for (const msg of history) {
+    if (msg.role === 'system') continue;
+    if (msg.role === 'user') {
+      pairs.push([msg.content, null]);
+    } else if (msg.role === 'assistant') {
+      const last = pairs[pairs.length - 1];
+      if (last && last[1] === null) {
+        last[1] = msg.content;
+      } else {
+        pairs.push([null, msg.content]);
+      }
+    }
+  }
+  return pairs;
+}
+
 export function buildGradioInputPayload(
   ctx: ProviderExecutionContext,
   promptText: string,
   systemPrompt?: string,
   history?: Array<{ role: string; content: string }>,
-  mediaInput?: string | { path?: string; url?: string; meta: { _type: 'gradio.FileData' } },
-  options?: { aspectRatio?: string; mode?: 'generate' | 'edit' | 'variation' },
+  mediaInput?: string | GradioFileData,
+  options?: {
+    aspectRatio?: string;
+    mode?: 'generate' | 'edit' | 'variation' | 't2v' | 'i2v' | 'text' | 'vision' | 'tts' | 'stt';
+    durationSeconds?: number;
+    voice?: string;
+    language?: string;
+    mediaKind?: 'image' | 'audio' | 'video';
+    chatHistoryFormat?: 'auto' | 'messages' | 'tuples';
+  },
 ): unknown[] {
   const paramSpecs = Array.isArray(ctx.modelParameters?.parameters)
-    ? (ctx.modelParameters.parameters as Array<{
-        index?: number;
-        name?: string;
-        label?: string;
-        component?: string;
-        hasDefault?: boolean;
-        defaultValue?: unknown;
-        enum?: unknown[];
-      }>)
+    ? (ctx.modelParameters.parameters as StoredGradioParamSpec[])
     : null;
 
-  const mediaPayload =
+  const mediaPayload: GradioFileData | undefined =
     typeof mediaInput === 'string'
-      ? { url: mediaInput, meta: { _type: 'gradio.FileData' } }
+      ? { url: mediaInput, is_stream: false, meta: { _type: 'gradio.FileData' } }
       : mediaInput;
 
   if (!paramSpecs || paramSpecs.length === 0) {
@@ -1291,19 +1747,42 @@ export function buildGradioInputPayload(
   }
 
   const isExcludedTextbox = (pname: string, plabel: string): boolean =>
-    /negative|repo|file|lora|weight|system|token|key|password|seed|url|model|checkpoint/i.test(`${pname} ${plabel}`);
+    /negative|repo|file|lora|weight|system|token|key|password|seed|url|model|checkpoint|api_key/i.test(
+      `${pname} ${plabel}`,
+    );
+
+  // Detect MultimodalTextbox (takes both prompt + uploaded files in one object)
+  const multimodalSlotIndex = paramSpecs.findIndex((spec) => {
+    const comp = (spec.component ?? '').toLowerCase();
+    return Boolean(spec.isMultimodalTextbox) || comp.includes('multimodal');
+  });
 
   // Pick the single best prompt slot before filling defaults
-  let promptSlotIndex = paramSpecs.findIndex((spec) => {
-    const comp = (spec.component ?? '').toLowerCase();
-    const pname = (spec.name ?? '').toLowerCase();
-    const plabel = (spec.label ?? '').toLowerCase();
-    if (comp.includes('image') || comp.includes('audio') || comp.includes('file') || comp.includes('slider') || comp.includes('checkbox') || comp.includes('number')) {
-      return false;
-    }
-    if (isExcludedTextbox(pname, plabel)) return false;
-    return /prompt|message|query|instruction|text|input/i.test(`${pname} ${plabel}`);
-  });
+  let promptSlotIndex = multimodalSlotIndex;
+  if (promptSlotIndex === -1) {
+    promptSlotIndex = paramSpecs.findIndex((spec) => {
+      const comp = (spec.component ?? '').toLowerCase();
+      const pname = (spec.name ?? '').toLowerCase();
+      const plabel = (spec.label ?? '').toLowerCase();
+      if (
+        comp.includes('image') ||
+        comp.includes('audio') ||
+        comp.includes('video') ||
+        comp.includes('file') ||
+        comp.includes('gallery') ||
+        comp.includes('slider') ||
+        comp.includes('checkbox') ||
+        comp.includes('number') ||
+        comp.includes('dropdown') ||
+        comp.includes('radio') ||
+        comp.includes('chatbot')
+      ) {
+        return false;
+      }
+      if (isExcludedTextbox(pname, plabel)) return false;
+      return /prompt|message|query|instruction|text|input|caption/i.test(`${pname} ${plabel}`);
+    });
+  }
 
   if (promptSlotIndex === -1) {
     promptSlotIndex = paramSpecs.findIndex((spec) => {
@@ -1314,11 +1793,51 @@ export function buildGradioInputPayload(
     });
   }
 
+  // Pick the single best media input slot matching mediaKind (image vs audio vs video)
+  let preferredMediaSlotIndex = -1;
+  if (mediaPayload && multimodalSlotIndex === -1) {
+    const isMediaComponent = (spec: StoredGradioParamSpec): boolean => {
+      const comp = (spec.component ?? '').toLowerCase();
+      return (
+        Boolean(spec.isImageEditor) ||
+        Boolean(spec.isFileList) ||
+        comp.includes('image') ||
+        comp.includes('paint') ||
+        comp.includes('sketch') ||
+        comp.includes('audio') ||
+        comp.includes('video') ||
+        comp.includes('file') ||
+        comp.includes('gallery')
+      );
+    };
+
+    if (options?.mediaKind === 'audio') {
+      preferredMediaSlotIndex = paramSpecs.findIndex((s) => (s.component ?? '').toLowerCase().includes('audio'));
+    } else if (options?.mediaKind === 'image') {
+      preferredMediaSlotIndex = paramSpecs.findIndex((s) => {
+        const comp = (s.component ?? '').toLowerCase();
+        return (
+          Boolean(s.isImageEditor) ||
+          comp.includes('image') ||
+          comp.includes('paint') ||
+          comp.includes('sketch') ||
+          comp.includes('gallery')
+        );
+      });
+    } else if (options?.mediaKind === 'video') {
+      preferredMediaSlotIndex = paramSpecs.findIndex((s) => (s.component ?? '').toLowerCase().includes('video'));
+    }
+
+    if (preferredMediaSlotIndex === -1) {
+      preferredMediaSlotIndex = paramSpecs.findIndex(isMediaComponent);
+    }
+  }
+
   const dims = mapAspectRatioToDimensions(options?.aspectRatio);
   const isCfWorker = isCloudflareWorker() || Boolean(getCloudflareRequestContext()?.waitUntil);
 
   // Detect built-in fast/Turbo LoRA on heavy ZeroGPU image Spaces (e.g. "Viggle Turbo (6-Step)" on Qwen AIO).
-  // Cuts generation latency from ~29s (which exceeds Cloudflare Workers' 30s waitUntil limit) down to ~7–8s!
+  // Works for BOTH generate AND edit/variation! Cuts latency from ~35-60s (CF timeout) down to ~7-10s!
   const hasHeavyDefaultSteps = paramSpecs.some((spec) => {
     const comp = (spec.component ?? '').toLowerCase();
     const pname = (spec.name ?? '').toLowerCase();
@@ -1327,12 +1846,15 @@ export function buildGradioInputPayload(
       (pname.includes('step') || plabel.includes('step')) &&
       (comp.includes('slider') || comp.includes('number')) &&
       typeof spec.defaultValue === 'number' &&
-      spec.defaultValue >= 20
+      spec.defaultValue >= 18
     );
   });
 
+  const isImageGenerationOrEdit =
+    options?.mode === 'generate' || options?.mode === 'edit' || options?.mode === 'variation';
+
   const allowAutoTurbo =
-    options?.mode === 'generate' &&
+    isImageGenerationOrEdit &&
     hasHeavyDefaultSteps &&
     ctx.modelParameters?.disableAutoTurbo !== true &&
     !ctx.modelParameters?.defaultLora;
@@ -1348,7 +1870,7 @@ export function buildGradioInputPayload(
       const plabel = (spec.label ?? '').toLowerCase();
       if (
         Array.isArray(spec.enum) &&
-        /lora|adapter|turbo|preset/i.test(`${pname} ${plabel}`)
+        /lora|adapter|turbo|preset|speed|model_type/i.test(`${pname} ${plabel}`)
       ) {
         const turboChoice = spec.enum.find(
           (v): v is string =>
@@ -1369,26 +1891,60 @@ export function buildGradioInputPayload(
     }
   }
 
-  let injectedMedia = false;
-
   return paramSpecs.map((spec, idx) => {
     const comp = (spec.component ?? '').toLowerCase();
     const pname = (spec.name ?? '').toLowerCase();
     const plabel = (spec.label ?? '').toLowerCase();
     const isMediaComp =
-      comp.includes('image') || comp.includes('audio') || comp.includes('video') || comp.includes('file') || comp.includes('gallery');
+      Boolean(spec.isImageEditor) ||
+      Boolean(spec.isFileList) ||
+      comp.includes('image') ||
+      comp.includes('paint') ||
+      comp.includes('sketch') ||
+      comp.includes('audio') ||
+      comp.includes('video') ||
+      comp.includes('file') ||
+      comp.includes('gallery');
+
+    // MultimodalTextbox slot receives BOTH text and uploaded files
+    if (idx === multimodalSlotIndex) {
+      return {
+        text: promptText,
+        files: mediaPayload ? [mediaPayload] : [],
+      };
+    }
 
     if (isMediaComp) {
-      if (mediaPayload && !injectedMedia) {
-        injectedMedia = true;
+      if (mediaPayload && idx === preferredMediaSlotIndex) {
+        if (spec.isImageEditor || /imageeditor|paint|sketchpad|inpaint/.test(comp)) {
+          return { background: mediaPayload, layers: [], composite: mediaPayload };
+        }
+        if (comp.includes('gallery')) {
+          return [{ image: mediaPayload, caption: null }];
+        }
+        if (spec.isFileList || comp === 'files') {
+          return [mediaPayload];
+        }
         return mediaPayload;
       }
       return spec.hasDefault ? (spec.defaultValue ?? null) : null;
     }
 
     if (comp.includes('chatbot') || pname.includes('history')) {
-      return (history ?? []).map((h) => [h.role === 'user' ? h.content : null, h.role === 'assistant' ? h.content : null]);
+      const useMessages =
+        options?.chatHistoryFormat === 'messages' ||
+        (options?.chatHistoryFormat !== 'tuples' && Boolean(spec.isChatbotMessages));
+      if (useMessages) {
+        return (history ?? [])
+          .filter((h) => h.role !== 'system')
+          .map((h) => ({
+            role: h.role === 'assistant' ? 'assistant' : 'user',
+            content: h.content,
+          }));
+      }
+      return pairGradio4TupleHistory(history);
     }
+
     if (pname.includes('system') && systemPrompt) {
       return systemPrompt;
     }
@@ -1400,25 +1956,76 @@ export function buildGradioInputPayload(
       return selectedTurboLoraValue;
     }
 
-    // Mode selection (e.g., Text to Image vs Edit Image on AIO Spaces)
+    // Mode selection (Image: Text-to-Image vs Edit; Video: T2V vs I2V)
     if (
-      (pname.includes('mode') || plabel.includes('mode')) &&
+      (pname.includes('mode') || plabel.includes('mode') || pname.includes('task') || plabel.includes('task')) &&
       Array.isArray(spec.enum) &&
       spec.enum.length > 0
     ) {
       if (options?.mode === 'edit' || options?.mode === 'variation') {
-        const editChoice = spec.enum.find((v) => typeof v === 'string' && /edit|img2img|ref/i.test(v));
+        const editChoice =
+          spec.enum.find((v) => typeof v === 'string' && /edit.*1\s*ref|single|img2img/i.test(v)) ??
+          spec.enum.find((v) => typeof v === 'string' && /edit|img2img|inpaint|ref/i.test(v));
         if (editChoice !== undefined) return editChoice;
       } else if (options?.mode === 'generate') {
-        const genChoice = spec.enum.find((v) => typeof v === 'string' && /text to image|txt2img|generate/i.test(v));
+        const genChoice = spec.enum.find((v) => typeof v === 'string' && /text to image|txt2img|t2i|generate/i.test(v));
         if (genChoice !== undefined) return genChoice;
+      } else if (options?.mode === 'i2v') {
+        const i2vChoice = spec.enum.find((v) => typeof v === 'string' && /image.*video|i2v|img2vid/i.test(v));
+        if (i2vChoice !== undefined) return i2vChoice;
+      } else if (options?.mode === 't2v') {
+        const t2vChoice = spec.enum.find((v) => typeof v === 'string' && /text.*video|t2v|txt2vid/i.test(v));
+        if (t2vChoice !== undefined) return t2vChoice;
+      }
+    }
+
+    // Voice / speaker dropdown matching (TTS)
+    if (
+      options?.voice &&
+      Array.isArray(spec.enum) &&
+      spec.enum.length > 0 &&
+      /voice|speaker|timbre|actor|narrator/i.test(`${pname} ${plabel}`)
+    ) {
+      const targetVoice = options.voice.trim().toLowerCase();
+      const voiceMatch = spec.enum.find(
+        (v) => typeof v === 'string' && v.toLowerCase().includes(targetVoice),
+      );
+      if (voiceMatch !== undefined) return voiceMatch;
+    }
+
+    // Language dropdown matching (TTS / STT)
+    if (
+      options?.language &&
+      Array.isArray(spec.enum) &&
+      spec.enum.length > 0 &&
+      /lang|language/i.test(`${pname} ${plabel}`)
+    ) {
+      const langMatch = matchLanguageChoice(spec.enum, options.language);
+      if (langMatch !== undefined) return langMatch;
+    }
+
+    // Video duration matching
+    if (
+      typeof options?.durationSeconds === 'number' &&
+      /duration|second|video_len|clip_len/i.test(`${pname} ${plabel}`)
+    ) {
+      if (Array.isArray(spec.enum) && spec.enum.length > 0) {
+        const durMatch = spec.enum.find(
+          (v) =>
+            Number(v) === options.durationSeconds ||
+            (typeof v === 'string' && v.includes(String(options.durationSeconds))),
+        );
+        if (durMatch !== undefined) return durMatch;
+      }
+      if (comp.includes('slider') || comp.includes('number')) {
+        return clampNumericToSpec(options.durationSeconds, spec);
       }
     }
 
     // Aspect ratio dropdown matching (e.g. "Landscape · 16:9 (1344x768)")
     if (
       options?.aspectRatio &&
-      (pname.includes('aspect') || pname.includes('ratio') || plabel.includes('aspect')) &&
+      (pname.includes('aspect') || pname.includes('ratio') || plabel.includes('aspect') || plabel.includes('resolution')) &&
       Array.isArray(spec.enum)
     ) {
       const ratioMatch = spec.enum.find(
@@ -1427,10 +2034,10 @@ export function buildGradioInputPayload(
       if (ratioMatch !== undefined) return ratioMatch;
     }
 
-    // Explicit width / height sliders
+    // Explicit width / height sliders (clamped to Space min/max)
     if (options?.aspectRatio && (comp.includes('slider') || comp.includes('number'))) {
-      if (pname === 'width' || plabel === 'width') return dims.width;
-      if (pname === 'height' || plabel === 'height') return dims.height;
+      if (pname === 'width' || plabel === 'width') return clampNumericToSpec(dims.width, spec);
+      if (pname === 'height' || plabel === 'height') return clampNumericToSpec(dims.height, spec);
     }
 
     // Match step count to auto-selected Turbo LoRA, or cap heavy steps so Cloudflare Workers completes cleanly
@@ -1439,10 +2046,11 @@ export function buildGradioInputPayload(
       (comp.includes('slider') || comp.includes('number'))
     ) {
       if (selectedTurboSteps !== null) {
-        return selectedTurboSteps;
+        return clampNumericToSpec(selectedTurboSteps, spec);
       }
       if (typeof spec.defaultValue === 'number' && spec.defaultValue > 12) {
-        return isCfWorker ? Math.min(spec.defaultValue, 10) : Math.min(spec.defaultValue, 16);
+        const capped = isCfWorker ? Math.min(spec.defaultValue, 10) : Math.min(spec.defaultValue, 16);
+        return clampNumericToSpec(capped, spec);
       }
     }
 
@@ -1452,17 +2060,24 @@ export function buildGradioInputPayload(
     if (Array.isArray(spec.enum) && spec.enum.length > 0) {
       return spec.enum[0];
     }
-    if (comp.includes('slider') || comp.includes('number')) return 1;
+    if (comp.includes('slider') || comp.includes('number')) {
+      return typeof spec.min === 'number' ? spec.min : 1;
+    }
     if (comp.includes('checkbox')) return false;
     return '';
   });
 }
 
-async function runGradioSpaceCall(
+type GradioSubmitResult =
+  | { kind: 'immediate'; outputData: unknown[]; spaceHost: string; endpointPrefix: string }
+  | { kind: 'event'; eventId: string; callUrl: string; spaceHost: string; endpointPrefix: string };
+
+async function submitGradioSpaceCall(
   ctx: ProviderExecutionContext,
   dataArgs: unknown[],
   signal?: AbortSignal,
-): Promise<{ outputData: unknown[]; spaceHost: string }> {
+  deadlineAtMs?: number,
+): Promise<GradioSubmitResult> {
   const paramSpaceHost = typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost : '';
   const resolved = paramSpaceHost
     ? { resolvedRootUrl: normalizeBaseUrl(paramSpaceHost) }
@@ -1475,11 +2090,14 @@ async function runGradioSpaceCall(
       ? ctx.modelParameters.apiName
       : modelIdParts[1] || 'predict'
   ).replace(/^\/+/, '');
+  const fnIndex =
+    typeof ctx.modelParameters?.fnIndex === 'number' ? ctx.modelParameters.fnIndex : undefined;
 
   const prefix =
     typeof ctx.modelParameters?.endpointPrefix === 'string'
       ? ctx.modelParameters.endpointPrefix
       : '/gradio_api';
+  const normalizedPrefix = prefix === '' ? '' : `/${prefix.replace(/^\/+|\/+$/g, '')}`;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (ctx.apiKey.trim()) {
@@ -1487,19 +2105,24 @@ async function runGradioSpaceCall(
   }
   const mergedHeaders = mergeHeaders(headers, ctx.additionalHeaders);
 
-  const candidates = [
-    `${spaceHost}${prefix}/call/${apiName}`,
-    `${spaceHost}/call/${apiName}`,
-  ];
+  const callCandidates =
+    fnIndex !== undefined
+      ? []
+      : Array.from(
+          new Set([
+            `${spaceHost}${normalizedPrefix}/call/${apiName}`,
+            `${spaceHost}/call/${apiName}`,
+          ]),
+        );
 
   let submitRes: Response | null = null;
-  let activeCallUrl = candidates[0]!;
+  let activeCallUrl = callCandidates[0] ?? `${spaceHost}${normalizedPrefix}/call/${apiName}`;
 
-  for (const url of candidates) {
+  for (const url of callCandidates) {
     const res = await fetchWithTimeout(
       url,
       { method: 'POST', headers: mergedHeaders, body: JSON.stringify({ data: dataArgs }) },
-      20000,
+      getRemainingBudgetMs(deadlineAtMs, 15_000),
       signal,
     );
     if (res.status !== 404) {
@@ -1509,48 +2132,159 @@ async function runGradioSpaceCall(
     }
   }
 
-  // Fallback for legacy Gradio `/api/predict`
+  // Fallback for unnamed fn_index endpoints or legacy Gradio `/api/predict`
   if (!submitRes) {
-    const legacyUrl = `${spaceHost}/api/predict`;
-    const legacyRes = await fetchWithTimeout(
-      legacyUrl,
-      { method: 'POST', headers: mergedHeaders, body: JSON.stringify({ data: dataArgs }) },
-      45000,
-      signal,
-    );
-    if (!legacyRes.ok) throw classifyHttpError(legacyRes.status, await legacyRes.text(), ctx.apiKey);
-    const json = (await legacyRes.json()) as { data?: unknown[] };
-    return { outputData: Array.isArray(json.data) ? json.data : [], spaceHost };
-  }
+    const legacyUrls =
+      fnIndex !== undefined
+        ? [`${spaceHost}${normalizedPrefix}/api/predict`, `${spaceHost}/api/predict`, `${spaceHost}/run/predict`]
+        : [`${spaceHost}/api/predict`, `${spaceHost}${normalizedPrefix}/api/predict`];
+    const bodyPayload =
+      fnIndex !== undefined ? { data: dataArgs, fn_index: fnIndex } : { data: dataArgs };
 
-  if (!submitRes.ok) {
-    const errBody = await submitRes.text();
-    if (submitRes.status === 503 && /queue is stopped|sleeping|building|paused|no space/i.test(errBody)) {
+    let lastStatus = 404;
+    let lastBody = '';
+    for (const legacyUrl of legacyUrls) {
+      const legacyRes = await fetchWithTimeout(
+        legacyUrl,
+        { method: 'POST', headers: mergedHeaders, body: JSON.stringify(bodyPayload) },
+        getRemainingBudgetMs(deadlineAtMs, 25_000),
+        signal,
+      );
+      lastStatus = legacyRes.status;
+      lastBody = await legacyRes.text();
+      if (legacyRes.ok) {
+        const parsed = safeParseJsonText(lastBody) as { data?: unknown[] } | null;
+        if (parsed && Array.isArray(parsed.data)) {
+          return {
+            kind: 'immediate',
+            outputData: parsed.data,
+            spaceHost,
+            endpointPrefix: normalizedPrefix,
+          };
+        }
+      }
+      if (legacyRes.status !== 404) break;
+    }
+
+    if (lastStatus === 404 || lastBody.trim().startsWith('<')) {
       throw new AIProviderError({
         code: 'PROVIDER_ERROR',
-        message: `HF Space unavailable (${submitRes.status}): ${redactSecrets(errBody.slice(0, 200), ctx.apiKey ? [ctx.apiKey] : [])}`,
-        userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
-        retryable: false,
-        httpStatus: 503,
+        message: `HF Space endpoint unavailable (${lastStatus}): ${redactSecrets(lastBody.slice(0, 160), ctx.apiKey ? [ctx.apiKey] : [])}`,
+        userMessageFa: 'این مدل موقتاً در حال راه‌اندازی یا در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید.',
+        retryable: true,
+        httpStatus: lastStatus,
         credentialFailureKind: 'transient',
       });
     }
-    throw classifyHttpError(submitRes.status, errBody, ctx.apiKey);
+    throw classifyHttpError(lastStatus, lastBody, ctx.apiKey);
   }
 
-  const { event_id: eventId } = (await submitRes.json()) as { event_id?: string };
-  if (!eventId) {
+  const rawSubmitText = await submitRes.text();
+
+  if (!submitRes.ok) {
+    if (
+      (submitRes.status === 503 || submitRes.status === 502 || submitRes.status === 504) &&
+      (/queue is stopped|sleeping|building|paused|no space|restarting|<!doctype/i.test(rawSubmitText) ||
+        rawSubmitText.trim().startsWith('<'))
+    ) {
+      throw new AIProviderError({
+        code: 'PROVIDER_ERROR',
+        message: `HF Space unavailable (${submitRes.status}): ${redactSecrets(rawSubmitText.slice(0, 200), ctx.apiKey ? [ctx.apiKey] : [])}`,
+        userMessageFa: 'این مدل موقتاً در حال راه‌اندازی یا شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب کنید.',
+        retryable: true,
+        httpStatus: submitRes.status,
+        credentialFailureKind: 'transient',
+      });
+    }
+    throw classifyHttpError(submitRes.status, rawSubmitText, ctx.apiKey);
+  }
+
+  const parsedSubmit = safeParseJsonText(rawSubmitText) as { event_id?: string; data?: unknown[] } | null;
+  if (!parsedSubmit) {
+    throw new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: `HF Space returned non-JSON submit response: ${redactSecrets(rawSubmitText.slice(0, 180), ctx.apiKey ? [ctx.apiKey] : [])}`,
+      userMessageFa: 'سرور این مدل موقتاً پاسخ نامعتبر برگرداند (احتمالاً در حال ری‌استارت است). لطفاً دوباره تلاش کنید.',
+      retryable: true,
+      credentialFailureKind: 'transient',
+    });
+  }
+
+  if (!parsedSubmit.event_id && Array.isArray(parsedSubmit.data)) {
+    return {
+      kind: 'immediate',
+      outputData: parsedSubmit.data,
+      spaceHost,
+      endpointPrefix: normalizedPrefix,
+    };
+  }
+
+  if (!parsedSubmit.event_id) {
     throw new AIProviderError({
       code: 'PROVIDER_ERROR',
       message: 'Hugging Face Space did not return an event_id.',
       userMessageFa: 'پاسخی از سرور پردازش دریافت نشد. لطفاً دوباره تلاش کنید.',
+      retryable: true,
+      credentialFailureKind: 'transient',
     });
   }
 
-  // Keep a single active AbortController across BOTH the SSE connect AND the entire streaming body read.
-  // Inside Cloudflare Workers waitUntil (30s hard kill), finish cleanly before 25s so catch+refund always execute.
-  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
-  const sseTimeoutMs = isCfBackgroundWaitUntil ? 25_000 : 55_000;
+  return {
+    kind: 'event',
+    eventId: parsedSubmit.event_id,
+    callUrl: activeCallUrl,
+    spaceHost,
+    endpointPrefix: normalizedPrefix,
+  };
+}
+
+function parseGradioSseBlock(
+  block: string,
+): { kind: 'complete'; data: unknown[] } | { kind: 'error'; raw: string } | null {
+  const lines = block.split(/\r?\n/);
+  let eventName = '';
+  const dataLines: string[] = [];
+  for (const l of lines) {
+    if (l.startsWith('event:')) eventName = l.slice(6).trim();
+    if (l.startsWith('data:')) dataLines.push(l.slice(5).trim());
+  }
+  const payloadRaw = dataLines.join('\n');
+  if (eventName === 'error') {
+    return { kind: 'error', raw: payloadRaw || 'Space execution failed' };
+  }
+  if (eventName === 'complete' && payloadRaw) {
+    const parsed = safeParseJsonText(payloadRaw);
+    if (parsed !== null) {
+      return { kind: 'complete', data: Array.isArray(parsed) ? parsed : [parsed] };
+    }
+    return { kind: 'complete', data: [payloadRaw] };
+  }
+  return null;
+}
+
+function buildGradioSseError(raw: string, apiKey: string): AIProviderError {
+  const isQuota = isQuotaExhaustedSignal(raw);
+  const safeDetail = redactSecrets(raw.slice(0, 300), apiKey ? [apiKey] : []);
+  return new AIProviderError({
+    code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
+    message: `HF Space error: ${safeDetail}`,
+    userMessageFa: isQuota
+      ? 'سرویس این مدل موقتاً شلوغ است (محدودیت سهمیه GPU). لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
+      : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
+    retryable: true,
+    credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
+  });
+}
+
+async function readGradioSpaceSse(params: {
+  callUrl: string;
+  eventId: string;
+  apiKey: string;
+  additionalHeaders?: Record<string, string>;
+  deadlineAtMs: number;
+  signal?: AbortSignal;
+}): Promise<{ status: 'complete'; outputData: unknown[] } | { status: 'timeout' }> {
+  const sseTimeoutMs = Math.max(1500, params.deadlineAtMs - Date.now());
   const sseController = new AbortController();
   let timedOut = false;
   const sseTimer = setTimeout(() => {
@@ -1558,63 +2292,37 @@ async function runGradioSpaceCall(
     sseController.abort();
   }, sseTimeoutMs);
   const onExternalAbort = () => sseController.abort();
-  signal?.addEventListener('abort', onExternalAbort, { once: true });
+  params.signal?.addEventListener('abort', onExternalAbort, { once: true });
 
-  const parseSseBlock = (
-    block: string,
-  ): { kind: 'complete'; data: unknown[] } | { kind: 'error'; raw: string } | null => {
-    const lines = block.split(/\r?\n/);
-    let eventName = '';
-    const dataLines: string[] = [];
-    for (const l of lines) {
-      if (l.startsWith('event:')) eventName = l.slice(6).trim();
-      if (l.startsWith('data:')) dataLines.push(l.slice(5).trim());
-    }
-    const payloadRaw = dataLines.join('\n');
-    if (eventName === 'error') {
-      return { kind: 'error', raw: payloadRaw };
-    }
-    if (eventName === 'complete' && payloadRaw) {
-      const parsed = JSON.parse(payloadRaw) as unknown;
-      return { kind: 'complete', data: Array.isArray(parsed) ? parsed : [parsed] };
-    }
-    return null;
-  };
+  const authHeaders: Record<string, string> = { Accept: 'text/event-stream' };
+  if (params.apiKey.trim()) authHeaders.Authorization = `Bearer ${params.apiKey.trim()}`;
+  const mergedHeaders = mergeHeaders(authHeaders, params.additionalHeaders);
+
+  const sseUrl = `${params.callUrl}/${encodeURIComponent(params.eventId)}`;
+  await assertSafeOutboundUrl(sseUrl);
 
   try {
-    const sseRes = await fetch(`${activeCallUrl}/${encodeURIComponent(eventId)}`, {
+    const sseRes = await fetch(sseUrl, {
       method: 'GET',
-      headers: mergeHeaders({ Accept: 'text/event-stream' }, mergedHeaders),
+      headers: mergedHeaders,
       signal: sseController.signal,
     });
     if (!sseRes.ok) {
-      throw classifyHttpError(sseRes.status, await sseRes.text(), ctx.apiKey);
+      throw classifyHttpError(sseRes.status, await sseRes.text(), params.apiKey);
     }
 
     if (!sseRes.body) {
       const sseText = await sseRes.text();
       for (const block of sseText.split(/\r?\n\r?\n/)) {
-        const parsed = parseSseBlock(block);
-        if (parsed?.kind === 'error') {
-          const isQuota = isQuotaExhaustedSignal(parsed.raw);
-          throw new AIProviderError({
-            code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
-            message: `HF Space error: ${redactSecrets(parsed.raw, ctx.apiKey ? [ctx.apiKey] : [])}`,
-            userMessageFa: isQuota
-              ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
-              : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
-            retryable: true,
-            credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
-          });
-        }
-        if (parsed?.kind === 'complete') {
-          return { outputData: parsed.data, spaceHost };
-        }
+        const parsed = parseGradioSseBlock(block);
+        if (parsed?.kind === 'error') throw buildGradioSseError(parsed.raw, params.apiKey);
+        if (parsed?.kind === 'complete') return { status: 'complete', outputData: parsed.data };
       }
       throw new AIProviderError({
         code: 'PROVIDER_ERROR',
         message: 'Hugging Face Space stream ended without complete event.',
         userMessageFa: 'خروجی کاملی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+        retryable: true,
       });
     }
 
@@ -1633,45 +2341,22 @@ async function runGradioSpaceCall(
 
         for (const block of parts) {
           if (!block.trim()) continue;
-          const parsed = parseSseBlock(block);
+          const parsed = parseGradioSseBlock(block);
           if (parsed?.kind === 'error') {
             await reader.cancel().catch(() => {});
-            const isQuota = isQuotaExhaustedSignal(parsed.raw);
-            throw new AIProviderError({
-              code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
-              message: `HF Space error: ${redactSecrets(parsed.raw, ctx.apiKey ? [ctx.apiKey] : [])}`,
-              userMessageFa: isQuota
-                ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
-                : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
-              retryable: true,
-              credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
-            });
+            throw buildGradioSseError(parsed.raw, params.apiKey);
           }
           if (parsed?.kind === 'complete') {
             await reader.cancel().catch(() => {});
-            return { outputData: parsed.data, spaceHost };
+            return { status: 'complete', outputData: parsed.data };
           }
         }
       }
 
-      // Process any trailing block after stream EOF
       if (buffer.trim()) {
-        const parsed = parseSseBlock(buffer);
-        if (parsed?.kind === 'error') {
-          const isQuota = isQuotaExhaustedSignal(parsed.raw);
-          throw new AIProviderError({
-            code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
-            message: `HF Space error: ${redactSecrets(parsed.raw, ctx.apiKey ? [ctx.apiKey] : [])}`,
-            userMessageFa: isQuota
-              ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
-              : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
-            retryable: true,
-            credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
-          });
-        }
-        if (parsed?.kind === 'complete') {
-          return { outputData: parsed.data, spaceHost };
-        }
+        const parsed = parseGradioSseBlock(buffer);
+        if (parsed?.kind === 'error') throw buildGradioSseError(parsed.raw, params.apiKey);
+        if (parsed?.kind === 'complete') return { status: 'complete', outputData: parsed.data };
       }
     } finally {
       reader.releaseLock();
@@ -1681,23 +2366,125 @@ async function runGradioSpaceCall(
       code: 'PROVIDER_ERROR',
       message: 'Hugging Face Space stream ended without complete event.',
       userMessageFa: 'خروجی کاملی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+      retryable: true,
     });
   } catch (err) {
     if (err instanceof AIProviderError) throw err;
     if (timedOut) {
-      throw new AIProviderError({
-        code: 'TIMEOUT',
-        message: `Hugging Face Space SSE queue timed out after ${Math.round(sseTimeoutMs / 1000)}s.`,
-        userMessageFa: 'زمان پاسخ‌گویی این مدل به پایان رسید (صف شلوغ است). لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
-        retryable: true,
-        credentialFailureKind: 'transient',
-      });
+      return { status: 'timeout' };
     }
     throw err;
   } finally {
     clearTimeout(sseTimer);
-    signal?.removeEventListener('abort', onExternalAbort);
+    params.signal?.removeEventListener('abort', onExternalAbort);
   }
+}
+
+async function runGradioSpaceCall(
+  ctx: ProviderExecutionContext,
+  dataArgs: unknown[],
+  signal?: AbortSignal,
+  deadlineAtMs?: number,
+): Promise<{ outputData: unknown[]; spaceHost: string; endpointPrefix: string }> {
+  const effectiveDeadline = deadlineAtMs ?? createHfDeadline('sync');
+  const submitted = await submitGradioSpaceCall(ctx, dataArgs, signal, effectiveDeadline);
+  if (submitted.kind === 'immediate') {
+    return {
+      outputData: submitted.outputData,
+      spaceHost: submitted.spaceHost,
+      endpointPrefix: submitted.endpointPrefix,
+    };
+  }
+
+  const sseResult = await readGradioSpaceSse({
+    callUrl: submitted.callUrl,
+    eventId: submitted.eventId,
+    apiKey: ctx.apiKey,
+    additionalHeaders: ctx.additionalHeaders,
+    deadlineAtMs: effectiveDeadline,
+    signal,
+  });
+
+  if (sseResult.status === 'timeout') {
+    throw new AIProviderError({
+      code: 'TIMEOUT',
+      message: 'Hugging Face Space SSE queue timed out before completion.',
+      userMessageFa:
+        'زمان پاسخ‌گویی این مدل به پایان رسید (صف شلوغ است). اعتبار شما بازگردانده شد؛ لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+      retryable: true,
+      credentialFailureKind: 'transient',
+    });
+  }
+
+  return {
+    outputData: sseResult.outputData,
+    spaceHost: submitted.spaceHost,
+    endpointPrefix: submitted.endpointPrefix,
+  };
+}
+
+async function callOpenAiCompatibleSpaceText(
+  ctx: ProviderExecutionContext,
+  input: TextGenerationInput,
+  spaceHost: string,
+  deadlineAtMs: number,
+): Promise<TextGenerationOutput> {
+  const modelName =
+    typeof ctx.modelParameters?.openAiModelId === 'string' && ctx.modelParameters.openAiModelId
+      ? ctx.modelParameters.openAiModelId
+      : ctx.modelIdentifier.split('::openai::')[1] || 'default';
+
+  const messages: Array<{ role: string; content: unknown }> = [];
+  if (input.systemPrompt) messages.push({ role: 'system', content: input.systemPrompt });
+  for (const m of input.messages) {
+    if (m.role === 'system') continue;
+    if (m.imageBase64 && m.imageMimeType) {
+      messages.push({
+        role: m.role,
+        content: [
+          { type: 'image_url', image_url: { url: `data:${m.imageMimeType};base64,${m.imageBase64}` } },
+          { type: 'text', text: m.content },
+        ],
+      });
+    } else {
+      messages.push({ role: m.role, content: m.content });
+    }
+  }
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (ctx.apiKey.trim()) headers.Authorization = `Bearer ${ctx.apiKey.trim()}`;
+  const res = await fetchWithTimeout(
+    `${normalizeBaseUrl(spaceHost)}/v1/chat/completions`,
+    {
+      method: 'POST',
+      headers: mergeHeaders(headers, ctx.additionalHeaders),
+      body: JSON.stringify({
+        model: modelName,
+        messages,
+        max_tokens: Math.min(input.maxTokens ?? ctx.maxOutputSize ?? 2048, 4096),
+        ...(typeof input.temperature === 'number' ? { temperature: input.temperature } : {}),
+      }),
+    },
+    getRemainingBudgetMs(deadlineAtMs, 20_000),
+    input.signal,
+  );
+  const rawText = await res.text();
+  if (!res.ok) throw classifyHttpError(res.status, rawText, ctx.apiKey);
+  const json = safeParseJsonText(rawText) as {
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  } | null;
+  const text = json?.choices?.[0]?.message?.content?.trim() ?? '';
+  if (input.onChunk && text) await input.onChunk(text);
+  const inTok = json?.usage?.prompt_tokens ?? estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
+  const outTok = json?.usage?.completion_tokens ?? estimateTokensRough(text);
+  return {
+    text: text || 'پاسخی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+    inputTokens: inTok,
+    outputTokens: outTok,
+    costUsd: 0,
+    finishReason: json?.choices?.[0]?.finish_reason,
+  };
 }
 
 // =============================================================================
@@ -2145,22 +2932,107 @@ async function executeTextOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const deadlineAtMs = createHfDeadline('sync');
       const lastUser = [...input.messages].reverse().find((m) => m.role === 'user');
-      const promptText = lastUser?.content || input.messages.map((m) => m.content).join('\n');
-      const mediaDataUri =
-        lastUser?.imageBase64 && lastUser?.imageMimeType
-          ? `data:${lastUser.imageMimeType};base64,${lastUser.imageBase64}`
-          : undefined;
+      const hasVisionImage = Boolean(lastUser?.imageBase64 && lastUser?.imageMimeType);
 
+      // Direct OpenAI-compatible Docker HF Space (/v1/chat/completions)
+      if (ctx.modelParameters?.openAiCompatible === true) {
+        const spaceHost =
+          typeof ctx.modelParameters.spaceHost === 'string' && ctx.modelParameters.spaceHost
+            ? normalizeBaseUrl(ctx.modelParameters.spaceHost)
+            : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
+        return callOpenAiCompatibleSpaceText(ctx, input, spaceHost, deadlineAtMs);
+      }
+
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+        preferredKind: hasVisionImage ? 'vision' : 'text',
+        deadlineAtMs,
+      });
+      const promptText = lastUser?.content || input.messages.map((m) => m.content).join('\n');
+
+      let uploadedVisionMedia: GradioFileData | undefined;
+      if (hasVisionImage && lastUser?.imageBase64 && lastUser?.imageMimeType) {
+        const ext = lastUser.imageMimeType.includes('png')
+          ? 'png'
+          : lastUser.imageMimeType.includes('webp')
+            ? 'webp'
+            : 'jpg';
+        uploadedVisionMedia = await uploadMediaToGradioSpace(
+          resolvedCtx,
+          Buffer.from(lastUser.imageBase64, 'base64'),
+          lastUser.imageMimeType,
+          `vision.${ext}`,
+          input.signal,
+          deadlineAtMs,
+        );
+      }
+
+      const historyMsgs = input.messages.slice(0, -1);
       const args = buildGradioInputPayload(
         resolvedCtx,
         promptText,
         input.systemPrompt,
-        input.messages.slice(0, -1),
-        mediaDataUri,
+        historyMsgs,
+        uploadedVisionMedia,
+        {
+          mode: hasVisionImage ? 'vision' : 'text',
+          mediaKind: hasVisionImage ? 'image' : undefined,
+        },
       );
-      const { outputData } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+
+      let outputData: unknown[];
+      try {
+        const callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
+        outputData = callRes.outputData;
+      } catch (firstErr) {
+        const isSchemaOrFormatErr =
+          firstErr instanceof AIProviderError &&
+          (firstErr.httpStatus === 400 ||
+            firstErr.httpStatus === 422 ||
+            firstErr.httpStatus === 500 ||
+            (firstErr.code === 'PROVIDER_ERROR' && /Space error/i.test(firstErr.message)));
+        const isNotFoundGradio =
+          firstErr instanceof AIProviderError && firstErr.httpStatus === 404;
+
+        // Auto-fallback to OpenAI /v1/chat/completions for Docker Spaces without Gradio endpoints
+        if (isNotFoundGradio && deadlineAtMs - Date.now() > 4000) {
+          const spaceHost =
+            typeof resolvedCtx.modelParameters?.spaceHost === 'string' && resolvedCtx.modelParameters.spaceHost
+              ? normalizeBaseUrl(resolvedCtx.modelParameters.spaceHost)
+              : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
+          return callOpenAiCompatibleSpaceText(resolvedCtx, input, spaceHost, deadlineAtMs);
+        }
+
+        if (!isSchemaOrFormatErr || deadlineAtMs - Date.now() < 5500) {
+          throw firstErr;
+        }
+
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+          forceRefresh: true,
+          preferredKind: hasVisionImage ? 'vision' : 'text',
+          deadlineAtMs,
+        });
+        const retryParams = Array.isArray(resolvedCtx.modelParameters?.parameters)
+          ? (resolvedCtx.modelParameters.parameters as StoredGradioParamSpec[])
+          : [];
+        const hasMessagesBot = retryParams.some((p) => p.isChatbotMessages);
+        const retryArgs = buildGradioInputPayload(
+          resolvedCtx,
+          promptText,
+          input.systemPrompt,
+          historyMsgs,
+          uploadedVisionMedia,
+          {
+            mode: hasVisionImage ? 'vision' : 'text',
+            mediaKind: hasVisionImage ? 'image' : undefined,
+            chatHistoryFormat: hasMessagesBot ? 'tuples' : 'messages',
+          },
+        );
+        const retryRes = await runGradioSpaceCall(resolvedCtx, retryArgs, input.signal, deadlineAtMs);
+        outputData = retryRes.outputData;
+      }
+
       const text = extractGradioOutputText(outputData).trim();
       const inTok = estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
       const outTok = estimateTokensRough(text);
@@ -2321,6 +3193,8 @@ async function downloadBinarySafe(
   url: string,
   apiKey: string,
   attachBearerAuth = false,
+  timeoutMs = 45000,
+  signal?: AbortSignal,
 ): Promise<{ buffer: Buffer; mimeType: string }> {
   if (url.startsWith('data:')) {
     const match = /^data:([^;]+);base64,(.+)$/s.exec(url);
@@ -2335,11 +3209,44 @@ async function downloadBinarySafe(
   if (attachBearerAuth && apiKey.trim()) {
     headers.Authorization = `Bearer ${apiKey.trim()}`;
   }
-  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 45000);
+  let res = await fetchWithTimeout(url, { method: 'GET', headers }, timeoutMs, signal);
+
+  // Presigned S3/R2/CloudFront media URLs reject extra Authorization headers; retry once cleanly without auth
+  if (
+    !res.ok &&
+    attachBearerAuth &&
+    headers.Authorization &&
+    (res.status === 400 || res.status === 401 || res.status === 403)
+  ) {
+    let isHfHost = false;
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      isHfHost = host.endsWith('.hf.space') || host.endsWith('huggingface.co');
+    } catch {
+      isHfHost = false;
+    }
+    if (!isHfHost) {
+      res = await fetchWithTimeout(url, { method: 'GET' }, timeoutMs, signal);
+    }
+  }
+
   if (!res.ok) {
     throw classifyHttpError(res.status, await res.text(), apiKey);
   }
-  const mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
+  let mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || '';
+  if (!mimeType || mimeType === 'application/octet-stream' || mimeType === 'binary/octet-stream') {
+    const cleanUrl = url.split('?')[0]?.toLowerCase() ?? '';
+    if (cleanUrl.endsWith('.mp4') || cleanUrl.endsWith('.m4v')) mimeType = 'video/mp4';
+    else if (cleanUrl.endsWith('.webm')) mimeType = 'video/webm';
+    else if (cleanUrl.endsWith('.mov')) mimeType = 'video/quicktime';
+    else if (cleanUrl.endsWith('.mp3')) mimeType = 'audio/mpeg';
+    else if (cleanUrl.endsWith('.wav')) mimeType = 'audio/wav';
+    else if (cleanUrl.endsWith('.ogg') || cleanUrl.endsWith('.opus')) mimeType = 'audio/ogg';
+    else if (cleanUrl.endsWith('.flac')) mimeType = 'audio/flac';
+    else if (cleanUrl.endsWith('.jpg') || cleanUrl.endsWith('.jpeg')) mimeType = 'image/jpeg';
+    else if (cleanUrl.endsWith('.webp')) mimeType = 'image/webp';
+    else mimeType = 'image/png';
+  }
   const arrayBuf = await res.arrayBuffer();
   return { buffer: Buffer.from(arrayBuf), mimeType };
 }
@@ -2916,27 +3823,40 @@ async function executeImageGenOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      let resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const deadlineAtMs = createHfDeadline('sync');
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+        preferredKind: 'image_generate',
+        deadlineAtMs,
+      });
       let args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
         aspectRatio: input.aspectRatio,
         mode: 'generate',
       });
-      let callRes: { outputData: unknown[]; spaceHost: string };
+      let callRes: { outputData: unknown[]; spaceHost: string; endpointPrefix: string };
       try {
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
       } catch (firstErr) {
         const isSchemaErr =
           firstErr instanceof AIProviderError &&
           (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
-        if (!isSchemaErr) throw firstErr;
-        resolvedCtx = await resolveGradioContext(ctx, input.signal, { forceRefresh: true });
+        if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+          forceRefresh: true,
+          preferredKind: 'image_generate',
+          deadlineAtMs,
+        });
         args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
           aspectRatio: input.aspectRatio,
           mode: 'generate',
         });
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
       }
-      const mediaUrl = extractGradioMediaUrl(callRes.outputData, callRes.spaceHost);
+      const mediaUrl = extractGradioMediaUrl(
+        callRes.outputData,
+        callRes.spaceHost,
+        'image',
+        callRes.endpointPrefix,
+      );
       if (!mediaUrl) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -2944,7 +3864,13 @@ async function executeImageGenOnProvider(
           userMessageFa: 'تصویری تولید نشد. لطفاً دوباره تلاش کنید.',
         });
       }
-      const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
+      const dl = await downloadBinarySafe(
+        mediaUrl,
+        resolvedCtx.apiKey,
+        true,
+        getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
+        input.signal,
+      );
       return {
         images: [
           {
@@ -3205,13 +4131,23 @@ async function executeImageEditOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      let resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const deadlineAtMs = createHfDeadline('sync');
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+        preferredKind: 'image_edit',
+        deadlineAtMs,
+      });
+      const ext = input.sourceMimeType.includes('png')
+        ? 'png'
+        : input.sourceMimeType.includes('webp')
+          ? 'webp'
+          : 'jpg';
       const uploadedImg = await uploadMediaToGradioSpace(
         resolvedCtx,
         input.sourceImageBuffer,
         input.sourceMimeType,
-        input.sourceMimeType.includes('png') ? 'source.png' : 'source.jpg',
+        `source.${ext}`,
         input.signal,
+        deadlineAtMs,
       );
       const promptText =
         input.mode === 'variation'
@@ -3220,23 +4156,34 @@ async function executeImageEditOnProvider(
       let args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
         aspectRatio: input.aspectRatio,
         mode: input.mode,
+        mediaKind: 'image',
       });
-      let callRes: { outputData: unknown[]; spaceHost: string };
+      let callRes: { outputData: unknown[]; spaceHost: string; endpointPrefix: string };
       try {
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
       } catch (firstErr) {
         const isSchemaErr =
           firstErr instanceof AIProviderError &&
           (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
-        if (!isSchemaErr) throw firstErr;
-        resolvedCtx = await resolveGradioContext(ctx, input.signal, { forceRefresh: true });
+        if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+          forceRefresh: true,
+          preferredKind: 'image_edit',
+          deadlineAtMs,
+        });
         args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
           aspectRatio: input.aspectRatio,
           mode: input.mode,
+          mediaKind: 'image',
         });
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
       }
-      const mediaUrl = extractGradioMediaUrl(callRes.outputData, callRes.spaceHost);
+      const mediaUrl = extractGradioMediaUrl(
+        callRes.outputData,
+        callRes.spaceHost,
+        'image',
+        callRes.endpointPrefix,
+      );
       if (!mediaUrl) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -3244,13 +4191,19 @@ async function executeImageEditOnProvider(
           userMessageFa: 'ویرایش تصویر نتیجه‌ای برنگرداند. لطفاً دوباره تلاش کنید.',
         });
       }
-      const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
+      const dl = await downloadBinarySafe(
+        mediaUrl,
+        resolvedCtx.apiKey,
+        true,
+        getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
+        input.signal,
+      );
       return {
         images: [
           {
             buffer: dl.buffer,
             mimeType: dl.mimeType,
-            extension: dl.mimeType.includes('jpeg') ? 'jpg' : 'png',
+            extension: dl.mimeType.includes('jpeg') ? 'jpg' : dl.mimeType.includes('webp') ? 'webp' : 'png',
           },
         ],
         costUsd: 0,
@@ -3482,18 +4435,46 @@ async function executeTranscribeOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const deadlineAtMs = createHfDeadline('sync');
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+        preferredKind: 'stt',
+        deadlineAtMs,
+      });
       const uploadedAudio = await uploadMediaToGradioSpace(
         resolvedCtx,
         input.audioBuffer,
         input.mimeType || 'audio/ogg',
         input.fileName || 'voice.ogg',
         input.signal,
+        deadlineAtMs,
       );
-      const args = buildGradioInputPayload(resolvedCtx, '', undefined, undefined, uploadedAudio);
-      const { outputData } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+      let args = buildGradioInputPayload(resolvedCtx, '', undefined, undefined, uploadedAudio, {
+        mode: 'stt',
+        language: input.language,
+        mediaKind: 'audio',
+      });
+      let callRes: { outputData: unknown[]; spaceHost: string; endpointPrefix: string };
+      try {
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
+      } catch (firstErr) {
+        const isSchemaErr =
+          firstErr instanceof AIProviderError &&
+          (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
+        if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+          forceRefresh: true,
+          preferredKind: 'stt',
+          deadlineAtMs,
+        });
+        args = buildGradioInputPayload(resolvedCtx, '', undefined, undefined, uploadedAudio, {
+          mode: 'stt',
+          language: input.language,
+          mediaKind: 'audio',
+        });
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
+      }
       return {
-        text: extractGradioOutputText(outputData).trim(),
+        text: extractGradioOutputText(callRes.outputData).trim(),
         language: input.language,
         costUsd: 0,
       };
@@ -3727,10 +4708,42 @@ async function executeSpeechOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
-      const args = buildGradioInputPayload(resolvedCtx, input.text);
-      const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
-      const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
+      const deadlineAtMs = createHfDeadline('sync');
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+        preferredKind: 'tts',
+        deadlineAtMs,
+      });
+      let args = buildGradioInputPayload(resolvedCtx, input.text, undefined, undefined, undefined, {
+        mode: 'tts',
+        voice: input.voice,
+        language: input.language,
+      });
+      let callRes: { outputData: unknown[]; spaceHost: string; endpointPrefix: string };
+      try {
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
+      } catch (firstErr) {
+        const isSchemaErr =
+          firstErr instanceof AIProviderError &&
+          (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
+        if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+          forceRefresh: true,
+          preferredKind: 'tts',
+          deadlineAtMs,
+        });
+        args = buildGradioInputPayload(resolvedCtx, input.text, undefined, undefined, undefined, {
+          mode: 'tts',
+          voice: input.voice,
+          language: input.language,
+        });
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
+      }
+      const mediaUrl = extractGradioMediaUrl(
+        callRes.outputData,
+        callRes.spaceHost,
+        'audio',
+        callRes.endpointPrefix,
+      );
       if (!mediaUrl) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -3738,8 +4751,20 @@ async function executeSpeechOnProvider(
           userMessageFa: 'خروجی صوتی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
         });
       }
-      const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
-      const ext = dl.mimeType.includes('mpeg') ? 'mp3' : dl.mimeType.includes('ogg') ? 'ogg' : 'wav';
+      const dl = await downloadBinarySafe(
+        mediaUrl,
+        resolvedCtx.apiKey,
+        true,
+        getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
+        input.signal,
+      );
+      const ext = dl.mimeType.includes('mpeg')
+        ? 'mp3'
+        : dl.mimeType.includes('ogg')
+          ? 'ogg'
+          : dl.mimeType.includes('flac')
+            ? 'flac'
+            : 'wav';
       return {
         audioBuffer: dl.buffer,
         mimeType: dl.mimeType,
@@ -3895,6 +4920,161 @@ export async function startVideoGenerationWithRoute(
           status: 'running',
           progressPercent: 20,
           costUsd: 0.2,
+        };
+      }
+
+      if (isHuggingFaceSpaceContext(ctx)) {
+        const deadlineAtMs = createHfDeadline('sync');
+        const hasSourceImage = Boolean(input.sourceImageBase64);
+        let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+          preferredKind: hasSourceImage ? 'video_i2v' : 'video_t2v',
+          deadlineAtMs,
+        });
+
+        let uploadedImg: GradioFileData | undefined;
+        if (input.sourceImageBase64) {
+          const mime = input.sourceImageMimeType || 'image/jpeg';
+          const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
+          uploadedImg = await uploadMediaToGradioSpace(
+            resolvedCtx,
+            Buffer.from(input.sourceImageBase64, 'base64'),
+            mime,
+            `video-source.${ext}`,
+            input.signal,
+            deadlineAtMs,
+          );
+        }
+
+        const buildVideoArgs = (targetCtx: ProviderExecutionContext) =>
+          buildGradioInputPayload(targetCtx, input.prompt, undefined, undefined, uploadedImg, {
+            mode: hasSourceImage ? 'i2v' : 't2v',
+            aspectRatio: input.aspectRatio,
+            durationSeconds: input.durationSeconds,
+            mediaKind: hasSourceImage ? 'image' : undefined,
+          });
+
+        let submitted: GradioSubmitResult;
+        try {
+          submitted = await submitGradioSpaceCall(
+            resolvedCtx,
+            buildVideoArgs(resolvedCtx),
+            input.signal,
+            deadlineAtMs,
+          );
+        } catch (firstErr) {
+          const isSchemaErr =
+            firstErr instanceof AIProviderError &&
+            (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
+          if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
+          resolvedCtx = await resolveGradioContext(ctx, input.signal, {
+            forceRefresh: true,
+            preferredKind: hasSourceImage ? 'video_i2v' : 'video_t2v',
+            deadlineAtMs,
+          });
+          submitted = await submitGradioSpaceCall(
+            resolvedCtx,
+            buildVideoArgs(resolvedCtx),
+            input.signal,
+            deadlineAtMs,
+          );
+        }
+
+        if (submitted.kind === 'immediate') {
+          const videoUrl = extractGradioMediaUrl(
+            submitted.outputData,
+            submitted.spaceHost,
+            'video',
+            submitted.endpointPrefix,
+          );
+          if (!videoUrl) {
+            throw new AIProviderError({
+              code: 'PROVIDER_ERROR',
+              message: 'Hugging Face Space returned no video output.',
+              userMessageFa: 'ویدیویی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+            });
+          }
+          const dl = await downloadBinarySafe(
+            videoUrl,
+            resolvedCtx.apiKey,
+            true,
+            getRemainingBudgetMs(deadlineAtMs, 25_000, 5000),
+            input.signal,
+          );
+          return {
+            providerJobId: `hf-sync-${Date.now()}`,
+            status: 'succeeded',
+            progressPercent: 100,
+            videoBuffer: dl.buffer,
+            videoUrl,
+            mimeType: dl.mimeType.startsWith('video/') ? dl.mimeType : 'video/mp4',
+            costUsd: 0,
+          };
+        }
+
+        const hfMetadata = {
+          kind: 'hf_space_gradio',
+          callUrl: submitted.callUrl,
+          spaceHost: submitted.spaceHost,
+          endpointPrefix: submitted.endpointPrefix,
+          credentialId: ctx.credentialId ?? null,
+        };
+
+        // On Cloudflare Workers (30s waitUntil ceiling), return immediately after POST so Gradio
+        // keeps generating in the background without SSE disconnect cancellation; video poll collects it!
+        const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
+        if (isCfBackgroundWaitUntil) {
+          return {
+            providerJobId: submitted.eventId,
+            status: 'running',
+            progressPercent: 25,
+            costUsd: 0,
+            metadata: hfMetadata,
+          };
+        }
+
+        // On Node.js, wait directly up to the sync deadline; if still rendering, hand off to async poll
+        const sseResult = await readGradioSpaceSse({
+          callUrl: submitted.callUrl,
+          eventId: submitted.eventId,
+          apiKey: resolvedCtx.apiKey,
+          additionalHeaders: resolvedCtx.additionalHeaders,
+          deadlineAtMs,
+          signal: input.signal,
+        });
+
+        if (sseResult.status === 'complete') {
+          const videoUrl = extractGradioMediaUrl(
+            sseResult.outputData,
+            submitted.spaceHost,
+            'video',
+            submitted.endpointPrefix,
+          );
+          if (!videoUrl) {
+            throw new AIProviderError({
+              code: 'PROVIDER_ERROR',
+              message: 'Hugging Face Space completed without a video file.',
+              userMessageFa: 'ویدیویی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+            });
+          }
+          const dl = await downloadBinarySafe(videoUrl, resolvedCtx.apiKey, true, 45_000, input.signal);
+          return {
+            providerJobId: submitted.eventId,
+            status: 'succeeded',
+            progressPercent: 100,
+            videoBuffer: dl.buffer,
+            videoUrl,
+            mimeType: dl.mimeType.startsWith('video/') ? dl.mimeType : 'video/mp4',
+            costUsd: 0,
+            metadata: hfMetadata,
+          };
+        }
+
+        return {
+          providerJobId: submitted.eventId,
+          status: 'running',
+          progressPercent: 45,
+          costUsd: 0,
+          metadata: hfMetadata,
         };
       }
 
@@ -4060,6 +5240,94 @@ export async function pollVideoGenerationJob(
         };
       }
       return { status: 'running', progressPercent: 55 };
+    }
+
+    if (isHuggingFaceSpaceContext(ctx) || metadata?.kind === 'hf_space_gradio') {
+      const deadlineAtMs = createHfDeadline('video_poll');
+      const spaceHost =
+        typeof metadata?.spaceHost === 'string' && metadata.spaceHost
+          ? normalizeBaseUrl(metadata.spaceHost)
+          : typeof ctx.modelParameters?.spaceHost === 'string' && ctx.modelParameters.spaceHost
+            ? normalizeBaseUrl(ctx.modelParameters.spaceHost)
+            : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
+      const endpointPrefix =
+        typeof metadata?.endpointPrefix === 'string'
+          ? metadata.endpointPrefix
+          : typeof ctx.modelParameters?.endpointPrefix === 'string'
+            ? ctx.modelParameters.endpointPrefix
+            : '/gradio_api';
+      const apiName = (
+        typeof ctx.modelParameters?.apiName === 'string'
+          ? ctx.modelParameters.apiName
+          : ctx.modelIdentifier.split('::')[1] || 'predict'
+      ).replace(/^\/+/, '');
+      const normalizedPrefix = endpointPrefix === '' ? '' : `/${endpointPrefix.replace(/^\/+|\/+$/g, '')}`;
+      const callUrl =
+        typeof metadata?.callUrl === 'string' && metadata.callUrl
+          ? metadata.callUrl
+          : `${spaceHost}${normalizedPrefix}/call/${apiName}`;
+
+      try {
+        const sseResult = await readGradioSpaceSse({
+          callUrl,
+          eventId: providerJobId,
+          apiKey: ctx.apiKey,
+          additionalHeaders: ctx.additionalHeaders,
+          deadlineAtMs,
+        });
+
+        if (sseResult.status === 'timeout') {
+          return { status: 'running', progressPercent: 60 };
+        }
+
+        const videoUrl = extractGradioMediaUrl(
+          sseResult.outputData,
+          spaceHost,
+          'video',
+          normalizedPrefix,
+        );
+        if (!videoUrl) {
+          return {
+            status: 'failed',
+            progressPercent: 0,
+            errorMessage: 'ویدیویی از مدل دریافت نشد.',
+          };
+        }
+
+        const dl = await downloadBinarySafe(
+          videoUrl,
+          ctx.apiKey,
+          true,
+          getRemainingBudgetMs(deadlineAtMs, 25_000, 6000),
+        );
+        return {
+          status: 'succeeded',
+          progressPercent: 100,
+          videoBuffer: dl.buffer,
+          videoUrl,
+          mimeType: dl.mimeType.startsWith('video/') ? dl.mimeType : 'video/mp4',
+          costUsd: 0,
+        };
+      } catch (pollErr) {
+        if (pollErr instanceof AIProviderError) {
+          if (pollErr.httpStatus === 404) {
+            return {
+              status: 'failed',
+              progressPercent: 0,
+              errorMessage: 'شناسه پردازش ویدیو در سرور منقضی شد. لطفاً دوباره تلاش کنید.',
+            };
+          }
+          if (pollErr.retryable && pollErr.code === 'TIMEOUT') {
+            return { status: 'running', progressPercent: 60 };
+          }
+          return {
+            status: 'failed',
+            progressPercent: 0,
+            errorMessage: pollErr.userMessageFa,
+          };
+        }
+        throw pollErr;
+      }
     }
 
     return { status: 'failed', progressPercent: 0, errorMessage: 'پشتیبانی از polling این ارائه‌دهنده تعریف نشده است.' };
