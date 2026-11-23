@@ -13,7 +13,10 @@ import {
 } from '../middleware/auth.ts';
 import { getSystemBillingSettings } from '../services/walletService.ts';
 import { normalizeModelIdentifierForProvider } from '../providers/discovery.ts';
-import { runBatchModelHealthCheck } from '../providers/modelHealthService.ts';
+import {
+  applyBulkModelAction,
+  runBatchModelHealthCheck,
+} from '../providers/modelHealthService.ts';
 
 const modelHealthCheckSchema = z.object({
   providerId: z.string().uuid().optional(),
@@ -26,6 +29,11 @@ const modelHealthCheckSchema = z.object({
     .enum(['report_only', 'deactivate_broken', 'delete_broken'])
     .optional()
     .default('report_only'),
+});
+
+const bulkModelActionSchema = z.object({
+  modelIds: z.array(z.string().uuid()).min(1).max(200),
+  action: z.enum(['activate', 'deactivate', 'delete']),
 });
 
 export function createModelRouter(): Router {
@@ -433,6 +441,57 @@ export function createModelRouter(): Router {
       } catch (err) {
         console.error('[models/health-check]', err instanceof Error ? err.message : 'unknown');
         res.status(500).json({ error: 'خطا در اجرای بررسی سلامت مدل‌ها.' });
+      }
+    },
+  );
+
+  // Manual bulk enable / disable / delete for arbitrary models (broken, rate-limited, inactive, etc.)
+  router.post(
+    '/models/bulk-action',
+    requireRole('admin'),
+    async (req: AdminRequest, res: Response) => {
+      try {
+        const parsed = bulkModelActionSchema.safeParse(req.body ?? {});
+        if (!parsed.success) {
+          res.status(400).json({
+            error: 'ورودی عملیات گروهی مدل‌ها معتبر نیست.',
+            details: parsed.error.flatten(),
+          });
+          return;
+        }
+
+        const { modelIds, action } = parsed.data;
+        const result = await applyBulkModelAction({ modelIds, action });
+
+        if (result.affectedCount > 0) {
+          const ip = getClientIp(req);
+          const ua = req.headers['user-agent'] ?? null;
+          const auditAction =
+            action === 'activate'
+              ? 'model.bulk_activated'
+              : action === 'deactivate'
+                ? 'model.bulk_deactivated'
+                : 'model.bulk_deleted';
+
+          await recordAuditLog({
+            adminUserId: req.admin!.id,
+            action: auditAction,
+            resourceType: 'ai_model',
+            severity: action === 'delete' ? 'warning' : 'info',
+            ipAddress: ip,
+            userAgent: ua,
+            details: {
+              action,
+              affectedCount: result.affectedCount,
+              modelIds: result.affectedIds.slice(0, 50),
+            },
+          });
+        }
+
+        res.json(result);
+      } catch (err) {
+        console.error('[models/bulk-action]', err instanceof Error ? err.message : 'unknown');
+        res.status(500).json({ error: 'خطا در اعمال عملیات دستی روی مدل‌ها.' });
       }
     },
   );

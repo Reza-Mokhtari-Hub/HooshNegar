@@ -19,6 +19,7 @@ import {
 import { testProviderConnection } from '../providers/adapters.ts';
 import {
   discoverProviderModels,
+  isHuggingFaceSpaceUrl,
   syncProviderModelsToDatabase,
   type SyncModelsResult,
 } from '../providers/discovery.ts';
@@ -194,13 +195,18 @@ export function createProviderRouter(): Router {
 
       const db = getDb();
 
+      const normalizedProviderType =
+        data.providerType === 'huggingface' && isHuggingFaceSpaceUrl(data.baseUrl)
+          ? 'huggingface_space'
+          : data.providerType;
+
       const created = await db.transaction(async (tx) => {
         const [provider] = await tx
           .insert(aiProviders)
           .values({
             name: data.name,
             slug: slugifyProviderName(data.name),
-            providerType: data.providerType,
+            providerType: normalizedProviderType,
             baseUrl: data.baseUrl,
             organizationId: data.organizationId || null,
             additionalHeaders: data.additionalHeaders ?? {},
@@ -368,10 +374,23 @@ export function createProviderRouter(): Router {
         }
       }
       const db = getDb();
+      const [existingProv] = await db.select().from(aiProviders).where(eq(aiProviders.id, id)).limit(1);
+      if (!existingProv) {
+        res.status(404).json({ error: 'ارائه‌دهنده مورد نظر یافت نشد.' });
+        return;
+      }
+      const nextBaseUrl = parsed.data.baseUrl ?? existingProv.baseUrl;
+      const requestedType = parsed.data.providerType ?? existingProv.providerType;
+      const effectiveUpdatedType =
+        requestedType === 'huggingface' && isHuggingFaceSpaceUrl(nextBaseUrl)
+          ? 'huggingface_space'
+          : requestedType;
+
       const [updated] = await db
         .update(aiProviders)
         .set({
           ...parsed.data,
+          providerType: effectiveUpdatedType,
           organizationId:
             parsed.data.organizationId === '' ? null : parsed.data.organizationId,
           updatedAt: new Date(),
@@ -727,9 +746,14 @@ export function createProviderRouter(): Router {
         const bestCred =
           activeCreds.find((c) => isCredentialHealthy(c, nowMs)) ?? activeCreds[0] ?? null;
 
+        const effectiveProviderType =
+          provider.providerType === 'huggingface' && isHuggingFaceSpaceUrl(provider.baseUrl)
+            ? 'huggingface_space'
+            : provider.providerType;
+
         const isKeylessAllowed =
-          provider.providerType === 'huggingface_space' ||
-          (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
+          effectiveProviderType === 'huggingface_space' ||
+          (effectiveProviderType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
 
         if (!bestCred && !isKeylessAllowed) {
           res.status(400).json({
@@ -748,7 +772,7 @@ export function createProviderRouter(): Router {
           : '';
 
         const discoverRes = await discoverProviderModels({
-          providerType: provider.providerType,
+          providerType: effectiveProviderType,
           baseUrl: provider.baseUrl,
           apiKey: rawApiKey,
           organizationId: provider.organizationId,
@@ -760,6 +784,7 @@ export function createProviderRouter(): Router {
           await db
             .update(aiProviders)
             .set({
+              providerType: effectiveProviderType,
               connectionStatus: 'connected',
               lastTestMessage: discoverRes.message,
               lastTestedAt: now,
@@ -808,7 +833,7 @@ export function createProviderRouter(): Router {
 
         const syncResult = await syncProviderModelsToDatabase({
           providerId: provider.id,
-          providerType: provider.providerType,
+          providerType: effectiveProviderType,
           discoveredModels: discoverRes.models,
           activateAll: parsed.data.activateAll,
           defaultCreditCost: parsed.data.defaultCreditCost,
@@ -992,9 +1017,14 @@ export function createProviderRouter(): Router {
         const nowMs = Date.now();
         const cred = creds.find((c) => isCredentialHealthy(c, nowMs)) ?? creds[0] ?? null;
 
+        const effectiveProviderType =
+          provider.providerType === 'huggingface' && isHuggingFaceSpaceUrl(provider.baseUrl)
+            ? 'huggingface_space'
+            : provider.providerType;
+
         const isKeylessAllowed =
-          provider.providerType === 'huggingface_space' ||
-          (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
+          effectiveProviderType === 'huggingface_space' ||
+          (effectiveProviderType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
 
         if (!cred && !isKeylessAllowed) {
           res.status(400).json({
@@ -1013,7 +1043,7 @@ export function createProviderRouter(): Router {
           : '';
 
         const testResult = await testProviderConnection({
-          providerType: provider.providerType,
+          providerType: effectiveProviderType,
           baseUrl: provider.baseUrl,
           apiKey: rawApiKey,
           organizationId: provider.organizationId,
@@ -1024,6 +1054,7 @@ export function createProviderRouter(): Router {
         await db
           .update(aiProviders)
           .set({
+            providerType: effectiveProviderType,
             connectionStatus: testResult.status,
             lastTestLatencyMs: testResult.latencyMs,
             lastTestMessage: testResult.message,

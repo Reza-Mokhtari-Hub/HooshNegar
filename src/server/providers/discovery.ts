@@ -419,6 +419,10 @@ export function parseHuggingFaceSpaceUrl(rawUrl: string): {
   }
 }
 
+export function isHuggingFaceSpaceUrl(rawUrl: string): boolean {
+  return parseHuggingFaceSpaceUrl(rawUrl) !== null;
+}
+
 export async function resolveHfSpaceRootUrl(
   baseUrl: string,
   apiKey?: string,
@@ -755,10 +759,14 @@ export async function discoverProviderModels(
   fetchImpl: typeof fetch = fetch,
 ): Promise<DiscoveryResult> {
   const apiKey = (config.apiKey ?? '').trim();
+  const effectiveProviderType =
+    config.providerType === 'huggingface' && isHuggingFaceSpaceUrl(config.baseUrl)
+      ? 'huggingface_space'
+      : config.providerType;
 
   try {
     // 1. GOOGLE GEMINI
-    if (config.providerType === 'google_gemini') {
+    if (effectiveProviderType === 'google_gemini') {
       const root = normalizeGeminiRootBaseUrl(config.baseUrl);
       validatePublicHttpsUrl(root);
       const headers = mergeHeaders(
@@ -857,7 +865,7 @@ export async function discoverProviderModels(
     }
 
     // 3. HUGGING FACE INFERENCE / ROUTER
-    if (config.providerType === 'huggingface') {
+    if (effectiveProviderType === 'huggingface') {
       const repoId = extractHuggingFaceRepoFromUrl(config.baseUrl);
       const authHeaders: Record<string, string> = { Accept: 'application/json' };
       if (apiKey) authHeaders.Authorization = `Bearer ${apiKey}`;
@@ -960,7 +968,7 @@ export async function discoverProviderModels(
     }
 
     // 4. HUGGING FACE SPACES (Gradio / ZeroGPU / Custom API)
-    if (config.providerType === 'huggingface_space') {
+    if (effectiveProviderType === 'huggingface_space') {
       const resolved = await resolveHfSpaceRootUrl(
         config.baseUrl,
         apiKey,
@@ -1509,9 +1517,13 @@ export async function syncProviderModelsToDatabase(params: {
     existing.map((m) => [normalizeModelIdentifierForProvider(params.providerType, m.modelIdentifier).toLowerCase(), m]),
   );
 
+  const isHfSpaceSync =
+    params.providerType === 'huggingface_space' ||
+    params.discoveredModels.some((item) => Boolean(item.modelParameters?.spaceHost));
+
   await db.transaction(async (tx) => {
     // For Hugging Face Spaces, automatically deactivate legacy UI-helper endpoints (e.g. ::update_mode_ui)
-    if (params.providerType === 'huggingface_space' && params.discoveredModels.length > 0) {
+    if (isHfSpaceSync && params.discoveredModels.length > 0) {
       const discoveredNormSet = new Set(
         params.discoveredModels.map((item) =>
           normalizeModelIdentifierForProvider(params.providerType, item.modelIdentifier).toLowerCase(),
@@ -1544,7 +1556,7 @@ export async function syncProviderModelsToDatabase(params: {
       }
       if (existingNormalizedSet.has(cleanId.toLowerCase())) {
         // Refresh Space parameter schema metadata on resync so existing HF Space models get latest parameter enums/defaults
-        if (params.providerType === 'huggingface_space' && item.modelParameters && Object.keys(item.modelParameters).length > 0) {
+        if (isHfSpaceSync && item.modelParameters && Object.keys(item.modelParameters).length > 0) {
           const matchedExisting = existingByNorm.get(cleanId.toLowerCase());
           if (matchedExisting) {
             await tx

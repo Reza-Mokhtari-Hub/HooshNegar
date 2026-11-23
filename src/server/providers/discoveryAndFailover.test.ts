@@ -22,12 +22,19 @@ import {
   syncProviderModelsToDatabase,
 } from './discovery.ts';
 import {
+  buildGradioInputPayload,
   generateImageWithRoute,
   generateSpeechWithRoute,
   generateTextWithRoute,
   loadModelExecutionRoute,
   transcribeAudioWithRoute,
 } from './engine.ts';
+import {
+  BLOB_CHUNK_SENTINEL,
+  BLOB_CHUNK_SIZE,
+  joinBlobChunks,
+  splitBlobBase64,
+} from '../storage/storageAdapter.ts';
 import {
   ensureTelegramUser,
   getAvailableModelsForUser,
@@ -1498,5 +1505,164 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       .where(eq(providerCredentials.id, cred1!.id));
     expect(cred1After?.status).toBe('quota_exhausted');
   });
+
+  it('auto-selects built-in Turbo LoRA + optimal 6 steps on Qwen-Image AIO Gradio schema and caps steps in edit mode', () => {
+    const qwenSchemaCtx = {
+      providerId: 'prov-qwen',
+      providerName: 'HF Qwen Space',
+      providerType: 'huggingface_space' as const,
+      baseUrl: 'https://huggingface.co/spaces/leivisondias/qwen-image-2.1-uncensored-aio-loras',
+      apiKey: 'hf_test_dummy',
+      credentialId: null,
+      organizationId: null,
+      additionalHeaders: {},
+      modelId: 'm-qwen',
+      modelName: 'qwen-image-2.1-uncensored-aio-loras',
+      modelIdentifier: 'leivisondias/qwen-image-2.1-uncensored-aio-loras::generate',
+      modelParameters: {
+        spaceHost: 'https://leivisondias-qwen-image-2-1-uncensored-aio-loras.hf.space',
+        apiName: 'generate',
+        endpointPrefix: '/gradio_api',
+        parameters: [
+          { index: 0, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false, defaultValue: null },
+          {
+            index: 1,
+            name: 'mode',
+            label: 'Mode',
+            component: 'radio',
+            hasDefault: true,
+            defaultValue: 'Text to Image',
+            enum: ['Text to Image', 'Edit Image (1 Ref)', 'Multi-Image Edit (2 Refs)'],
+          },
+          { index: 2, name: 'ref_image_1', label: 'Ref Image 1', component: 'image', hasDefault: true, defaultValue: null },
+          { index: 3, name: 'ref_image_2', label: 'Ref Image 2', component: 'image', hasDefault: true, defaultValue: null },
+          {
+            index: 4,
+            name: 'lora_adapter',
+            label: 'LoRA Adapter',
+            component: 'dropdown',
+            hasDefault: true,
+            defaultValue: 'None (Base Uncensored)',
+            enum: ['None (Base Uncensored)', 'Viggle Turbo (6-Step)', 'Realism Boost'],
+          },
+          { index: 5, name: 'lora_strength', label: 'LoRA Strength', component: 'slider', hasDefault: true, defaultValue: 1 },
+          { index: 6, name: 'custom_repo', label: 'Custom Repo', component: 'textbox', hasDefault: true, defaultValue: '' },
+          { index: 7, name: 'custom_file', label: 'Custom File', component: 'textbox', hasDefault: true, defaultValue: '' },
+          {
+            index: 8,
+            name: 'aspect_ratio',
+            label: 'Aspect Ratio',
+            component: 'dropdown',
+            hasDefault: true,
+            defaultValue: 'Square · 1:1 (1024x1024)',
+            enum: ['Square · 1:1 (1024x1024)', 'Landscape · 16:9 (1344x768)'],
+          },
+          { index: 9, name: 'steps', label: 'Steps', component: 'slider', hasDefault: true, defaultValue: 30 },
+          { index: 10, name: 'seed', label: 'Seed', component: 'number', hasDefault: true, defaultValue: 42 },
+          { index: 11, name: 'randomize_seed', label: 'Randomize Seed', component: 'checkbox', hasDefault: true, defaultValue: true },
+        ],
+      },
+      supportedCapabilities: ['image_generation' as const, 'image_editing' as const],
+      inputPricePerMillion: 0,
+      outputPricePerMillion: 0,
+      maxInputSize: 32000,
+      maxOutputSize: 4096,
+    };
+
+    const genArgs = buildGradioInputPayload(qwenSchemaCtx, 'persian sunset over mountains', undefined, undefined, undefined, {
+      aspectRatio: '16:9',
+      mode: 'generate',
+    });
+    expect(genArgs).toEqual([
+      'persian sunset over mountains',
+      'Text to Image',
+      null,
+      null,
+      'Viggle Turbo (6-Step)',
+      1,
+      '',
+      '',
+      'Landscape · 16:9 (1344x768)',
+      6,
+      42,
+      true,
+    ]);
+
+    const editArgs = buildGradioInputPayload(
+      qwenSchemaCtx,
+      'add golden light',
+      undefined,
+      undefined,
+      { path: '/tmp/source.png', meta: { _type: 'gradio.FileData' } },
+      { aspectRatio: '1:1', mode: 'edit' },
+    );
+    expect(editArgs[1]).toBe('Edit Image (1 Ref)');
+    expect(editArgs[2]).toEqual({ path: '/tmp/source.png', meta: { _type: 'gradio.FileData' } });
+    expect(editArgs[3]).toBeNull();
+    expect(editArgs[4]).toBe('None (Base Uncensored)');
+    expect(Number(editArgs[9])).toBeLessThanOrEqual(16);
+  });
+
+  it('auto-promotes Space URLs saved under providerType="huggingface" in testProviderConnection and discoverProviderModels', async () => {
+    const spaceUrl = 'https://huggingface.co/spaces/owner/fast-img-space';
+    const mockFetch: typeof fetch = async (input) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('huggingface.co/api/spaces/owner/fast-img-space')) {
+        return new Response(
+          JSON.stringify({ host: 'https://owner-fast-img-space.hf.space', sdk: 'gradio' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('owner-fast-img-space.hf.space/gradio_api/info')) {
+        return new Response(
+          JSON.stringify({
+            named_endpoints: {
+              '/generate': {
+                parameters: [{ label: 'Prompt', parameter_name: 'prompt', component: 'textbox' }],
+                returns: [{ label: 'Result', component: 'image' }],
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    };
+
+    const probe = await testProviderConnection(
+      { providerType: 'huggingface', baseUrl: spaceUrl, apiKey: '' },
+      mockFetch,
+    );
+    expect(probe.ok).toBe(true);
+    expect(probe.protocol).toMatch(/Gradio|Space/i);
+
+    const disc = await discoverProviderModels(
+      { providerType: 'huggingface', baseUrl: spaceUrl, apiKey: '' },
+      mockFetch,
+    );
+    expect(disc.ok).toBe(true);
+    expect(disc.models).toHaveLength(1);
+    expect(disc.models[0]?.modelIdentifier).toBe('owner/fast-img-space::generate');
+  });
+
+  it('chunks large 2.6 MB base64 image payloads safely below Cloudflare Durable Object SQLite 2 MB row limit', () => {
+    // 2.6 MB base64 string (equivalent to a ~1.95 MB uncompressed 1024x1024 PNG)
+    const largeBase64 = 'A'.repeat(1_000_000) + 'B'.repeat(1_000_000) + 'C'.repeat(600_000);
+    expect(largeBase64.length).toBeGreaterThan(2_097_152);
+    expect(BLOB_CHUNK_SENTINEL).toBe('__CHUNKED__');
+
+    const chunks = splitBlobBase64(largeBase64, BLOB_CHUNK_SIZE);
+    expect(chunks.length).toBe(6);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(BLOB_CHUNK_SIZE);
+      expect(chunk.length).toBeLessThan(2_097_152);
+    }
+    expect(joinBlobChunks(chunks)).toBe(largeBase64);
+
+    // Small payload stays single unchunked string
+    const smallBase64 = 'SGVsbG8=';
+    expect(splitBlobBase64(smallBase64)).toEqual([smallBase64]);
+  });
 });
+
 

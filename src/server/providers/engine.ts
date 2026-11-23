@@ -2,12 +2,13 @@ import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities, providerCredentials } from '../../db/schema.ts';
 import type { CapabilityType } from '../../shared/validation.ts';
-import { isAiMockModeEnabled } from '../config/env.ts';
+import { isAiMockModeEnabled, isCloudflareWorker } from '../config/env.ts';
 import { getCloudflareAiBinding, getCloudflareRequestContext } from '../cloudflare/requestContext.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { assertSafeOutboundUrl, SsrfProtectionError } from '../security/ssrf.ts';
 import {
   extractHuggingFaceRepoFromUrl,
+  isHuggingFaceSpaceUrl,
   normalizeBaseUrl,
   normalizeGeminiModelId,
   normalizeGeminiRootBaseUrl,
@@ -555,9 +556,14 @@ async function loadProviderContextForId(params: {
     maxOutputSize: params.maxOutputSize,
   };
 
+  const isHfSpaceProvider =
+    provider.providerType === 'huggingface_space' ||
+    (provider.providerType === 'huggingface' &&
+      (isHuggingFaceSpaceUrl(provider.baseUrl) || params.modelIdentifier.includes('::')));
+
   let candidateCreds = usableCreds;
   const supportsKeylessRuntime =
-    provider.providerType === 'huggingface_space' ||
+    isHfSpaceProvider ||
     (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
 
   // When running natively inside Cloudflare Workers with `env.AI`, prefer keyless native binding immediately
@@ -671,7 +677,7 @@ async function loadProviderContextForId(params: {
     });
   }
 
-  if (provider.providerType === 'huggingface_space') {
+  if (isHfSpaceProvider) {
     contexts.push({
       ...baseMeta,
       apiKey: '',
@@ -1041,9 +1047,29 @@ function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
   return null;
 }
 
+function isHuggingFaceSpaceContext(
+  ctx: Pick<ProviderExecutionContext, 'providerType' | 'baseUrl' | 'modelIdentifier'>,
+): boolean {
+  if (ctx.providerType === 'huggingface_space') return true;
+  if (ctx.providerType === 'huggingface') {
+    return isHuggingFaceSpaceUrl(ctx.baseUrl) || ctx.modelIdentifier.includes('::');
+  }
+  return false;
+}
+
+function isDirectGradioHostUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname.endsWith('.hf.space') || !parsed.hostname.includes('huggingface.co');
+  } catch {
+    return false;
+  }
+}
+
 async function resolveGradioContext(
   ctx: ProviderExecutionContext,
   signal?: AbortSignal,
+  options?: { forceRefresh?: boolean },
 ): Promise<ProviderExecutionContext> {
   const rawApiName = (
     typeof ctx.modelParameters?.apiName === 'string'
@@ -1052,20 +1078,38 @@ async function resolveGradioContext(
   ).replace(/^\/+/, '');
   const isStaleUiHelper = isGradioUiHelperName(rawApiName);
 
-  const hasParams =
-    Array.isArray(ctx.modelParameters?.parameters) && ctx.modelParameters.parameters.length > 0;
+  const rawParams = Array.isArray(ctx.modelParameters?.parameters)
+    ? (ctx.modelParameters.parameters as Array<{ component?: string; enum?: unknown[] }>)
+    : [];
+  const hasParams = rawParams.length > 0;
   const paramSpaceHost =
-    typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost : '';
+    typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost.trim() : '';
+  const hasValidSpaceHost = Boolean(paramSpaceHost) && isDirectGradioHostUrl(paramSpaceHost);
 
-  if (hasParams && paramSpaceHost && !isStaleUiHelper) {
+  // If the stored schema has dropdown/radio components but zero `enum` metadata (legacy sync),
+  // refresh `/gradio_api/info` so mode/aspect-ratio/turbo-LoRA matching works accurately.
+  const hasDropdownOrRadio = rawParams.some((p) =>
+    /dropdown|radio/i.test(String(p.component ?? '')),
+  );
+  const hasEnumMetadata =
+    !hasDropdownOrRadio ||
+    rawParams.some((p) => Array.isArray(p.enum) && p.enum.length > 0);
+
+  if (
+    !options?.forceRefresh &&
+    hasParams &&
+    hasValidSpaceHost &&
+    hasEnumMetadata &&
+    !isStaleUiHelper
+  ) {
     return ctx;
   }
 
-  const spaceHost = paramSpaceHost
+  const spaceHost = hasValidSpaceHost
     ? normalizeBaseUrl(paramSpaceHost)
     : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
 
-  if (hasParams && !isStaleUiHelper) {
+  if (!options?.forceRefresh && hasParams && hasEnumMetadata && !isStaleUiHelper) {
     return {
       ...ctx,
       modelParameters: { ...(ctx.modelParameters ?? {}), spaceHost },
@@ -1217,7 +1261,7 @@ function mapAspectRatioToDimensions(aspectRatio?: string): { width: number; heig
   }
 }
 
-function buildGradioInputPayload(
+export function buildGradioInputPayload(
   ctx: ProviderExecutionContext,
   promptText: string,
   systemPrompt?: string,
@@ -1271,7 +1315,60 @@ function buildGradioInputPayload(
   }
 
   const dims = mapAspectRatioToDimensions(options?.aspectRatio);
-  const isCfWorker = Boolean(getCloudflareRequestContext()?.waitUntil);
+  const isCfWorker = isCloudflareWorker() || Boolean(getCloudflareRequestContext()?.waitUntil);
+
+  // Detect built-in fast/Turbo LoRA on heavy ZeroGPU image Spaces (e.g. "Viggle Turbo (6-Step)" on Qwen AIO).
+  // Cuts generation latency from ~29s (which exceeds Cloudflare Workers' 30s waitUntil limit) down to ~7–8s!
+  const hasHeavyDefaultSteps = paramSpecs.some((spec) => {
+    const comp = (spec.component ?? '').toLowerCase();
+    const pname = (spec.name ?? '').toLowerCase();
+    const plabel = (spec.label ?? '').toLowerCase();
+    return (
+      (pname.includes('step') || plabel.includes('step')) &&
+      (comp.includes('slider') || comp.includes('number')) &&
+      typeof spec.defaultValue === 'number' &&
+      spec.defaultValue >= 20
+    );
+  });
+
+  const allowAutoTurbo =
+    options?.mode === 'generate' &&
+    hasHeavyDefaultSteps &&
+    ctx.modelParameters?.disableAutoTurbo !== true &&
+    !ctx.modelParameters?.defaultLora;
+
+  let selectedTurboLoraIndex = -1;
+  let selectedTurboLoraValue: string | null = null;
+  let selectedTurboSteps: number | null = null;
+
+  if (allowAutoTurbo) {
+    for (let i = 0; i < paramSpecs.length; i++) {
+      const spec = paramSpecs[i]!;
+      const pname = (spec.name ?? '').toLowerCase();
+      const plabel = (spec.label ?? '').toLowerCase();
+      if (
+        Array.isArray(spec.enum) &&
+        /lora|adapter|turbo|preset/i.test(`${pname} ${plabel}`)
+      ) {
+        const turboChoice = spec.enum.find(
+          (v): v is string =>
+            typeof v === 'string' &&
+            /\bturbo\b|\blightning\b|\bfast\b|\b[468]\s*-?\s*step\b/i.test(v),
+        );
+        if (turboChoice) {
+          selectedTurboLoraIndex = i;
+          selectedTurboLoraValue = turboChoice;
+          const stepMatch = turboChoice.match(/\b(\d{1,2})\s*-?\s*step/i);
+          const parsedStep = stepMatch?.[1] ? Number.parseInt(stepMatch[1], 10) : 8;
+          selectedTurboSteps = Number.isFinite(parsedStep)
+            ? Math.max(4, Math.min(10, parsedStep))
+            : 8;
+          break;
+        }
+      }
+    }
+  }
+
   let injectedMedia = false;
 
   return paramSpecs.map((spec, idx) => {
@@ -1297,6 +1394,10 @@ function buildGradioInputPayload(
     }
     if (idx === promptSlotIndex) {
       return promptText;
+    }
+
+    if (idx === selectedTurboLoraIndex && selectedTurboLoraValue !== null) {
+      return selectedTurboLoraValue;
     }
 
     // Mode selection (e.g., Text to Image vs Edit Image on AIO Spaces)
@@ -1332,14 +1433,17 @@ function buildGradioInputPayload(
       if (pname === 'height' || plabel === 'height') return dims.height;
     }
 
-    // Cap very heavy default inference steps (e.g. 30-50 steps on slow ZeroGPU Spaces) so Cloudflare Workers completes cleanly
+    // Match step count to auto-selected Turbo LoRA, or cap heavy steps so Cloudflare Workers completes cleanly
     if (
       (pname.includes('step') || plabel.includes('step')) &&
-      (comp.includes('slider') || comp.includes('number')) &&
-      typeof spec.defaultValue === 'number' &&
-      spec.defaultValue > 12
+      (comp.includes('slider') || comp.includes('number'))
     ) {
-      return isCfWorker ? Math.min(spec.defaultValue, 12) : Math.min(spec.defaultValue, 20);
+      if (selectedTurboSteps !== null) {
+        return selectedTurboSteps;
+      }
+      if (typeof spec.defaultValue === 'number' && spec.defaultValue > 12) {
+        return isCfWorker ? Math.min(spec.defaultValue, 10) : Math.min(spec.defaultValue, 16);
+      }
     }
 
     if (spec.hasDefault) {
@@ -1444,9 +1548,9 @@ async function runGradioSpaceCall(
   }
 
   // Keep a single active AbortController across BOTH the SSE connect AND the entire streaming body read.
-  // Inside Cloudflare Workers waitUntil (30s hard kill), finish cleanly before 24s so catch+refund always execute.
+  // Inside Cloudflare Workers waitUntil (30s hard kill), finish cleanly before 25s so catch+refund always execute.
   const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
-  const sseTimeoutMs = isCfBackgroundWaitUntil ? 24_000 : 55_000;
+  const sseTimeoutMs = isCfBackgroundWaitUntil ? 25_000 : 55_000;
   const sseController = new AbortController();
   let timedOut = false;
   const sseTimer = setTimeout(() => {
@@ -1884,7 +1988,7 @@ async function executeTextOnProvider(
     if (
       ctx.providerType === 'openai_compatible' ||
       ctx.providerType === 'custom' ||
-      ctx.providerType === 'huggingface'
+      (ctx.providerType === 'huggingface' && !isHuggingFaceSpaceContext(ctx))
     ) {
       let url: string;
       if (ctx.providerType === 'huggingface') {
@@ -2040,7 +2144,7 @@ async function executeTextOnProvider(
       };
     }
 
-    if (ctx.providerType === 'huggingface_space') {
+    if (isHuggingFaceSpaceContext(ctx)) {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const lastUser = [...input.messages].reverse().find((m) => m.role === 'user');
       const promptText = lastUser?.content || input.messages.map((m) => m.content).join('\n');
@@ -2599,7 +2703,7 @@ async function executeImageGenOnProvider(
       return { images, costUsd: 0.03 * Math.max(1, images.length) };
     }
 
-    if (ctx.providerType === 'huggingface') {
+    if (ctx.providerType === 'huggingface' && !isHuggingFaceSpaceContext(ctx)) {
       const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const hfRepoId = extractHuggingFaceRepoFromUrl(ctx.modelIdentifier) ?? ctx.modelIdentifier.replace(/^\/+/, '');
       const url = `${routerRoot}/hf-inference/models/${hfRepoId}`;
@@ -2811,14 +2915,28 @@ async function executeImageGenOnProvider(
       };
     }
 
-    if (ctx.providerType === 'huggingface_space') {
-      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
-      const args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
+    if (isHuggingFaceSpaceContext(ctx)) {
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      let args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
         aspectRatio: input.aspectRatio,
         mode: 'generate',
       });
-      const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
-      const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
+      let callRes: { outputData: unknown[]; spaceHost: string };
+      try {
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+      } catch (firstErr) {
+        const isSchemaErr =
+          firstErr instanceof AIProviderError &&
+          (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
+        if (!isSchemaErr) throw firstErr;
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, { forceRefresh: true });
+        args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
+          aspectRatio: input.aspectRatio,
+          mode: 'generate',
+        });
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+      }
+      const mediaUrl = extractGradioMediaUrl(callRes.outputData, callRes.spaceHost);
       if (!mediaUrl) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -3042,7 +3160,7 @@ async function executeImageEditOnProvider(
       return { images, costUsd: 0.035 };
     }
 
-    if (ctx.providerType === 'huggingface') {
+    if (ctx.providerType === 'huggingface' && !isHuggingFaceSpaceContext(ctx)) {
       const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
       const res = await fetchWithTimeout(
@@ -3086,8 +3204,8 @@ async function executeImageEditOnProvider(
       };
     }
 
-    if (ctx.providerType === 'huggingface_space') {
-      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
+    if (isHuggingFaceSpaceContext(ctx)) {
+      let resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const uploadedImg = await uploadMediaToGradioSpace(
         resolvedCtx,
         input.sourceImageBuffer,
@@ -3099,12 +3217,26 @@ async function executeImageEditOnProvider(
         input.mode === 'variation'
           ? `Create a stylized variation. ${input.prompt || ''}`.trim()
           : input.prompt;
-      const args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
+      let args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
         aspectRatio: input.aspectRatio,
         mode: input.mode,
       });
-      const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
-      const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
+      let callRes: { outputData: unknown[]; spaceHost: string };
+      try {
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+      } catch (firstErr) {
+        const isSchemaErr =
+          firstErr instanceof AIProviderError &&
+          (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
+        if (!isSchemaErr) throw firstErr;
+        resolvedCtx = await resolveGradioContext(ctx, input.signal, { forceRefresh: true });
+        args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
+          aspectRatio: input.aspectRatio,
+          mode: input.mode,
+        });
+        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+      }
+      const mediaUrl = extractGradioMediaUrl(callRes.outputData, callRes.spaceHost);
       if (!mediaUrl) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -3228,7 +3360,7 @@ async function executeTranscribeOnProvider(
       return { text: json.text?.trim() ?? '', language: input.language, costUsd: 0.005 };
     }
 
-    if (ctx.providerType === 'huggingface') {
+    if (ctx.providerType === 'huggingface' && !isHuggingFaceSpaceContext(ctx)) {
       const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
       const res = await fetchWithTimeout(
@@ -3349,7 +3481,7 @@ async function executeTranscribeOnProvider(
       };
     }
 
-    if (ctx.providerType === 'huggingface_space') {
+    if (isHuggingFaceSpaceContext(ctx)) {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const uploadedAudio = await uploadMediaToGradioSpace(
         resolvedCtx,
@@ -3475,7 +3607,7 @@ async function executeSpeechOnProvider(
       };
     }
 
-    if (ctx.providerType === 'huggingface') {
+    if (ctx.providerType === 'huggingface' && !isHuggingFaceSpaceContext(ctx)) {
       const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
       const res = await fetchWithTimeout(
@@ -3594,7 +3726,7 @@ async function executeSpeechOnProvider(
       };
     }
 
-    if (ctx.providerType === 'huggingface_space') {
+    if (isHuggingFaceSpaceContext(ctx)) {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const args = buildGradioInputPayload(resolvedCtx, input.text);
       const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);

@@ -14,6 +14,7 @@ import {
 import { ensurePlatformReady } from '../services/bootstrap.ts';
 import { encryptSecret, maskSecret } from '../security/crypto.ts';
 import {
+  applyBulkModelAction,
   classifyProbeHttpResponse,
   isLikelyBrokenGradioUiHelper,
   runBatchModelHealthCheck,
@@ -142,6 +143,85 @@ describe('Model Health Classifier & Smart Pruner (Preserves Rate-Limited Models)
     // Gradio UI helper detection
     expect(isLikelyBrokenGradioUiHelper('qwen-image::update_mode_ui')).toBe(true);
     expect(isLikelyBrokenGradioUiHelper('qwen-image::generate')).toBe(false);
+
+    // HTTP 200 with embedded proxy JSON error (OpenRouter style) -> must detect actual error status!
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'openai_compatible',
+        modelIdentifier: 'openrouter/broken-free:free',
+        httpStatus: 200,
+        expectedShape: 'openai_chat',
+        bodyText: JSON.stringify({ error: { code: 404, message: 'No endpoints found' } }),
+      }).status,
+    ).toBe('broken');
+
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'openai_compatible',
+        modelIdentifier: 'openrouter/busy-free:free',
+        httpStatus: 200,
+        expectedShape: 'openai_chat',
+        bodyText: JSON.stringify({ error: { code: 429, message: 'Rate limit exceeded' } }),
+      }).status,
+    ).toBe('rate_limited');
+
+    // HTTP 200 returning HTML error/Cloudflare challenge page -> broken (never healthy)
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'openai_compatible',
+        modelIdentifier: 'proxy/model',
+        httpStatus: 200,
+        expectedShape: 'openai_chat',
+        bodyText: '<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>',
+      }).status,
+    ).toBe('broken');
+
+    // HTTP 200 missing choices for openai_chat -> broken (never falsely healthy)
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'openai_compatible',
+        modelIdentifier: 'proxy/empty-model',
+        httpStatus: 200,
+        expectedShape: 'openai_chat',
+        bodyText: JSON.stringify({ id: 'chatcmpl-1', choices: [] }),
+      }).status,
+    ).toBe('broken');
+
+    // Cloudflare REST HTTP 200 with success: false -> broken / rate_limited
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'cloudflare_workers_ai',
+        modelIdentifier: '@cf/meta/missing-model',
+        httpStatus: 200,
+        expectedShape: 'cloudflare_run',
+        bodyText: JSON.stringify({ success: false, errors: [{ message: 'No such model' }] }),
+      }).status,
+    ).toBe('broken');
+
+    // Gemini 429 with quotaValue: "0" -> broken (permanent zero quota)
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'google_gemini',
+        modelIdentifier: 'gemini-2.5-pro-exp',
+        httpStatus: 429,
+        bodyText: JSON.stringify({
+          error: {
+            code: 429,
+            details: [{ violations: [{ quotaValue: '0' }] }],
+          },
+        }),
+      }).status,
+    ).toBe('broken');
+
+    // Unclassified 400 parameter mismatch -> transient (NEVER falsely healthy!)
+    expect(
+      classifyProbeHttpResponse({
+        providerType: 'openai_compatible',
+        modelIdentifier: 'strict/model',
+        httpStatus: 400,
+        bodyText: JSON.stringify({ error: { message: 'temperature must be 1.0' } }),
+      }).status,
+    ).toBe('transient');
   });
 
   it('prunes ONLY broken models while keeping healthy, rate-limited, and auth-error models intact', async () => {
@@ -275,6 +355,47 @@ describe('Model Health Classifier & Smart Pruner (Preserves Rate-Limited Models)
       'org/rate-limit-chat:free',
       'org/working-chat:free',
     ]);
+
+    // Step 3: Manual admin bulk overrides (disable rate-limited, re-enable it, delete auth-err)
+    const remainingRows = await db
+      .select({ id: aiModels.id, modelIdentifier: aiModels.modelIdentifier })
+      .from(aiModels)
+      .where(eq(aiModels.providerId, provider!.id));
+    const rateLimitedId = remainingRows.find((r) => r.modelIdentifier === 'org/rate-limit-chat:free')!.id;
+    const authErrId = remainingRows.find((r) => r.modelIdentifier === 'org/auth-err-model')!.id;
+
+    const disableLimited = await applyBulkModelAction({
+      modelIds: [rateLimitedId],
+      action: 'deactivate',
+    });
+    expect(disableLimited.affectedCount).toBe(1);
+    const [afterManualDisable] = await db
+      .select({ isActive: aiModels.isActive })
+      .from(aiModels)
+      .where(eq(aiModels.id, rateLimitedId));
+    expect(afterManualDisable?.isActive).toBe(false);
+
+    const reactivateLimited = await applyBulkModelAction({
+      modelIds: [rateLimitedId],
+      action: 'activate',
+    });
+    expect(reactivateLimited.affectedCount).toBe(1);
+    const [afterManualEnable] = await db
+      .select({ isActive: aiModels.isActive })
+      .from(aiModels)
+      .where(eq(aiModels.id, rateLimitedId));
+    expect(afterManualEnable?.isActive).toBe(true);
+
+    const manualDelete = await applyBulkModelAction({
+      modelIds: [authErrId],
+      action: 'delete',
+    });
+    expect(manualDelete.affectedCount).toBe(1);
+    const [afterManualDelete] = await db
+      .select({ id: aiModels.id })
+      .from(aiModels)
+      .where(eq(aiModels.id, authErrId));
+    expect(afterManualDelete).toBeUndefined();
   });
 });
 

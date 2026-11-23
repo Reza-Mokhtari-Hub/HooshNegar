@@ -1,5 +1,6 @@
 import {
   extractHuggingFaceRepoFromUrl,
+  isHuggingFaceSpaceUrl,
   normalizeBaseUrl,
   normalizeGeminiRootBaseUrl,
   normalizeOpenAiRootBaseUrl,
@@ -557,10 +558,14 @@ export async function testProviderConnection(
   config: ProviderConnectionConfig,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ProviderTestResult> {
-  const adapter = getProviderAdapter(config.providerType);
+  const effectiveProviderType =
+    config.providerType === 'huggingface' && isHuggingFaceSpaceUrl(config.baseUrl)
+      ? 'huggingface_space'
+      : config.providerType;
+  const adapter = getProviderAdapter(effectiveProviderType);
   const startedAt = Date.now();
 
-  if (config.providerType === 'cloudflare_workers_ai') {
+  if (effectiveProviderType === 'cloudflare_workers_ai') {
     if (getCloudflareAiBinding()) {
       return {
         ok: true,
@@ -585,10 +590,10 @@ export async function testProviderConnection(
     }
   }
 
-  let effectiveConfig = config;
+  let effectiveConfig = { ...config, providerType: effectiveProviderType };
   let resolvedBaseUrl: string | undefined;
 
-  if (config.providerType === 'huggingface_space') {
+  if (effectiveProviderType === 'huggingface_space') {
     try {
       const resolved = await resolveHfSpaceRootUrl(
         config.baseUrl,
@@ -597,7 +602,7 @@ export async function testProviderConnection(
         fetchImpl,
       );
       resolvedBaseUrl = resolved.resolvedRootUrl;
-      effectiveConfig = { ...config, baseUrl: resolved.resolvedRootUrl };
+      effectiveConfig = { ...effectiveConfig, baseUrl: resolved.resolvedRootUrl };
     } catch (err) {
       return {
         ok: false,
@@ -642,7 +647,7 @@ export async function testProviderConnection(
 
     // Gradio spaces on older versions expose `/info` or `/config` instead of `/gradio_api/info`
     if (
-      config.providerType === 'huggingface_space' &&
+      effectiveProviderType === 'huggingface_space' &&
       response.status === 404 &&
       resolvedBaseUrl
     ) {

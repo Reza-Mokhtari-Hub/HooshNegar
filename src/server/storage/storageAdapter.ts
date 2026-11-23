@@ -28,6 +28,29 @@ export function setCloudflareBlobStore(store: CloudflareBlobStore | undefined): 
   global._hooshnegarCfBlobStore = store;
 }
 
+/**
+ * Cloudflare Durable Object SQLite enforces a hard 2 MB row size limit (SQLITE_TOOBIG).
+ * High-resolution PNGs (e.g. 1024x1024 from Hugging Face Spaces) frequently exceed 2 MB
+ * once base64-encoded (~2.1–2.8 MB). Split large payloads into 512 KB chunks transparently.
+ */
+export const BLOB_CHUNK_SENTINEL = '__CHUNKED__';
+export const BLOB_CHUNK_SIZE = 512_000;
+
+export function splitBlobBase64(dataBase64: string, chunkSize = BLOB_CHUNK_SIZE): string[] {
+  if (dataBase64.length <= chunkSize) {
+    return [dataBase64];
+  }
+  const chunks: string[] = [];
+  for (let offset = 0; offset < dataBase64.length; offset += chunkSize) {
+    chunks.push(dataBase64.slice(offset, offset + chunkSize));
+  }
+  return chunks;
+}
+
+export function joinBlobChunks(chunks: string[]): string {
+  return chunks.join('');
+}
+
 export interface StoredObjectResult {
   id: string;
   storageProvider: 'r2' | 'local_temp';

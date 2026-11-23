@@ -17,7 +17,14 @@ import {
 import { createApiApp } from './src/server/app.ts';
 import { ensurePlatformReady } from './src/server/services/bootstrap.ts';
 import { runScheduledMaintenance } from './src/server/services/maintenanceService.ts';
-import { setCloudflareBlobStore, setCloudflareR2Bucket } from './src/server/storage/storageAdapter.ts';
+import {
+  BLOB_CHUNK_SENTINEL,
+  BLOB_CHUNK_SIZE,
+  joinBlobChunks,
+  setCloudflareBlobStore,
+  setCloudflareR2Bucket,
+  splitBlobBase64,
+} from './src/server/storage/storageAdapter.ts';
 import {
   runWithCloudflareRequestContext,
   setGlobalCloudflareAiBinding,
@@ -90,6 +97,14 @@ export class HooshNegarStore extends DurableObject<CloudflareWorkerEnv> {
           "data_base64" TEXT NOT NULL,
           "expires_at" TEXT NOT NULL,
           "created_at" TEXT NOT NULL
+        );
+      `);
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS "_hooshnegar_blob_chunks" (
+          "object_key" TEXT NOT NULL,
+          "chunk_index" INTEGER NOT NULL,
+          "data" TEXT NOT NULL,
+          PRIMARY KEY ("object_key", "chunk_index")
         );
       `);
     });
@@ -212,16 +227,38 @@ export class HooshNegarStore extends DurableObject<CloudflareWorkerEnv> {
   ): Promise<void> {
     this.ensureSchemaInitialized();
     const now = new Date().toISOString();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO "_hooshnegar_blobs" ("object_key", "mime_type", "data_base64", "expires_at", "created_at")
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT("object_key") DO UPDATE SET "mime_type" = excluded."mime_type", "data_base64" = excluded."data_base64", "expires_at" = excluded."expires_at"`,
-      objectKey,
-      mimeType,
-      dataBase64,
-      expiresAtIso,
-      now,
-    );
+    const needsChunking = dataBase64.length > BLOB_CHUNK_SIZE;
+
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        'DELETE FROM "_hooshnegar_blob_chunks" WHERE "object_key" = ?',
+        objectKey,
+      );
+
+      this.ctx.storage.sql.exec(
+        `INSERT INTO "_hooshnegar_blobs" ("object_key", "mime_type", "data_base64", "expires_at", "created_at")
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT("object_key") DO UPDATE SET "mime_type" = excluded."mime_type", "data_base64" = excluded."data_base64", "expires_at" = excluded."expires_at"`,
+        objectKey,
+        mimeType,
+        needsChunking ? BLOB_CHUNK_SENTINEL : dataBase64,
+        expiresAtIso,
+        now,
+      );
+
+      if (needsChunking) {
+        const chunks = splitBlobBase64(dataBase64, BLOB_CHUNK_SIZE);
+        for (let i = 0; i < chunks.length; i++) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO "_hooshnegar_blob_chunks" ("object_key", "chunk_index", "data")
+             VALUES (?, ?, ?)`,
+            objectKey,
+            i,
+            chunks[i]!,
+          );
+        }
+      }
+    });
   }
 
   async getBlob(objectKey: string): Promise<{ mimeType: string; dataBase64: string } | null> {
@@ -233,12 +270,30 @@ export class HooshNegarStore extends DurableObject<CloudflareWorkerEnv> {
       )
       .toArray();
     if (!rows[0]) return null;
+
+    if (rows[0].data_base64 === BLOB_CHUNK_SENTINEL) {
+      const chunkRows = this.ctx.storage.sql
+        .exec<{ data: string }>(
+          'SELECT "data" FROM "_hooshnegar_blob_chunks" WHERE "object_key" = ? ORDER BY "chunk_index" ASC',
+          objectKey,
+        )
+        .toArray();
+      if (chunkRows.length === 0) return null;
+      return {
+        mimeType: rows[0].mime_type,
+        dataBase64: joinBlobChunks(chunkRows.map((c) => c.data)),
+      };
+    }
+
     return { mimeType: rows[0].mime_type, dataBase64: rows[0].data_base64 };
   }
 
   async deleteBlob(objectKey: string): Promise<void> {
     this.ensureSchemaInitialized();
-    this.ctx.storage.sql.exec('DELETE FROM "_hooshnegar_blobs" WHERE "object_key" = ?', objectKey);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec('DELETE FROM "_hooshnegar_blob_chunks" WHERE "object_key" = ?', objectKey);
+      this.ctx.storage.sql.exec('DELETE FROM "_hooshnegar_blobs" WHERE "object_key" = ?', objectKey);
+    });
   }
 }
 

@@ -457,17 +457,29 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
 
       for (let i = 0; i < outputRes.result.images.length; i++) {
         const img = outputRes.result.images[i]!;
-        const stored = await storage.putObject({
-          buffer: img.buffer,
-          mimeType: img.mimeType,
-          extension: img.extension,
-          prefix: 'generated-images',
-          userId: job.userId,
-          requestId: reqRow.id,
-          jobId: job.id,
-        });
-        if (!firstKey) firstKey = stored.objectKey;
-        storedKeys.push(stored.objectKey);
+        const canDeliverToTelegram = Boolean(api && job.telegramChatId);
+
+        try {
+          const stored = await storage.putObject({
+            buffer: img.buffer,
+            mimeType: img.mimeType,
+            extension: img.extension,
+            prefix: 'generated-images',
+            userId: job.userId,
+            requestId: reqRow.id,
+            jobId: job.id,
+          });
+          if (!firstKey) firstKey = stored.objectKey;
+          storedKeys.push(stored.objectKey);
+        } catch (storageErr) {
+          if (!canDeliverToTelegram) {
+            throw storageErr;
+          }
+          console.error(
+            '[jobRunner] non-fatal image storage error before Telegram delivery:',
+            storageErr instanceof Error ? storageErr.message : 'unknown',
+          );
+        }
 
         if (api && job.telegramChatId) {
           const caption = `🎨 تصویر تولیدشده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`;
