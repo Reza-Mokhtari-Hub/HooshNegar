@@ -245,13 +245,22 @@ export async function reserveCreditsAndCreateRequest(
       );
     }
 
+    const acceptableCaps: CapabilityType[] =
+      input.capability === 'chat'
+        ? ['chat', 'text_generation']
+        : input.capability === 'text_generation'
+          ? ['text_generation', 'chat']
+          : input.capability === 'document_analysis'
+            ? ['document_analysis', 'vision', 'chat', 'text_generation']
+            : [input.capability];
+
     const [capRow] = await tx
       .select({ id: modelCapabilities.id })
       .from(modelCapabilities)
       .where(
         and(
           eq(modelCapabilities.modelId, input.modelId),
-          eq(modelCapabilities.capability, input.capability),
+          inArray(modelCapabilities.capability, acceptableCaps),
         ),
       )
       .limit(1);

@@ -32,6 +32,9 @@ export function hasCloudflareSqlExecutor(): boolean {
   return Boolean(getCloudflareRequestContext()?.sqlExecutor ?? global._hooshnegarCfSqlExecutor);
 }
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+const cfTxAls = new AsyncLocalStorage<string>();
+
 function createCloudflareDurableObjectDb(): AppDatabase {
   const getLiveExecutor = (): CloudflareSqlExecutor => {
     const exec = getCloudflareRequestContext()?.sqlExecutor ?? global._hooshnegarCfSqlExecutor;
@@ -43,38 +46,46 @@ function createCloudflareDurableObjectDb(): AppDatabase {
     return exec;
   };
 
-  const createScopedDb = (txToken?: string) =>
-    drizzlePgProxy(
+  const attachTxMethod = (targetDb: ReturnType<typeof drizzlePgProxy>) => {
+    (
+      targetDb as unknown as {
+        transaction: <T>(
+          callback: (tx: unknown) => Promise<T>,
+          config?: Record<string, unknown>,
+        ) => Promise<T>;
+      }
+    ).transaction = async <T>(
+      callback: (tx: unknown) => Promise<T>,
+      _config?: Record<string, unknown>,
+    ): Promise<T> => {
+      const existingToken = cfTxAls.getStore();
+      if (existingToken) {
+        return callback(createScopedDb(existingToken));
+      }
+      const executor = getLiveExecutor();
+      const txToken = await executor.beginTx();
+      const txDb = createScopedDb(txToken);
+      try {
+        return await cfTxAls.run(txToken, () => callback(txDb));
+      } finally {
+        await executor.endTx(txToken).catch(() => {});
+      }
+    };
+    return targetDb;
+  };
+
+  const createScopedDb = (explicitTxToken?: string) => {
+    const scoped = drizzlePgProxy(
       async (queryString, params, method) => {
-        return getLiveExecutor().execSql(queryString, params, method, txToken);
+        const effectiveToken = explicitTxToken ?? cfTxAls.getStore();
+        return getLiveExecutor().execSql(queryString, params, method, effectiveToken);
       },
       { schema },
     );
-
-  const rootDb = createScopedDb();
-
-  (
-    rootDb as unknown as {
-      transaction: <T>(
-        callback: (tx: unknown) => Promise<T>,
-        config?: Record<string, unknown>,
-      ) => Promise<T>;
-    }
-  ).transaction = async <T>(
-    callback: (tx: unknown) => Promise<T>,
-    _config?: Record<string, unknown>,
-  ): Promise<T> => {
-    const executor = getLiveExecutor();
-    const txToken = await executor.beginTx();
-    const txDb = createScopedDb(txToken);
-    try {
-      return await callback(txDb);
-    } finally {
-      await executor.endTx(txToken).catch(() => {});
-    }
+    return attachTxMethod(scoped);
   };
 
-  return rootDb as unknown as AppDatabase;
+  return createScopedDb() as unknown as AppDatabase;
 }
 
 function createDatabaseInstance(): { db: AppDatabase; mode: DatabaseMode } {

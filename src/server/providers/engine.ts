@@ -1,4 +1,3 @@
-import { GoogleGenAI } from '@google/genai';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities, providerCredentials } from '../../db/schema.ts';
@@ -7,12 +6,12 @@ import { isAiMockModeEnabled } from '../config/env.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { assertSafeOutboundUrl, SsrfProtectionError } from '../security/ssrf.ts';
 import {
-  extractHuggingFaceRepoFromUrl,
   normalizeBaseUrl,
   normalizeGeminiModelId,
   normalizeGeminiRootBaseUrl,
   normalizeOpenAiRootBaseUrl,
   resolveHfSpaceRootUrl,
+  resolveHuggingFaceRouterRoot,
 } from './discovery.ts';
 import {
   AIProviderError,
@@ -258,15 +257,110 @@ async function fetchWithTimeout(
   }
 }
 
-function createGeminiClient(ctx: ProviderExecutionContext): GoogleGenAI {
-  const normalizedBase = ctx.baseUrl ? normalizeGeminiRootBaseUrl(ctx.baseUrl) : undefined;
-  return new GoogleGenAI({
-    apiKey: ctx.apiKey,
-    httpOptions: {
-      baseUrl: normalizedBase,
-      headers: mergeHeaders({ 'User-Agent': 'aistudio-build' }, ctx.additionalHeaders),
+function buildGeminiHeaders(ctx: ProviderExecutionContext): Record<string, string> {
+  return mergeHeaders(
+    {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': ctx.apiKey,
     },
-  });
+    ctx.additionalHeaders,
+  );
+}
+
+interface GeminiPart {
+  text?: string;
+  thought?: boolean;
+  inlineData?: { data?: string; mimeType?: string };
+}
+
+interface GeminiCandidate {
+  content?: { parts?: GeminiPart[] };
+  finishReason?: string;
+}
+
+interface GeminiGenerateContentResponse {
+  candidates?: GeminiCandidate[];
+  promptFeedback?: { blockReason?: string; blockReasonMessage?: string };
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+}
+
+function assertGeminiNotBlocked(resp: GeminiGenerateContentResponse, isImage = false): void {
+  const blockReason = resp.promptFeedback?.blockReason;
+  const finishReason = resp.candidates?.[0]?.finishReason;
+  if (
+    blockReason ||
+    finishReason === 'SAFETY' ||
+    finishReason === 'IMAGE_SAFETY' ||
+    finishReason === 'PROHIBITED_CONTENT' ||
+    finishReason === 'BLOCKLIST' ||
+    finishReason === 'SPII'
+  ) {
+    throw new AIProviderError({
+      code: 'INVALID_PROMPT',
+      message: `Gemini blocked content (${blockReason || finishReason})`,
+      userMessageFa: isImage
+        ? 'درخواست ساخت/ویرایش تصویر به دلیل قوانین ایمنی مدل مسدود شد. لطفاً پرامپت دیگری بنویسید.'
+        : 'درخواست شما به دلیل قوانین ایمنی مدل مسدود شد. لطفاً متن خود را اصلاح کنید.',
+      retryable: false,
+      credentialFailureKind: 'prompt_error',
+    });
+  }
+}
+
+function extractGeminiCandidateText(candidates?: GeminiCandidate[]): string {
+  const parts = candidates?.[0]?.content?.parts ?? [];
+  const regularText = parts
+    .filter((p) => !p.thought && typeof p.text === 'string')
+    .map((p) => p.text!)
+    .join('');
+  if (regularText) return regularText;
+  return parts
+    .filter((p) => typeof p.text === 'string')
+    .map((p) => p.text!)
+    .join('');
+}
+
+function extractGeminiCandidateImages(
+  candidates?: GeminiCandidate[],
+): Array<{ buffer: Buffer; mimeType: string; extension: string }> {
+  const parts = candidates?.[0]?.content?.parts ?? [];
+  const nonThoughtImages = parts.filter((p) => !p.thought && p.inlineData?.data);
+  const chosenParts = nonThoughtImages.length > 0 ? nonThoughtImages : parts.filter((p) => p.inlineData?.data);
+
+  const images: Array<{ buffer: Buffer; mimeType: string; extension: string }> = [];
+  for (const part of chosenParts) {
+    const data = part.inlineData?.data;
+    if (!data) continue;
+    const mime = part.inlineData?.mimeType ?? 'image/png';
+    images.push({
+      buffer: Buffer.from(data, 'base64'),
+      mimeType: mime,
+      extension: mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : mime.includes('webp') ? 'webp' : 'png',
+    });
+  }
+  return images;
+}
+
+function pcm16ToWav(pcmBuffer: Buffer, sampleRate = 24000, channels = 1): Buffer {
+  const bitsPerSample = 16;
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
+  const dataSize = pcmBuffer.byteLength;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcmBuffer]);
 }
 
 // =============================================================================
@@ -670,7 +764,8 @@ function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
   const resolvePath = (p: string): string => {
     if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
     const cleanHost = normalizeBaseUrl(spaceHost);
-    if (p.startsWith('/')) return `${cleanHost}/gradio_api/file=${p}`;
+    if (p.startsWith('/gradio_api/')) return `${cleanHost}${p}`;
+    if (p.startsWith('/file=')) return `${cleanHost}/gradio_api${p}`;
     return `${cleanHost}/gradio_api/file=${p}`;
   };
   if (typeof val === 'string' && (val.startsWith('http') || val.startsWith('data:') || val.includes('/'))) {
@@ -690,6 +785,103 @@ function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
     if (obj.value) return extractGradioMediaUrl(obj.value, spaceHost);
   }
   return null;
+}
+
+async function resolveGradioContext(
+  ctx: ProviderExecutionContext,
+  signal?: AbortSignal,
+): Promise<ProviderExecutionContext> {
+  const hasParams =
+    Array.isArray(ctx.modelParameters?.parameters) && ctx.modelParameters.parameters.length > 0;
+  const paramSpaceHost =
+    typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost : '';
+
+  if (hasParams && paramSpaceHost) {
+    return ctx;
+  }
+
+  const spaceHost = paramSpaceHost
+    ? normalizeBaseUrl(paramSpaceHost)
+    : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
+
+  if (hasParams) {
+    return {
+      ...ctx,
+      modelParameters: { ...(ctx.modelParameters ?? {}), spaceHost },
+    };
+  }
+
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (ctx.apiKey.trim()) headers.Authorization = `Bearer ${ctx.apiKey.trim()}`;
+  const merged = mergeHeaders(headers, ctx.additionalHeaders);
+
+  const apiName = (
+    typeof ctx.modelParameters?.apiName === 'string'
+      ? ctx.modelParameters.apiName
+      : ctx.modelIdentifier.split('::')[1] || 'predict'
+  ).replace(/^\/+/, '');
+
+  for (const candidate of [
+    { path: '/gradio_api/info', prefix: '/gradio_api' },
+    { path: '/info', prefix: '' },
+  ]) {
+    try {
+      const res = await fetchWithTimeout(
+        `${spaceHost}${candidate.path}`,
+        { method: 'GET', headers: merged },
+        8000,
+        signal,
+      );
+      if (!res.ok) continue;
+      const info = (await res.json()) as {
+        named_endpoints?: Record<
+          string,
+          {
+            parameters?: Array<{
+              label?: string;
+              parameter_name?: string;
+              type?: { type?: string };
+              component?: string;
+              parameter_has_default?: boolean;
+              parameter_default?: unknown;
+            }>;
+          }
+        >;
+      };
+      const endpoints = info.named_endpoints ?? {};
+      const entry =
+        endpoints[`/${apiName}`] ?? endpoints[apiName] ?? Object.values(endpoints)[0];
+      const matchedKey =
+        endpoints[`/${apiName}`] || endpoints[apiName]
+          ? apiName
+          : Object.keys(endpoints)[0]?.replace(/^\/+/, '') || apiName;
+      if (entry?.parameters && entry.parameters.length > 0) {
+        return {
+          ...ctx,
+          modelParameters: {
+            ...(ctx.modelParameters ?? {}),
+            spaceHost,
+            apiName: matchedKey,
+            endpointPrefix: candidate.prefix,
+            parameters: entry.parameters.map((p, idx) => ({
+              index: idx,
+              name: p.parameter_name || p.label || `arg_${idx}`,
+              component: (p.component || p.type?.type || 'textbox').toLowerCase(),
+              hasDefault: Boolean(p.parameter_has_default),
+              defaultValue: p.parameter_default ?? null,
+            })),
+          },
+        };
+      }
+    } catch {
+      // try next info endpoint
+    }
+  }
+
+  return {
+    ...ctx,
+    modelParameters: { ...(ctx.modelParameters ?? {}), spaceHost },
+  };
 }
 
 function buildGradioInputPayload(
@@ -887,8 +1079,10 @@ async function executeTextOnProvider(
 
   try {
     if (ctx.providerType === 'google_gemini') {
-      const ai = createGeminiClient(ctx);
+      const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
       const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
+      const isGemma = modelId.toLowerCase().includes('gemma');
+
       const contents = input.messages
         .filter((m) => m.role !== 'system')
         .map((m) => {
@@ -903,60 +1097,142 @@ async function executeTextOnProvider(
           };
         });
 
-      const config: Record<string, unknown> = {};
-      if (input.systemPrompt) config.systemInstruction = input.systemPrompt;
-
-      if (input.onChunk) {
-        const stream = await ai.models.generateContentStream({
-          model: modelId,
-          contents: contents as never,
-          config: config as never,
-        });
-        let fullText = '';
-        let inTok = 0;
-        let outTok = 0;
-        for await (const chunk of stream) {
-          if (input.signal?.aborted) {
-            throw new AIProviderError({
-              code: 'CANCELED',
-              message: 'Generation stopped by user',
-              userMessageFa: 'تولید پاسخ متوقف شد.',
-            });
+      // Gemma models on Gemini API do not support systemInstruction; prepend to first user turn instead
+      if (isGemma && input.systemPrompt) {
+        const firstUser = contents.find((c) => c.role === 'user');
+        const sysPrefix = `[System Instructions]\n${input.systemPrompt}\n\n`;
+        if (firstUser) {
+          const textPart = firstUser.parts.find((p) => typeof p.text === 'string');
+          if (textPart) {
+            textPart.text = `${sysPrefix}${textPart.text}`;
+          } else {
+            firstUser.parts.unshift({ text: sysPrefix });
           }
-          if (chunk.text) {
-            fullText += chunk.text;
-            await input.onChunk(fullText);
-          }
-          if (chunk.usageMetadata) {
-            inTok = chunk.usageMetadata.promptTokenCount ?? inTok;
-            outTok = chunk.usageMetadata.candidatesTokenCount ?? outTok;
-          }
+        } else {
+          contents.unshift({ role: 'user', parts: [{ text: input.systemPrompt }] });
         }
-        inTok = inTok || estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
-        outTok = outTok || estimateTokensRough(fullText);
-        return {
-          text: fullText.trim() || 'پاسخی از مدل دریافت نشد.',
-          inputTokens: inTok,
-          outputTokens: outTok,
-          costUsd: estimateTokenCostUsd(inTok, outTok, ctx.inputPricePerMillion, ctx.outputPricePerMillion),
-        };
       }
 
-      const response = await ai.models.generateContent({
-        model: modelId,
-        contents: contents as never,
-        config: config as never,
-      });
-      const text = response.text?.trim() ?? '';
+      const body: Record<string, unknown> = { contents };
+      if (!isGemma && input.systemPrompt) {
+        body.systemInstruction = { parts: [{ text: input.systemPrompt }] };
+      }
+      const generationConfig: Record<string, unknown> = {};
+      if (input.maxTokens ?? ctx.maxOutputSize) {
+        generationConfig.maxOutputTokens = input.maxTokens ?? ctx.maxOutputSize;
+      }
+      const temp = input.temperature ?? (ctx.modelParameters?.temperature as number | undefined);
+      if (typeof temp === 'number') {
+        generationConfig.temperature = temp;
+      }
+      if (Object.keys(generationConfig).length > 0) {
+        body.generationConfig = generationConfig;
+      }
+
+      const encodedModel = encodeURIComponent(modelId);
+      const headers = buildGeminiHeaders(ctx);
+
+      if (input.onChunk) {
+        const streamUrl = `${root}/v1beta/models/${encodedModel}:streamGenerateContent?alt=sse`;
+        const res = await fetchWithTimeout(
+          streamUrl,
+          { method: 'POST', headers, body: JSON.stringify(body) },
+          60000,
+          input.signal,
+        );
+        if (!res.ok) {
+          throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+        }
+
+        if (res.body) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let fullText = '';
+          let inTok = 0;
+          let outTok = 0;
+          let lastFinishReason: string | undefined;
+
+          while (true) {
+            if (input.signal?.aborted) {
+              throw new AIProviderError({
+                code: 'CANCELED',
+                message: 'Generation stopped by user',
+                userMessageFa: 'تولید پاسخ متوقف شد.',
+              });
+            }
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+              if (!line.startsWith('data:')) continue;
+              const raw = line.slice(5).trim();
+              if (!raw || raw === '[DONE]') continue;
+              try {
+                const evt = JSON.parse(raw) as GeminiGenerateContentResponse;
+                if (evt.promptFeedback?.blockReason) {
+                  assertGeminiNotBlocked(evt, false);
+                }
+                const delta = extractGeminiCandidateText(evt.candidates);
+                if (delta) {
+                  fullText += delta;
+                  await input.onChunk(fullText);
+                }
+                if (evt.candidates?.[0]?.finishReason) {
+                  lastFinishReason = evt.candidates[0].finishReason;
+                }
+                if (evt.usageMetadata) {
+                  inTok = evt.usageMetadata.promptTokenCount ?? inTok;
+                  outTok = evt.usageMetadata.candidatesTokenCount ?? outTok;
+                }
+              } catch (parseErr) {
+                if (parseErr instanceof AIProviderError) throw parseErr;
+              }
+            }
+          }
+
+          if (!fullText && (lastFinishReason === 'SAFETY' || lastFinishReason === 'PROHIBITED_CONTENT')) {
+            assertGeminiNotBlocked({ candidates: [{ finishReason: lastFinishReason }] }, false);
+          }
+
+          inTok = inTok || estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
+          outTok = outTok || estimateTokensRough(fullText);
+          return {
+            text: fullText.trim() || 'پاسخی از مدل دریافت نشد.',
+            inputTokens: inTok,
+            outputTokens: outTok,
+            costUsd: estimateTokenCostUsd(inTok, outTok, ctx.inputPricePerMillion, ctx.outputPricePerMillion),
+            finishReason: lastFinishReason,
+          };
+        }
+      }
+
+      const url = `${root}/v1beta/models/${encodedModel}:generateContent`;
+      const res = await fetchWithTimeout(
+        url,
+        { method: 'POST', headers, body: JSON.stringify(body) },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) {
+        throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      }
+
+      const json = (await res.json()) as GeminiGenerateContentResponse;
+      assertGeminiNotBlocked(json, false);
+      const text = extractGeminiCandidateText(json.candidates).trim();
       const inTok =
-        response.usageMetadata?.promptTokenCount ??
+        json.usageMetadata?.promptTokenCount ??
         estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
-      const outTok = response.usageMetadata?.candidatesTokenCount ?? estimateTokensRough(text);
+      const outTok = json.usageMetadata?.candidatesTokenCount ?? estimateTokensRough(text);
       return {
         text: text || 'پاسخی از مدل دریافت نشد.',
         inputTokens: inTok,
         outputTokens: outTok,
         costUsd: estimateTokenCostUsd(inTok, outTok, ctx.inputPricePerMillion, ctx.outputPricePerMillion),
+        finishReason: json.candidates?.[0]?.finishReason,
       };
     }
 
@@ -1081,13 +1357,8 @@ async function executeTextOnProvider(
     ) {
       let url: string;
       if (ctx.providerType === 'huggingface') {
-        const repoFromUrl = extractHuggingFaceRepoFromUrl(ctx.baseUrl);
-        if (repoFromUrl && ctx.baseUrl.includes('/hf-inference/models/')) {
-          url = `${normalizeBaseUrl(ctx.baseUrl)}/v1/chat/completions`;
-        } else {
-          const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '');
-          url = `${routerRoot}/v1/chat/completions`;
-        }
+        const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
+        url = `${routerRoot}/v1/chat/completions`;
       } else {
         const base = normalizeOpenAiRootBaseUrl(ctx.baseUrl);
         url = `${base}/chat/completions`;
@@ -1121,24 +1392,59 @@ async function executeTextOnProvider(
       if (ctx.organizationId) headers['OpenAI-Organization'] = ctx.organizationId;
 
       const useStream = Boolean(input.onChunk);
-      const res = await fetchWithTimeout(
+      const maxTokensVal = input.maxTokens ?? ctx.maxOutputSize ?? 4096;
+      const tempVal = input.temperature ?? (ctx.modelParameters?.temperature as number | undefined);
+      const isOpenAiReasoningModel = /^(o1|o3|o4|gpt-5)/i.test(ctx.modelIdentifier);
+
+      const buildChatBody = (useMaxCompletionTokens: boolean, includeTemperature: boolean) => {
+        const payload: Record<string, unknown> = {
+          model: ctx.modelIdentifier,
+          messages: formattedMessages,
+          stream: useStream,
+        };
+        if (useMaxCompletionTokens) {
+          payload.max_completion_tokens = maxTokensVal;
+        } else {
+          payload.max_tokens = maxTokensVal;
+        }
+        if (includeTemperature && typeof tempVal === 'number') {
+          payload.temperature = tempVal;
+        }
+        return payload;
+      };
+
+      const mergedHeaders = mergeHeaders(headers, ctx.additionalHeaders);
+      let res = await fetchWithTimeout(
         url,
         {
           method: 'POST',
-          headers: mergeHeaders(headers, ctx.additionalHeaders),
-          body: JSON.stringify({
-            model: ctx.modelIdentifier,
-            messages: formattedMessages,
-            max_tokens: input.maxTokens ?? ctx.maxOutputSize ?? 4096,
-            temperature: input.temperature ?? (ctx.modelParameters?.temperature as number | undefined),
-            stream: useStream,
-          }),
+          headers: mergedHeaders,
+          body: JSON.stringify(buildChatBody(isOpenAiReasoningModel, !isOpenAiReasoningModel)),
         },
         60000,
         input.signal,
       );
 
-      if (!res.ok) {
+      if (!res.ok && res.status === 400) {
+        const firstErrBody = await res.text();
+        if (/max_completion_tokens|max_tokens|temperature/i.test(firstErrBody)) {
+          res = await fetchWithTimeout(
+            url,
+            {
+              method: 'POST',
+              headers: mergedHeaders,
+              body: JSON.stringify(buildChatBody(!isOpenAiReasoningModel || firstErrBody.includes('max_completion_tokens'), false)),
+            },
+            60000,
+            input.signal,
+          );
+          if (!res.ok) {
+            throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+          }
+        } else {
+          throw classifyHttpError(res.status, firstErrBody, ctx.apiKey);
+        }
+      } else if (!res.ok) {
         throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
       }
 
@@ -1204,6 +1510,7 @@ async function executeTextOnProvider(
     }
 
     if (ctx.providerType === 'huggingface_space') {
+      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const lastUser = [...input.messages].reverse().find((m) => m.role === 'user');
       const promptText = lastUser?.content || input.messages.map((m) => m.content).join('\n');
       const mediaDataUri =
@@ -1212,13 +1519,13 @@ async function executeTextOnProvider(
           : undefined;
 
       const args = buildGradioInputPayload(
-        ctx,
+        resolvedCtx,
         promptText,
         input.systemPrompt,
         input.messages.slice(0, -1),
         mediaDataUri,
       );
-      const { outputData } = await runGradioSpaceCall(ctx, args, input.signal);
+      const { outputData } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       const text = extractGradioOutputText(outputData).trim();
       const inTok = estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
       const outTok = estimateTokensRough(text);
@@ -1364,30 +1671,129 @@ async function executeImageGenOnProvider(
 
   try {
     if (ctx.providerType === 'google_gemini') {
-      const ai = createGeminiClient(ctx);
+      const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
       const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
-      const imageConfig: Record<string, unknown> = {};
-      if (input.aspectRatio) imageConfig.aspectRatio = input.aspectRatio;
-      if (input.resolution && ['1K', '2K', '4K'].includes(input.resolution.toUpperCase())) {
-        imageConfig.imageSize = input.resolution.toUpperCase();
-      }
-      const response = await ai.models.generateContent({
-        model: modelId,
-        contents: { parts: [{ text: input.prompt }] } as never,
-        config: Object.keys(imageConfig).length > 0 ? ({ imageConfig } as never) : undefined,
-      });
+      const lowerModel = modelId.toLowerCase();
+      const encodedModel = encodeURIComponent(modelId);
+      const headers = buildGeminiHeaders(ctx);
 
-      const images: ImageOutput['images'] = [];
-      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-        if (part.inlineData?.data) {
-          const mime = part.inlineData.mimeType ?? 'image/png';
-          images.push({
-            buffer: Buffer.from(part.inlineData.data, 'base64'),
-            mimeType: mime,
-            extension: mime.includes('jpeg') ? 'jpg' : mime.includes('webp') ? 'webp' : 'png',
+      // Imagen models use :predict instead of :generateContent
+      if (/^imagen-/i.test(lowerModel) || lowerModel.includes('/imagen-')) {
+        const predictUrl = `${root}/v1beta/models/${encodedModel}:predict`;
+        const parameters: Record<string, unknown> = {
+          sampleCount: Math.min(Math.max(input.count ?? 1, 1), 4),
+        };
+        if (input.aspectRatio && ['1:1', '3:4', '4:3', '9:16', '16:9'].includes(input.aspectRatio)) {
+          parameters.aspectRatio = input.aspectRatio;
+        }
+        const res = await fetchWithTimeout(
+          predictUrl,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              instances: [{ prompt: input.prompt }],
+              parameters,
+            }),
+          },
+          90000,
+          input.signal,
+        );
+        if (!res.ok) {
+          throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+        }
+        const json = (await res.json()) as {
+          predictions?: Array<{
+            bytesBase64Encoded?: string;
+            mimeType?: string;
+            raiFilteredReason?: string;
+          }>;
+        };
+        const images: ImageOutput['images'] = [];
+        for (const pred of json.predictions ?? []) {
+          if (pred.bytesBase64Encoded) {
+            const mime = pred.mimeType ?? 'image/png';
+            images.push({
+              buffer: Buffer.from(pred.bytesBase64Encoded, 'base64'),
+              mimeType: mime,
+              extension: mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : mime.includes('webp') ? 'webp' : 'png',
+            });
+          }
+        }
+        if (images.length === 0) {
+          const filterReason = json.predictions?.find((p) => p.raiFilteredReason)?.raiFilteredReason;
+          throw new AIProviderError({
+            code: filterReason ? 'INVALID_PROMPT' : 'PROVIDER_ERROR',
+            message: filterReason
+              ? `Imagen blocked prompt: ${filterReason}`
+              : 'Imagen returned no generated image bytes.',
+            userMessageFa: filterReason
+              ? 'درخواست تولید تصویر توسط فیلتر ایمنی Imagen مسدود شد. لطفاً پرامپت را تغییر دهید.'
+              : 'مدل Imagen خروجی تصویر برنگرداند. لطفاً پرامپت را تغییر دهید.',
           });
         }
+        return { images, costUsd: 0.04 * images.length };
       }
+
+      // Gemini Native Image Generation (gemini-2.5-flash-image, gemini-2.0-flash-preview-image-generation, gemini-3-pro-image-preview, etc.)
+      const url = `${root}/v1beta/models/${encodedModel}:generateContent`;
+      const supportsImageSize = lowerModel.includes('gemini-3') || lowerModel.includes('pro-image');
+      const imageConfig: Record<string, unknown> = {};
+      if (input.aspectRatio) imageConfig.aspectRatio = input.aspectRatio;
+      if (
+        supportsImageSize &&
+        input.resolution &&
+        ['1K', '2K', '4K'].includes(input.resolution.toUpperCase())
+      ) {
+        imageConfig.imageSize = input.resolution.toUpperCase();
+      }
+
+      const buildGenImageBody = (withImageConfig: boolean) => ({
+        contents: [{ role: 'user', parts: [{ text: input.prompt }] }],
+        generationConfig: {
+          responseModalities: ['IMAGE', 'TEXT'],
+          ...(withImageConfig && Object.keys(imageConfig).length > 0 ? { imageConfig } : {}),
+        },
+      });
+
+      let res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(buildGenImageBody(true)),
+        },
+        90000,
+        input.signal,
+      );
+
+      // Retry without imageConfig if the specific Gemini image variant doesn't accept aspectRatio/imageSize
+      if (!res.ok && res.status === 400 && Object.keys(imageConfig).length > 0) {
+        const errBody = await res.text();
+        if (/imageConfig|image_size|imageSize|aspectRatio|aspect_ratio|Unknown name/i.test(errBody)) {
+          res = await fetchWithTimeout(
+            url,
+            {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(buildGenImageBody(false)),
+            },
+            90000,
+            input.signal,
+          );
+          if (!res.ok) {
+            throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+          }
+        } else {
+          throw classifyHttpError(res.status, errBody, ctx.apiKey);
+        }
+      } else if (!res.ok) {
+        throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      }
+
+      const json = (await res.json()) as GeminiGenerateContentResponse;
+      assertGeminiNotBlocked(json, true);
+      const images = extractGeminiCandidateImages(json.candidates);
       if (images.length === 0) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -1560,7 +1966,7 @@ async function executeImageGenOnProvider(
     }
 
     if (ctx.providerType === 'huggingface') {
-      const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '').replace(/\/hf-inference\/models\/.+$/i, '');
+      const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
       const res = await fetchWithTimeout(
         url,
@@ -1584,6 +1990,25 @@ async function executeImageGenOnProvider(
       );
       if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
       const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
+      if (contentType.includes('application/json')) {
+        const jsonBody = (await res.json()) as { error?: string; image?: string; url?: string };
+        if (jsonBody.error) {
+          throw classifyHttpError(502, jsonBody.error, ctx.apiKey);
+        }
+        if (jsonBody.image) {
+          return {
+            images: [{ buffer: Buffer.from(jsonBody.image, 'base64'), mimeType: 'image/png', extension: 'png' }],
+            costUsd: 0.02,
+          };
+        }
+        if (jsonBody.url) {
+          const dl = await downloadBinarySafe(jsonBody.url, ctx.apiKey, true);
+          return {
+            images: [{ buffer: dl.buffer, mimeType: dl.mimeType, extension: dl.mimeType.includes('jpeg') ? 'jpg' : 'png' }],
+            costUsd: 0.02,
+          };
+        }
+      }
       const buffer = Buffer.from(await res.arrayBuffer());
       return {
         images: [
@@ -1598,8 +2023,9 @@ async function executeImageGenOnProvider(
     }
 
     if (ctx.providerType === 'huggingface_space') {
-      const args = buildGradioInputPayload(ctx, input.prompt);
-      const { outputData, spaceHost } = await runGradioSpaceCall(ctx, args, input.signal);
+      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const args = buildGradioInputPayload(resolvedCtx, input.prompt);
+      const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
       if (!mediaUrl) {
         throw new AIProviderError({
@@ -1608,7 +2034,7 @@ async function executeImageGenOnProvider(
           userMessageFa: 'تصویری از خروجی Hugging Face Space دریافت نشد.',
         });
       }
-      const dl = await downloadBinarySafe(mediaUrl, ctx.apiKey, true);
+      const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
       return {
         images: [
           {
@@ -1649,39 +2075,48 @@ async function executeImageEditOnProvider(
 
   try {
     if (ctx.providerType === 'google_gemini') {
-      const ai = createGeminiClient(ctx);
+      const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
       const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
-      const response = await ai.models.generateContent({
-        model: modelId,
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                data: input.sourceImageBuffer.toString('base64'),
-                mimeType: input.sourceMimeType,
-              },
-            },
-            {
-              text:
-                input.mode === 'variation'
-                  ? `Create a high-quality visual variation of this image. ${input.prompt || ''}`.trim()
-                  : input.prompt,
-            },
-          ],
-        } as never,
-      });
+      const url = `${root}/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
+      const promptText =
+        input.mode === 'variation'
+          ? `Create a high-quality visual variation of this image. ${input.prompt || ''}`.trim()
+          : input.prompt;
 
-      const images: ImageOutput['images'] = [];
-      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-        if (part.inlineData?.data) {
-          const mime = part.inlineData.mimeType ?? 'image/png';
-          images.push({
-            buffer: Buffer.from(part.inlineData.data, 'base64'),
-            mimeType: mime,
-            extension: mime.includes('jpeg') ? 'jpg' : 'png',
-          });
-        }
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: buildGeminiHeaders(ctx),
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    inlineData: {
+                      data: input.sourceImageBuffer.toString('base64'),
+                      mimeType: input.sourceMimeType,
+                    },
+                  },
+                  { text: promptText },
+                ],
+              },
+            ],
+            generationConfig: {
+              responseModalities: ['IMAGE', 'TEXT'],
+            },
+          }),
+        },
+        90000,
+        input.signal,
+      );
+      if (!res.ok) {
+        throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
       }
+      const json = (await res.json()) as GeminiGenerateContentResponse;
+      assertGeminiNotBlocked(json, true);
+      const images = extractGeminiCandidateImages(json.candidates);
       if (images.length === 0) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -1815,6 +2250,80 @@ async function executeImageEditOnProvider(
       return { images, costUsd: 0.035 };
     }
 
+    if (ctx.providerType === 'huggingface') {
+      const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
+      const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: mergeHeaders(
+            {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${ctx.apiKey}`,
+              Accept: 'image/png',
+            },
+            ctx.additionalHeaders,
+          ),
+          body: JSON.stringify({
+            inputs: input.sourceImageBuffer.toString('base64'),
+            parameters: {
+              prompt:
+                input.mode === 'variation'
+                  ? `Create a high quality variation. ${input.prompt || ''}`.trim()
+                  : input.prompt,
+              ...(ctx.modelParameters ?? {}),
+            },
+          }),
+        },
+        90000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
+      const buffer = Buffer.from(await res.arrayBuffer());
+      return {
+        images: [
+          {
+            buffer,
+            mimeType: contentType.startsWith('image/') ? contentType : 'image/png',
+            extension: contentType.includes('jpeg') ? 'jpg' : 'png',
+          },
+        ],
+        costUsd: 0.025,
+      };
+    }
+
+    if (ctx.providerType === 'huggingface_space') {
+      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const dataUri = `data:${input.sourceMimeType};base64,${input.sourceImageBuffer.toString('base64')}`;
+      const promptText =
+        input.mode === 'variation'
+          ? `Create a stylized variation. ${input.prompt || ''}`.trim()
+          : input.prompt;
+      const args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, dataUri);
+      const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
+      const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
+      if (!mediaUrl) {
+        throw new AIProviderError({
+          code: 'PROVIDER_ERROR',
+          message: 'Hugging Face Space returned no edited image.',
+          userMessageFa: 'ویرایش تصویر در Hugging Face Space نتیجه‌ای برنگرداند.',
+        });
+      }
+      const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
+      return {
+        images: [
+          {
+            buffer: dl.buffer,
+            mimeType: dl.mimeType,
+            extension: dl.mimeType.includes('jpeg') ? 'jpg' : 'png',
+          },
+        ],
+        costUsd: 0,
+      };
+    }
+
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider ${ctx.providerType} does not support image editing.`,
@@ -1851,28 +2360,43 @@ async function executeTranscribeOnProvider(
 
   try {
     if (ctx.providerType === 'google_gemini') {
-      const ai = createGeminiClient(ctx);
+      const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
       const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
-      const response = await ai.models.generateContent({
-        model: modelId,
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: input.mimeType,
-                data: input.audioBuffer.toString('base64'),
+      const url = `${root}/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: buildGeminiHeaders(ctx),
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: input.mimeType,
+                      data: input.audioBuffer.toString('base64'),
+                    },
+                  },
+                  {
+                    text: input.language
+                      ? `Transcribe this audio accurately in language ${input.language}. Return only the transcription.`
+                      : 'Transcribe this audio accurately in its original language. Return only the transcription.',
+                  },
+                ],
               },
-            },
-            {
-              text: input.language
-                ? `Transcribe this audio accurately in language ${input.language}. Return only the transcription.`
-                : 'Transcribe this audio accurately in its original language. Return only the transcription.',
-            },
-          ],
-        } as never,
-      });
+            ],
+          }),
+        },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      const json = (await res.json()) as GeminiGenerateContentResponse;
+      assertGeminiNotBlocked(json, false);
       return {
-        text: response.text?.trim() || '',
+        text: extractGeminiCandidateText(json.candidates).trim(),
         language: input.language,
         costUsd: 0.004,
       };
@@ -1904,7 +2428,7 @@ async function executeTranscribeOnProvider(
     }
 
     if (ctx.providerType === 'huggingface') {
-      const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '').replace(/\/hf-inference\/models\/.+$/i, '');
+      const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
       const res = await fetchWithTimeout(
         url,
@@ -1925,9 +2449,10 @@ async function executeTranscribeOnProvider(
     }
 
     if (ctx.providerType === 'huggingface_space') {
+      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const dataUri = `data:${input.mimeType};base64,${input.audioBuffer.toString('base64')}`;
-      const args = buildGradioInputPayload(ctx, '', undefined, undefined, dataUri);
-      const { outputData } = await runGradioSpaceCall(ctx, args, input.signal);
+      const args = buildGradioInputPayload(resolvedCtx, '', undefined, undefined, dataUri);
+      const { outputData } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       return {
         text: extractGradioOutputText(outputData).trim(),
         language: input.language,
@@ -1963,22 +2488,35 @@ async function executeSpeechOnProvider(
 
   try {
     if (ctx.providerType === 'google_gemini') {
-      const ai = createGeminiClient(ctx);
+      const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
       const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
       const voiceName = input.voice || 'Kore';
-      const response = await ai.models.generateContent({
-        model: modelId,
-        contents: [{ role: 'user', parts: [{ text: input.text }] }] as never,
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
+      const url = `${root}/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: buildGeminiHeaders(ctx),
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: input.text }] }],
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
             },
-          },
-        } as never,
-      });
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          }),
+        },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      const json = (await res.json()) as GeminiGenerateContentResponse;
+      assertGeminiNotBlocked(json, false);
+      const audioPart = json.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data);
+      const base64Audio = audioPart?.inlineData?.data;
       if (!base64Audio) {
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
@@ -1986,10 +2524,16 @@ async function executeSpeechOnProvider(
           userMessageFa: 'خروجی صوتی از مدل دریافت نشد.',
         });
       }
+      const rawMime = audioPart?.inlineData?.mimeType || 'audio/wav';
+      const rawBuf = Buffer.from(base64Audio, 'base64');
+      const isRawPcm = /audio\/l16|codec=pcm/i.test(rawMime);
+      const rateMatch = /rate=(\d+)/i.exec(rawMime);
+      const sampleRate = rateMatch?.[1] ? Number.parseInt(rateMatch[1], 10) : 24000;
+      const finalBuf = isRawPcm ? pcm16ToWav(rawBuf, sampleRate || 24000) : rawBuf;
       return {
-        audioBuffer: Buffer.from(base64Audio, 'base64'),
-        mimeType: 'audio/wav',
-        extension: 'wav',
+        audioBuffer: finalBuf,
+        mimeType: isRawPcm ? 'audio/wav' : rawMime,
+        extension: isRawPcm || rawMime.includes('wav') ? 'wav' : rawMime.includes('mpeg') ? 'mp3' : 'wav',
         costUsd: 0.006,
       };
     }
@@ -2025,7 +2569,7 @@ async function executeSpeechOnProvider(
     }
 
     if (ctx.providerType === 'huggingface') {
-      const routerRoot = normalizeOpenAiRootBaseUrl(ctx.baseUrl).replace(/\/v1$/i, '').replace(/\/hf-inference\/models\/.+$/i, '');
+      const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
       const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
       const res = await fetchWithTimeout(
         url,
@@ -2052,8 +2596,9 @@ async function executeSpeechOnProvider(
     }
 
     if (ctx.providerType === 'huggingface_space') {
-      const args = buildGradioInputPayload(ctx, input.text);
-      const { outputData, spaceHost } = await runGradioSpaceCall(ctx, args, input.signal);
+      const resolvedCtx = await resolveGradioContext(ctx, input.signal);
+      const args = buildGradioInputPayload(resolvedCtx, input.text);
+      const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
       if (!mediaUrl) {
         throw new AIProviderError({
@@ -2062,7 +2607,7 @@ async function executeSpeechOnProvider(
           userMessageFa: 'خروجی صوتی از Hugging Face Space دریافت نشد.',
         });
       }
-      const dl = await downloadBinarySafe(mediaUrl, ctx.apiKey, true);
+      const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
       const ext = dl.mimeType.includes('mpeg') ? 'mp3' : dl.mimeType.includes('ogg') ? 'ogg' : 'wav';
       return {
         audioBuffer: dl.buffer,
@@ -2179,18 +2724,34 @@ export async function startVideoGenerationWithRoute(
       }
 
       if (ctx.providerType === 'google_gemini') {
-        const ai = createGeminiClient(ctx);
+        const root = normalizeGeminiRootBaseUrl(ctx.baseUrl);
         const modelId = normalizeGeminiModelId(ctx.modelIdentifier);
-        const op = await (ai.models as unknown as {
-          generateVideos?: (args: Record<string, unknown>) => Promise<{ name?: string; done?: boolean }>;
-        }).generateVideos?.({
-          model: modelId,
-          prompt: input.prompt,
-          config: {
-            aspectRatio: input.aspectRatio ?? '16:9',
-            durationSeconds: input.durationSeconds ?? 5,
+        const url = `${root}/v1beta/models/${encodeURIComponent(modelId)}:predictLongRunning`;
+        const instance: Record<string, unknown> = { prompt: input.prompt };
+        if (input.sourceImageBase64 && input.sourceImageMimeType) {
+          instance.image = {
+            bytesBase64Encoded: input.sourceImageBase64,
+            mimeType: input.sourceImageMimeType,
+          };
+        }
+        const res = await fetchWithTimeout(
+          url,
+          {
+            method: 'POST',
+            headers: buildGeminiHeaders(ctx),
+            body: JSON.stringify({
+              instances: [instance],
+              parameters: {
+                aspectRatio: input.aspectRatio ?? '16:9',
+                durationSeconds: input.durationSeconds ?? 5,
+              },
+            }),
           },
-        });
+          45000,
+          input.signal,
+        );
+        if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+        const op = (await res.json()) as { name?: string };
         if (!op?.name) {
           throw new AIProviderError({
             code: 'PROVIDER_ERROR',

@@ -115,9 +115,12 @@ async function sendSafeErrorToChat(
   chatId: number | null,
   statusMessageId: number | null,
   messageFa: string,
+  diagnosticHint?: string,
 ): Promise<void> {
   if (!api || !chatId) return;
-  const fullText = `❌ ${messageFa}\n\n💡 اعتبار رزروشده برای این درخواست به‌صورت خودکار به کیف‌پول شما بازگردانده شد.`;
+  const safeHint = diagnosticHint ? redactSecrets(diagnosticHint).slice(0, 180) : '';
+  const hintLine = safeHint ? `\n🔎 جزئیات فنی: ${safeHint}` : '';
+  const fullText = `❌ ${messageFa}${hintLine}\n\n💡 اعتبار رزروشده برای این درخواست به‌صورت خودکار به کیف‌پول شما بازگردانده شد.`;
   if (statusMessageId) {
     try {
       await api.editMessageText(chatId, statusMessageId, fullText);
@@ -473,7 +476,7 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
           const caption = `🎨 تصویر تولیدشده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`;
           await api.sendPhoto(
             job.telegramChatId,
-            new InputFile(img.buffer, `hooshnegar-${i + 1}.${img.extension}`),
+            new InputFile(new Uint8Array(img.buffer), `hooshnegar-${i + 1}.${img.extension}`),
             { caption: caption.slice(0, 1000) },
           );
         }
@@ -604,7 +607,7 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
       if (api && job.telegramChatId) {
         await api.sendAudio(
           job.telegramChatId,
-          new InputFile(result.audioBuffer, `speech.${result.extension}`),
+          new InputFile(new Uint8Array(result.audioBuffer), `speech.${result.extension}`),
           { caption: `🔊 خروجی صوتی (${route.primary.modelName})` },
         );
         if (job.statusMessageId) {
@@ -757,7 +760,7 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
         if (api && job.telegramChatId) {
           await api.sendVideo(
             job.telegramChatId,
-            new InputFile(result.videoBuffer, 'hooshnegar-video.mp4'),
+            new InputFile(new Uint8Array(result.videoBuffer), 'hooshnegar-video.mp4'),
             { caption: `🎬 ویدیو با مدل ${route.primary.modelName} آماده شد.` },
           );
           if (job.statusMessageId) {
@@ -842,8 +845,25 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
       latencyMs: Date.now() - startedAt,
     });
 
-    await sendSafeErrorToChat(api, job.telegramChatId, job.statusMessageId, aiErr.userMessageFa);
-    return { ok: false, status: 'failed', error: aiErr.message };
+    const diagParts = [
+      aiErr.code,
+      aiErr.httpStatus ? `HTTP ${aiErr.httpStatus}` : '',
+      aiErr.message,
+    ].filter(Boolean);
+    const diagnosticHint = redactSecrets(diagParts.join(' • ')).slice(0, 180);
+
+    await sendSafeErrorToChat(
+      api,
+      job.telegramChatId,
+      job.statusMessageId,
+      aiErr.userMessageFa,
+      diagnosticHint,
+    );
+    return {
+      ok: false,
+      status: 'failed',
+      error: `${aiErr.userMessageFa} (${diagnosticHint})`,
+    };
   }
 }
 
@@ -910,7 +930,7 @@ export async function executeVideoPollJob(jobId: string): Promise<{
       if (api && job.telegramChatId) {
         await api.sendVideo(
           job.telegramChatId,
-          new InputFile(videoBuffer, 'hooshnegar-video.mp4'),
+          new InputFile(new Uint8Array(videoBuffer), 'hooshnegar-video.mp4'),
           { caption: `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد.` },
         );
         if (job.statusMessageId) {

@@ -69,15 +69,48 @@ export function normalizeGeminiModelId(rawIdentifier: string): string {
 }
 
 /**
- * Normalizes OpenAI-compatible base URLs if an admin pasted `/chat/completions` or `/models`.
+ * Normalizes OpenAI-compatible base URLs if an admin pasted `/chat/completions` or `/models`,
+ * and appends `/v1` when a bare origin URL (e.g. `https://api.openai.com`) is provided.
  */
 export function normalizeOpenAiRootBaseUrl(raw: string): string {
   let clean = normalizeBaseUrl(raw);
   clean = clean.replace(/\/chat\/completions$/i, '');
-  clean = clean.replace(/\/images\/generations$/i, '');
+  clean = clean.replace(/\/images\/(generations|edits|variations)$/i, '');
   clean = clean.replace(/\/audio\/(speech|transcriptions)$/i, '');
   clean = clean.replace(/\/models$/i, '');
-  return normalizeBaseUrl(clean);
+  clean = normalizeBaseUrl(clean);
+  try {
+    const parsed = new URL(clean);
+    if (!parsed.pathname || parsed.pathname === '/') {
+      return `${parsed.origin}/v1`;
+    }
+  } catch {
+    // keep clean string if partial URL
+  }
+  return clean;
+}
+
+/**
+ * Resolves the API inference/router root for Hugging Face models.
+ * Hub model page URLs like `https://huggingface.co/black-forest-labs/FLUX.1-dev`
+ * must route requests to `https://router.huggingface.co`, never to the Hub HTML repo path.
+ */
+export function resolveHuggingFaceRouterRoot(rawUrl: string): string {
+  const clean = normalizeBaseUrl(rawUrl)
+    .replace(/\/v1\/chat\/completions$/i, '')
+    .replace(/\/v1\/models$/i, '')
+    .replace(/\/v1$/i, '')
+    .replace(/\/hf-inference\/models\/.+$/i, '');
+
+  try {
+    const u = new URL(clean);
+    if (u.hostname === 'huggingface.co' || u.hostname === 'www.huggingface.co') {
+      return 'https://router.huggingface.co';
+    }
+  } catch {
+    // fallback below
+  }
+  return clean || 'https://router.huggingface.co';
 }
 
 export function normalizeModelIdentifierForProvider(
@@ -267,6 +300,11 @@ function classifyModelMetadata(params: {
   const maxInputSize = params.inputTokenLimit && params.inputTokenLimit > 0 ? params.inputTokenLimit : 128000;
   const maxOutputSize = params.outputTokenLimit && params.outputTokenLimit > 0 ? params.outputTokenLimit : 8192;
 
+  // Skip legacy/internal non-callable Google models (e.g. aqa uses generateAnswer)
+  if (lower === 'aqa' || lower.startsWith('models/aqa')) {
+    return null;
+  }
+
   // Skip legacy/internal non-callable methods when Google lists pure attribution/tuning-only entries
   if (
     methods.length > 0 &&
@@ -385,13 +423,12 @@ function classifyModelMetadata(params: {
     lower.includes('gpt-image') ||
     lower.includes('flux') ||
     lower.includes('stable-diffusion') ||
-    lower.includes('sdxl')
+    lower.includes('sdxl') ||
+    lower.includes('qwen-image')
   ) {
-    const caps: CapabilityType[] = ['image_generation', 'image_editing', 'image_variation'];
-    // Gemini image models also support generateContent chat/vision
-    if (lower.includes('gemini')) {
-      caps.push('chat', 'text_generation', 'vision');
-    }
+    const caps: CapabilityType[] = lower.includes('imagen')
+      ? ['image_generation']
+      : ['image_generation', 'image_editing', 'image_variation'];
     return {
       name,
       modelIdentifier: cleanId,
@@ -637,7 +674,7 @@ export async function discoverProviderModels(
         };
       }
 
-      const root = normalizeOpenAiRootBaseUrl(config.baseUrl).replace(/\/v1$/i, '');
+      const root = resolveHuggingFaceRouterRoot(config.baseUrl);
       const listUrl = `${root}/v1/models`;
       const res = await fetchJsonSafe(listUrl, headers, apiKey, fetchImpl);
       if (!res.ok) {
@@ -945,6 +982,37 @@ export async function discoverProviderModels(
   }
 }
 
+function scoreDefaultChatCandidate(item: DiscoveredModelSpec, cleanId: string): number {
+  if (item.category !== 'llm' && item.category !== 'multimodal') return -1;
+  if (!item.capabilities.includes('chat') && !item.capabilities.includes('text_generation')) return -1;
+
+  const lower = cleanId.toLowerCase();
+  // Never auto-select specialized/restricted models as the default chat model
+  if (
+    lower.includes('gemma') ||
+    lower.includes('image') ||
+    lower.includes('tts') ||
+    lower.includes('robotics') ||
+    lower.includes('computer-use') ||
+    lower.includes('deep-research') ||
+    lower.includes('thinking')
+  ) {
+    return 1;
+  }
+
+  if (lower === 'gemini-2.5-flash') return 100;
+  if (lower === 'gemini-2.0-flash' || lower === 'gemini-2.5-flash-lite') return 95;
+  if (lower === 'gpt-4o-mini' || lower === 'gpt-4.1-mini') return 92;
+  if (lower === 'gpt-4o' || lower === 'gpt-4.1') return 90;
+  if (lower.includes('claude-sonnet-4') || lower.includes('claude-3-5-sonnet') || lower.includes('claude-3-7-sonnet')) {
+    return 88;
+  }
+  if (lower.includes('gemini-2.5') && lower.includes('flash')) return 85;
+  if (lower.includes('gemini-2.0') && lower.includes('flash')) return 80;
+  if (lower.includes('flash') || lower.includes('mini')) return 70;
+  return 50;
+}
+
 export async function syncProviderModelsToDatabase(params: {
   providerId: string;
   providerType: ProviderType;
@@ -962,38 +1030,51 @@ export async function syncProviderModelsToDatabase(params: {
     existing.map((m) => normalizeModelIdentifierForProvider(params.providerType, m.modelIdentifier).toLowerCase()),
   );
 
-  // Check if the platform has any default chat model yet
+  // Check if the platform already has any default chat/text model
   const existingDefaults = await db
     .select({ id: aiModels.id, category: aiModels.category })
     .from(aiModels)
     .where(eq(aiModels.isDefault, true));
   const hasAnyTextDefault = existingDefaults.some((d) => d.category === 'llm' || d.category === 'multimodal');
 
-  let assignedTextDefault = hasAnyTextDefault;
+  // Identify the single best default chat candidate among newly added models
+  let bestDefaultIdentifier: string | null = null;
+  if (!hasAnyTextDefault) {
+    let bestScore = -1;
+    for (const item of params.discoveredModels) {
+      const cleanId = normalizeModelIdentifierForProvider(params.providerType, item.modelIdentifier);
+      if (!cleanId || existingNormalizedSet.has(cleanId.toLowerCase())) continue;
+      const score = scoreDefaultChatCandidate(item, cleanId);
+      if (score > bestScore) {
+        bestScore = score;
+        bestDefaultIdentifier = cleanId.toLowerCase();
+      }
+    }
+  }
+
   const createdModelIds: string[] = [];
   let skippedCount = 0;
 
-  for (let idx = 0; idx < params.discoveredModels.length; idx++) {
-    const item = params.discoveredModels[idx]!;
-    const cleanId = normalizeModelIdentifierForProvider(params.providerType, item.modelIdentifier);
-    if (!cleanId || existingNormalizedSet.has(cleanId.toLowerCase())) {
-      skippedCount++;
-      continue;
-    }
+  await db.transaction(async (tx) => {
+    for (let idx = 0; idx < params.discoveredModels.length; idx++) {
+      const item = params.discoveredModels[idx]!;
+      const cleanId = normalizeModelIdentifierForProvider(params.providerType, item.modelIdentifier);
+      if (!cleanId || existingNormalizedSet.has(cleanId.toLowerCase())) {
+        skippedCount++;
+        continue;
+      }
 
-    const creditCost =
-      params.defaultCreditCost !== undefined ? params.defaultCreditCost : item.creditCost;
+      const creditCost =
+        params.defaultCreditCost !== undefined ? params.defaultCreditCost : item.creditCost;
+      const isPreferredDefault =
+        bestDefaultIdentifier !== null && cleanId.toLowerCase() === bestDefaultIdentifier;
+      if (isPreferredDefault) {
+        bestDefaultIdentifier = null;
+      }
 
-    const isPreferredDefault =
-      !assignedTextDefault &&
-      (item.capabilities.includes('chat') || item.capabilities.includes('text_generation')) &&
-      (cleanId.includes('flash') || cleanId.includes('gpt-4o') || idx === 0);
+      const candidateScore = scoreDefaultChatCandidate(item, cleanId);
+      const priority = isPreferredDefault ? 40 : candidateScore >= 70 ? 60 + idx : 100 + idx;
 
-    if (isPreferredDefault) {
-      assignedTextDefault = true;
-    }
-
-    const created = await db.transaction(async (tx) => {
       const [inserted] = await tx
         .insert(aiModels)
         .values({
@@ -1008,7 +1089,7 @@ export async function syncProviderModelsToDatabase(params: {
           minCreditCost: '0',
           providerCostPerOpUsd: '0',
           allowedPlanTiers: [],
-          priority: 100 + idx,
+          priority,
           isDefault: isPreferredDefault,
           isActive: params.activateAll ?? true,
           maxInputSize: item.maxInputSize,
@@ -1018,7 +1099,10 @@ export async function syncProviderModelsToDatabase(params: {
         .onConflictDoNothing()
         .returning({ id: aiModels.id });
 
-      if (!inserted) return null;
+      if (!inserted) {
+        skippedCount++;
+        continue;
+      }
 
       const uniqueCaps = Array.from(new Set(item.capabilities));
       if (uniqueCaps.length > 0) {
@@ -1027,16 +1111,11 @@ export async function syncProviderModelsToDatabase(params: {
           .values(uniqueCaps.map((capability) => ({ modelId: inserted.id, capability })))
           .onConflictDoNothing();
       }
-      return inserted;
-    });
 
-    if (created) {
       existingNormalizedSet.add(cleanId.toLowerCase());
-      createdModelIds.push(created.id);
-    } else {
-      skippedCount++;
+      createdModelIds.push(inserted.id);
     }
-  }
+  });
 
   return {
     discoveredCount: params.discoveredModels.length,

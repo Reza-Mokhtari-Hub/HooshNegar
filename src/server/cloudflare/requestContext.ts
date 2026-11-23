@@ -28,6 +28,7 @@ export interface CloudflareRequestContext {
   blobStore?: CloudflareBlobStore;
   r2Bucket?: CloudflareR2Bucket;
   waitUntil?: (promise: Promise<unknown>) => void;
+  childWaitUntilTasks?: Promise<unknown>[];
   requestOrigin?: string;
 }
 

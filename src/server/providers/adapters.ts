@@ -5,6 +5,7 @@ import {
   normalizeOpenAiRootBaseUrl,
   parseHuggingFaceSpaceUrl,
   resolveHfSpaceRootUrl,
+  resolveHuggingFaceRouterRoot,
 } from './discovery.ts';
 import type { ProviderType } from '../../shared/validation.ts';
 import { redactSecrets } from '../security/crypto.ts';
@@ -343,7 +344,7 @@ export const huggingfaceAdapter: AIProviderAdapter = {
     const repo = extractHuggingFaceRepoFromUrl(config.baseUrl);
     const url = repo
       ? `https://huggingface.co/api/models/${repo}`
-      : `${normalizeOpenAiRootBaseUrl(config.baseUrl).replace(/\/v1$/i, '')}/v1/models`;
+      : `${resolveHuggingFaceRouterRoot(config.baseUrl)}/v1/models`;
     return {
       url,
       method: 'GET',

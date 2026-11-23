@@ -33,6 +33,14 @@ const KNOWN_BOOLEAN_IDENTIFIERS = new Set<string>([
   'hasBotToken',
   'hasWebhookSecret',
   'signatureVerified',
+  'providerActive',
+  'isActive',
+  'isDefault',
+  'isEnabled',
+  'autoRenew',
+  'isRecurringStars',
+  'isPremiumTelegram',
+  'usedFallback',
 ]);
 
 let cachedSchemaMeta: TableSchemaMeta[] | null = null;
@@ -487,7 +495,59 @@ function translateOutsideQuotes(sqlText: string): string {
     i++;
   }
 
-  return out;
+  // Strip PostgreSQL row-locking suffixes (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, etc.) outside quotes.
+  // Cloudflare SQLite DO already serializes transactions via beginTx()/waitForTurn().
+  return stripPgRowLocksOutsideQuotes(out);
+}
+
+function stripPgRowLocksOutsideQuotes(sqlText: string): string {
+  const lockSuffixRegex =
+    /\s*\bfor\s+(?:no\s+key\s+update|update|key\s+share|share)(?:\s+of\s+(?:"[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*(?:"[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*))*)?(?:\s+(?:nowait|skip\s+locked))?(?=\s*(?:;|$|\)))/gi;
+
+  // Walk segments split by single-quoted string literals so prompt text is never altered
+  // while keeping double-quoted identifiers (`OF "table"`) intact in the SQL segment.
+  let result = '';
+  let i = 0;
+  let plainStart = 0;
+  let inSingle = false;
+
+  while (i < sqlText.length) {
+    const ch = sqlText[i]!;
+    const next = sqlText[i + 1];
+
+    if (inSingle) {
+      if (ch === "'" && next === "'") {
+        i += 2;
+        continue;
+      }
+      if (ch === "'") {
+        inSingle = false;
+        result += sqlText.slice(plainStart, i + 1);
+        plainStart = i + 1;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "'") {
+      result += sqlText.slice(plainStart, i).replace(lockSuffixRegex, '');
+      inSingle = true;
+      plainStart = i;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  const tail = sqlText.slice(plainStart);
+  if (!inSingle) {
+    result += tail.replace(lockSuffixRegex, '').replace(/\s+$/g, '');
+  } else {
+    result += tail;
+  }
+
+  return result;
 }
 
 export function translatePgQueryToSqlite(

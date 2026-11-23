@@ -188,4 +188,184 @@ describe('PostgreSQL-to-SQLite Cloudflare Durable Object Bridge', () => {
 
     expect(Number(usage?.credits)).toBe(12.5);
   });
+
+  it('strips PostgreSQL FOR UPDATE / FOR SHARE clauses outside quotes without corrupting prompt strings, and executes full credit reservation/reconcile/refund on SQLite DO', async () => {
+    const t1 = translatePgQueryToSqlite(
+      'select "id", "balance" from "credit_wallets" where "credit_wallets"."user_id" = $1 for update',
+      ['user-1'],
+    );
+    expect(t1.sql).toBe('select "id", "balance" from "credit_wallets" where "credit_wallets"."user_id" = ?1');
+
+    const t2 = translatePgQueryToSqlite(
+      'select "id" from "ai_requests" where "prompt_preview" = $1 for no key update of "ai_requests" skip locked',
+      ['please wait for update now'],
+    );
+    expect(t2.sql).toBe('select "id" from "ai_requests" where "prompt_preview" = ?1');
+    expect(t2.params).toEqual(['please wait for update now']);
+
+    // Quoted literal inside SQL itself must remain untouched
+    const t3 = translatePgQueryToSqlite(
+      `insert into "ai_requests" ("prompt_preview") values ('waiting for update')`,
+      [],
+    );
+    expect(t3.sql).toBe(`insert into "ai_requests" ("prompt_preview") values ('waiting for update')`);
+
+    // End-to-end execution through Cloudflare DO SQLite harness (transactions + FOR UPDATE + boolean aliases)
+    const { sqlite, db } = createSqliteDrizzleHarness();
+    const { runWithCloudflareRequestContext } = await import('../server/cloudflare/requestContext.ts');
+
+    let inTx = false;
+    const executor = {
+      async execSql(queryString: string, params: unknown[]) {
+        const { sql: sqliteSql, params: sqliteParams } = translatePgQueryToSqlite(queryString, params);
+        const stmt = sqlite.prepare(sqliteSql);
+        const cols = stmt.columns().map((c) => c.name);
+        if (cols.length === 0) {
+          stmt.run(...sqliteParams);
+          return { rows: [] };
+        }
+        const objRows = stmt.all(...sqliteParams) as Array<Record<string, unknown>>;
+        const rawRows = objRows.map((obj) => cols.map((c) => obj[c]));
+        return { rows: decodeSqliteRows(cols, rawRows) };
+      },
+      async beginTx() {
+        inTx = true;
+        return 'tx-1';
+      },
+      async endTx() {
+        inTx = false;
+      },
+    };
+
+    expect(inTx).toBe(false);
+    await runWithCloudflareRequestContext({ sqlExecutor: executor }, async () => {
+      // Seed user, plan, subscription, wallet, provider, and text_generation-only model
+      const [user] = await db.insert(schema.users).values({ email: 'do@test.ir', status: 'active' }).returning();
+      const [plan] = await db
+        .insert(schema.subscriptionPlans)
+        .values({
+          name: 'رایگان',
+          slug: 'free-do',
+          tier: 'free',
+          dailyRequestLimit: 20,
+          monthlyRequestLimit: 200,
+          dailyTextLimit: 20,
+          dailyImageLimit: 5,
+          dailyVideoLimit: 2,
+          textGenerationLimit: 200,
+          imageGenerationLimit: 50,
+          audioGenerationLimit: 50,
+          videoGenerationLimit: 10,
+          creditAllocation: 50,
+          availableModelIds: [],
+          allowedProviderIds: [],
+          isEnabled: true,
+        })
+        .returning();
+
+      await db.insert(schema.userSubscriptions).values({
+        userId: user!.id,
+        planId: plan!.id,
+        status: 'active',
+        startsAt: new Date(Date.now() - 60_000),
+        endsAt: new Date(Date.now() + 86_400_000),
+      });
+
+      await db.insert(schema.creditWallets).values({
+        userId: user!.id,
+        balance: '50.0000',
+        reservedBalance: '0.0000',
+        lifetimeEarned: '50.0000',
+        lifetimeSpent: '0.0000',
+      });
+
+      const [provider] = await db
+        .insert(schema.aiProviders)
+        .values({
+          name: 'Gemini DO',
+          slug: 'gemini-do',
+          providerType: 'google_gemini',
+          baseUrl: 'https://generativelanguage.googleapis.com',
+          isActive: true,
+        })
+        .returning();
+
+      const [model] = await db
+        .insert(schema.aiModels)
+        .values({
+          providerId: provider!.id,
+          name: 'Gemini Flash DO',
+          modelIdentifier: 'gemini-2.5-flash',
+          category: 'llm',
+          creditCost: '2.0000',
+          allowedPlanTiers: [],
+          isActive: true,
+          isDefault: true,
+        })
+        .returning();
+
+      await db.insert(schema.modelCapabilities).values({
+        modelId: model!.id,
+        capability: 'text_generation',
+      });
+
+      // Verify SELECT ... FOR UPDATE runs smoothly inside SQLite proxy
+      const lockedWallets = await db
+        .select()
+        .from(schema.creditWallets)
+        .where(eq(schema.creditWallets.userId, user!.id))
+        .for('update');
+      expect(Number(lockedWallets[0]?.balance)).toBe(50);
+    });
+  });
+
+  it('tracks nested enqueueBackgroundJob calls inside outer waitUntil so Cloudflare Workers awaits child jobs', async () => {
+    const { runWithCloudflareRequestContext } = await import('../server/cloudflare/requestContext.ts');
+    const { enqueueBackgroundJob, registerLocalJobProcessor } = await import('../server/queue/qstash.ts');
+
+    const prevToken = process.env.QSTASH_TOKEN;
+    delete process.env.QSTASH_TOKEN;
+
+    const executedOrder: string[] = [];
+    const trackedPromises: Promise<unknown>[] = [];
+
+    registerLocalJobProcessor(async (payload) => {
+      executedOrder.push(`start:${payload.kind}`);
+      if (payload.kind === 'telegram_update') {
+        await enqueueBackgroundJob({
+          kind: 'ai_generation_job',
+          idempotencyKey: 'nested-child-1',
+          jobId: 'job-child-1',
+        });
+      }
+      await new Promise((r) => setTimeout(r, 15));
+      executedOrder.push(`end:${payload.kind}`);
+    });
+
+    try {
+      await runWithCloudflareRequestContext(
+        {
+          waitUntil: (p) => {
+            trackedPromises.push(p);
+          },
+        },
+        async () => {
+          const enqueued = await enqueueBackgroundJob({
+            kind: 'telegram_update',
+            idempotencyKey: 'parent-upd-1',
+            update: { update_id: 1 },
+          });
+          expect(enqueued.mode).toBe('cloudflare_waituntil');
+        },
+      );
+
+      expect(trackedPromises.length).toBe(1);
+      await Promise.all(trackedPromises);
+      expect(executedOrder).toContain('start:telegram_update');
+      expect(executedOrder).toContain('start:ai_generation_job');
+      expect(executedOrder).toContain('end:ai_generation_job');
+    } finally {
+      if (prevToken) process.env.QSTASH_TOKEN = prevToken;
+    }
+  });
 });

@@ -116,31 +116,56 @@ export async function enqueueBackgroundJob(
     };
   }
 
-  const capturedCtx = captureRequestContext();
+  const activeCtx = getCloudflareRequestContext();
+  const parentChildQueue = activeCtx?.childWaitUntilTasks;
+  const currentJobChildren: Promise<unknown>[] = [];
+  const capturedCtx = {
+    ...captureRequestContext(),
+    childWaitUntilTasks: currentJobChildren,
+  };
   const waitUntil = capturedCtx.waitUntil;
+
   const runJobWithRetries = async () => {
     if (!localProcessor) return;
     if (delaySeconds > 0) {
       await sleep(delaySeconds * 1000);
     }
-    for (let attemptNum = 1; attemptNum <= retries; attemptNum++) {
-      try {
-        await runWithCloudflareRequestContext(capturedCtx, () =>
-          localProcessor!({ ...payload, attempt: attemptNum }),
-        );
-        return;
-      } catch (err) {
-        console.error(
-          `[bg-queue] job ${payload.kind} attempt ${attemptNum} failed:`,
-          err instanceof Error ? err.message : 'unknown',
-        );
-        if (attemptNum >= retries) {
-          return;
+    try {
+      for (let attemptNum = 1; attemptNum <= retries; attemptNum++) {
+        try {
+          await runWithCloudflareRequestContext(capturedCtx, () =>
+            localProcessor!({ ...payload, attempt: attemptNum }),
+          );
+          break;
+        } catch (err) {
+          console.error(
+            `[bg-queue] job ${payload.kind} attempt ${attemptNum} failed:`,
+            err instanceof Error ? err.message : 'unknown',
+          );
+          if (attemptNum >= retries) {
+            break;
+          }
+          await sleep(Math.min(15000, 1000 * Math.pow(2, attemptNum)));
         }
-        await sleep(Math.min(15000, 1000 * Math.pow(2, attemptNum)));
+      }
+    } finally {
+      while (currentJobChildren.length > 0) {
+        const batch = currentJobChildren.splice(0, currentJobChildren.length);
+        await Promise.allSettled(batch);
       }
     }
   };
+
+  // If already executing inside a parent waitUntil background task, register onto the parent's awaited task list
+  if (parentChildQueue) {
+    const messageId = `cf_child_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const childPromise = runJobWithRetries();
+    parentChildQueue.push(childPromise);
+    return {
+      mode: 'cloudflare_waituntil',
+      messageId,
+    };
+  }
 
   if (waitUntil) {
     const messageId = `cf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

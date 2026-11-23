@@ -419,4 +419,380 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     });
     expect(spaceExec.result.text).toBe('پاسخ موفق از اسپیس با توکن دوم');
   });
+
+  it('executes Gemini text/Gemma/image/Imagen/TTS, OpenAI reasoning retry, and Hugging Face Hub routing properly via direct REST', async () => {
+    const {
+      normalizeOpenAiRootBaseUrl,
+      resolveHuggingFaceRouterRoot,
+    } = await import('./discovery.ts');
+    const {
+      editImageWithRoute,
+      generateImageWithRoute,
+      generateSpeechWithRoute,
+    } = await import('./engine.ts');
+
+    expect(normalizeOpenAiRootBaseUrl('https://api.openai.com')).toBe('https://api.openai.com/v1');
+    expect(normalizeOpenAiRootBaseUrl('https://api.groq.com/openai/v1/chat/completions')).toBe(
+      'https://api.groq.com/openai/v1',
+    );
+    expect(resolveHuggingFaceRouterRoot('https://huggingface.co/black-forest-labs/FLUX.1-dev')).toBe(
+      'https://router.huggingface.co',
+    );
+
+    const db = getDb();
+    const [gemProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'Gemini REST Provider',
+        slug: `gem-rest-${Date.now()}`,
+        providerType: 'google_gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        isActive: true,
+      })
+      .returning();
+
+    const discovery = await discoverProviderModels(
+      {
+        providerType: 'google_gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        apiKey: 'AIzaMockKey',
+      },
+      (async () =>
+        new Response(
+          JSON.stringify({
+            models: [
+              {
+                name: 'models/gemini-2.5-flash-image',
+                displayName: 'Gemini 2.5 Flash Image',
+                supportedGenerationMethods: ['generateContent'],
+              },
+              {
+                name: 'models/gemma-3-27b-it',
+                displayName: 'Gemma 3 27B',
+                supportedGenerationMethods: ['generateContent'],
+              },
+              {
+                name: 'models/gemini-2.5-flash',
+                displayName: 'Gemini 2.5 Flash',
+                supportedGenerationMethods: ['generateContent'],
+              },
+            ],
+          }),
+          { status: 200 },
+        )) as unknown as typeof fetch,
+    );
+
+    // Clear any existing default flag from earlier tests in the shared PGlite harness
+    await db.update(aiModels).set({ isDefault: false });
+
+    await syncProviderModelsToDatabase({
+      providerId: gemProv!.id,
+      providerType: 'google_gemini',
+      discoveredModels: discovery.models,
+    });
+
+    const syncedModels = await db
+      .select()
+      .from(aiModels)
+      .where(eq(aiModels.providerId, gemProv!.id));
+
+    const flashDefault = syncedModels.find((m) => m.modelIdentifier === 'gemini-2.5-flash');
+    const gemImageModel = syncedModels.find((m) => m.modelIdentifier === 'gemini-2.5-flash-image');
+    const gemmaModel = syncedModels.find((m) => m.modelIdentifier === 'gemma-3-27b-it');
+    expect(flashDefault?.isDefault).toBe(true);
+    expect(gemImageModel?.isDefault).toBe(false);
+    expect(gemmaModel?.isDefault).toBe(false);
+
+    const gemImageCaps = await db
+      .select({ capability: modelCapabilities.capability })
+      .from(modelCapabilities)
+      .where(eq(modelCapabilities.modelId, gemImageModel!.id));
+    expect(gemImageCaps.map((c) => c.capability)).not.toContain('chat');
+
+    process.env.AI_MOCK_MODE = 'false';
+
+    // 1. Gemma folds systemPrompt into user turn (no systemInstruction)
+    const capturedGemmaBodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedGemmaBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'پاسخ جما' }] }, finishReason: 'STOP' }],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const gemKey = 'AIzaTestKeyForExecution999';
+    const encGem = encryptSecret(gemKey);
+    await db.insert(providerCredentials).values({
+      providerId: gemProv!.id,
+      label: 'main',
+      encryptedApiKey: encGem.ciphertext,
+      iv: encGem.iv,
+      authTag: encGem.authTag,
+      maskedPreview: maskSecret(gemKey),
+      isActive: true,
+      status: 'active',
+    });
+
+    const gemmaRoute = await loadModelExecutionRoute(gemmaModel!.id);
+    const gemmaOut = await generateTextWithRoute(gemmaRoute, {
+      systemPrompt: 'به فارسی جواب بده',
+      messages: [{ role: 'user', content: 'سلام' }],
+    });
+    expect(gemmaOut.result.text).toBe('پاسخ جما');
+    expect(capturedGemmaBodies[0]).toBeTruthy();
+    expect(capturedGemmaBodies[0]?.systemInstruction).toBeUndefined();
+
+    // 2. Gemini native image includes responseModalities: ['IMAGE', 'TEXT'] and omits unsupported imageSize
+    let capturedImgUrl = '';
+    const capturedImgBodies: Array<{
+      generationConfig?: { responseModalities?: string[]; imageConfig?: Record<string, unknown> };
+    }> = [];
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      capturedImgUrl = String(url);
+      capturedImgBodies.push(
+        JSON.parse(String(init?.body ?? '{}')) as {
+          generationConfig?: { responseModalities?: string[]; imageConfig?: Record<string, unknown> };
+        },
+      );
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { inlineData: { mimeType: 'image/png', data: Buffer.from('PNGDATA').toString('base64') } },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const imgRoute = await loadModelExecutionRoute(gemImageModel!.id);
+    const genImg = await generateImageWithRoute(imgRoute, {
+      prompt: 'یک گربه فضانورد',
+      aspectRatio: '1:1',
+      resolution: '1K',
+    });
+    expect(capturedImgUrl).toContain('/v1beta/models/gemini-2.5-flash-image:generateContent');
+    expect(genImg.result.images[0]?.buffer.toString()).toBe('PNGDATA');
+    const genCfg = capturedImgBodies[0]?.generationConfig;
+    expect(genCfg?.responseModalities).toEqual(['IMAGE', 'TEXT']);
+    expect(genCfg?.imageConfig?.imageSize).toBeUndefined();
+
+    // 3. Gemini Imagen uses :predict with instances & parameters
+    const [imagenModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: gemProv!.id,
+        name: 'Imagen 3',
+        modelIdentifier: 'imagen-3.0-generate-002',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: imagenModel!.id, capability: 'image_generation' });
+
+    let capturedImagenUrl = '';
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      capturedImagenUrl = String(url);
+      return new Response(
+        JSON.stringify({
+          predictions: [{ bytesBase64Encoded: Buffer.from('IMAGENBYTES').toString('base64'), mimeType: 'image/png' }],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const imagenRoute = await loadModelExecutionRoute(imagenModel!.id);
+    const imagenRes = await generateImageWithRoute(imagenRoute, {
+      prompt: 'منظره کوهستان',
+      aspectRatio: '16:9',
+      resolution: '1K',
+    });
+    expect(capturedImagenUrl).toContain('/v1beta/models/imagen-3.0-generate-002:predict');
+    expect(imagenRes.result.images[0]?.buffer.toString()).toBe('IMAGENBYTES');
+
+    // 4. Gemini TTS wraps raw PCM audio/L16 in a valid RIFF WAVE header
+    const [ttsModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: gemProv!.id,
+        name: 'Gemini TTS',
+        modelIdentifier: 'gemini-2.5-flash-preview-tts',
+        category: 'audio',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: ttsModel!.id, capability: 'speech_generation' });
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'audio/L16;codec=pcm;rate=24000',
+                      data: Buffer.from([1, 2, 3, 4]).toString('base64'),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+
+    const ttsRoute = await loadModelExecutionRoute(ttsModel!.id);
+    const ttsRes = await generateSpeechWithRoute(ttsRoute, { text: 'سلام دنیا' });
+    expect(ttsRes.result.mimeType).toBe('audio/wav');
+    expect(ttsRes.result.audioBuffer.subarray(0, 4).toString()).toBe('RIFF');
+    expect(ttsRes.result.audioBuffer.subarray(8, 12).toString()).toBe('WAVE');
+
+    // 5. Gemini image edit sends responseModalities: ['IMAGE', 'TEXT'] + inlineData
+    let capturedEditBody: Record<string, unknown> | null = null;
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedEditBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { inlineData: { mimeType: 'image/png', data: Buffer.from('EDITED').toString('base64') } },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const editRes = await editImageWithRoute(imgRoute, {
+      prompt: 'کلاه بگذار',
+      sourceImageBuffer: Buffer.from('SRC'),
+      sourceMimeType: 'image/png',
+      mode: 'edit',
+    });
+    expect(editRes.result.images[0]?.buffer.toString()).toBe('EDITED');
+    expect(
+      (capturedEditBody as { generationConfig?: { responseModalities?: string[] } } | null)
+        ?.generationConfig?.responseModalities,
+    ).toEqual(['IMAGE', 'TEXT']);
+
+    // 5b. OpenAI reasoning model (`o3-mini`) sends max_completion_tokens cleanly
+    const [oaProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'OpenAI Bare Root',
+        slug: `oa-bare-${Date.now()}`,
+        providerType: 'openai_compatible',
+        baseUrl: 'https://api.openai.com',
+        isActive: true,
+      })
+      .returning();
+    const oaKey = 'sk-test-openai-reasoning';
+    const encOa = encryptSecret(oaKey);
+    await db.insert(providerCredentials).values({
+      providerId: oaProv!.id,
+      label: 'main',
+      encryptedApiKey: encOa.ciphertext,
+      iv: encOa.iv,
+      authTag: encOa.authTag,
+      maskedPreview: maskSecret(oaKey),
+      isActive: true,
+      status: 'active',
+    });
+    const [o3Model] = await db
+      .insert(aiModels)
+      .values({
+        providerId: oaProv!.id,
+        name: 'o3-mini',
+        modelIdentifier: 'o3-mini',
+        category: 'llm',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: o3Model!.id, capability: 'chat' });
+
+    let capturedOaUrl = '';
+    let capturedOaBody: Record<string, unknown> | null = null;
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      capturedOaUrl = String(url);
+      capturedOaBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'پاسخ استدلالی' } }],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const o3Route = await loadModelExecutionRoute(o3Model!.id);
+    const o3Out = await generateTextWithRoute(o3Route, {
+      messages: [{ role: 'user', content: '2+2?' }],
+    });
+    expect(capturedOaUrl).toBe('https://api.openai.com/v1/chat/completions');
+    expect((capturedOaBody as Record<string, unknown> | null)?.max_completion_tokens).toBeTruthy();
+    expect(o3Out.result.text).toBe('پاسخ استدلالی');
+
+    // 6. Hugging Face Hub model URL routes to router.huggingface.co/hf-inference/models/... (never 404 Hub HTML)
+    const [hfFluxProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'HF Hub FLUX Repo',
+        slug: `hf-flux-${Date.now()}`,
+        providerType: 'huggingface',
+        baseUrl: 'https://huggingface.co/black-forest-labs/FLUX.1-dev',
+        isActive: true,
+      })
+      .returning();
+    const hfRouterKey = 'hf_test_router_key_999';
+    const encHf = encryptSecret(hfRouterKey);
+    await db.insert(providerCredentials).values({
+      providerId: hfFluxProv!.id,
+      label: 'main',
+      encryptedApiKey: encHf.ciphertext,
+      iv: encHf.iv,
+      authTag: encHf.authTag,
+      maskedPreview: maskSecret(hfRouterKey),
+      isActive: true,
+      status: 'active',
+    });
+    const [fluxModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: hfFluxProv!.id,
+        name: 'FLUX.1-dev',
+        modelIdentifier: 'black-forest-labs/FLUX.1-dev',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: fluxModel!.id, capability: 'image_generation' });
+
+    let capturedHfImgUrl = '';
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      capturedHfImgUrl = String(url);
+      return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+        status: 200,
+        headers: { 'Content-Type': 'image/png' },
+      });
+    }) as unknown as typeof fetch;
+
+    const fluxRoute = await loadModelExecutionRoute(fluxModel!.id);
+    const fluxRes = await generateImageWithRoute(fluxRoute, { prompt: 'persian garden' });
+    expect(capturedHfImgUrl).toBe('https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev');
+    expect(fluxRes.result.images[0]?.buffer.byteLength).toBe(4);
+  });
 });

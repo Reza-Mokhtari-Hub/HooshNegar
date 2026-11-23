@@ -1653,8 +1653,20 @@ export function createTelegramBotInstance(botToken: string): Bot {
     });
   });
 
-  bot.catch((err) => {
-    console.error('[telegram:bot]', redactSecrets(err.message));
+  bot.catch(async (err) => {
+    const safeMsg = redactSecrets(err.message || 'Unknown Telegram error');
+    console.error('[telegram:bot]', safeMsg);
+    try {
+      const chatId = err.ctx?.chat?.id;
+      if (chatId) {
+        await err.ctx.api.sendMessage(
+          chatId,
+          `❌ خطایی در پردازش پیام رخ داد.\n🔎 جزئیات فنی: ${safeMsg.slice(0, 160)}`,
+        );
+      }
+    } catch {
+      // ignore delivery failure
+    }
     throw err.error ?? err;
   });
 
