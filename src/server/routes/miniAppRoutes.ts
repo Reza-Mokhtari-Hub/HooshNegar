@@ -26,6 +26,7 @@ import { redeemGiftCreditCoupon } from '../services/referralCouponService.ts';
 import { cancelSubscriptionAutoRenewal } from '../services/subscriptionService.ts';
 import { createTelegramStarsOrder } from '../services/telegramStarsService.ts';
 import { reserveCreditsAndCreateRequest, UsageGuardError } from '../services/usageService.ts';
+import { reapStaleRunningJobs } from '../services/maintenanceService.ts';
 import { executeQueuedGenerationJob } from '../telegram/jobRunner.ts';
 import {
   authenticateMiniAppRequest,
@@ -786,7 +787,7 @@ export function createMiniAppRouter(): Router {
       const jobId = String(req.params.id ?? '');
       const db = getDb();
 
-      const [job] = await db
+      let [job] = await db
         .select()
         .from(generationJobs)
         .where(and(eq(generationJobs.id, jobId), eq(generationJobs.userId, auth.ensured.user.id)))
@@ -795,6 +796,18 @@ export function createMiniAppRouter(): Router {
       if (!job) {
         res.status(404).json({ error: 'پردازش مورد نظر یافت نشد.' });
         return;
+      }
+
+      if (job.status === 'running' || job.status === 'queued') {
+        const reaped = await reapStaleRunningJobs().catch(() => 0);
+        if (reaped > 0) {
+          const [refreshed] = await db
+            .select()
+            .from(generationJobs)
+            .where(and(eq(generationJobs.id, jobId), eq(generationJobs.userId, auth.ensured.user.id)))
+            .limit(1);
+          if (refreshed) job = refreshed;
+        }
       }
 
       const [reqRow] = await db

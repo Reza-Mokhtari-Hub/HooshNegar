@@ -3,7 +3,7 @@ import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities, providerCredentials } from '../../db/schema.ts';
 import type { CapabilityType } from '../../shared/validation.ts';
 import { isAiMockModeEnabled } from '../config/env.ts';
-import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
+import { getCloudflareAiBinding, getCloudflareRequestContext } from '../cloudflare/requestContext.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { assertSafeOutboundUrl, SsrfProtectionError } from '../security/ssrf.ts';
 import {
@@ -70,7 +70,7 @@ function isModelQuotaZeroSignal(text: string): boolean {
 
 function isQuotaExhaustedSignal(text: string): boolean {
   if (isModelQuotaZeroSignal(text)) return false;
-  return /insufficient_quota|credit balance is too low|exceeded your monthly included credits|payment required|zerogpu.*quota|daily.*limit|exceeded your current quota/i.test(
+  return /insufficient_quota|credit balance is too low|exceeded your monthly included credits|payment required|zerogpu.*quota|exceeded your.*gpu quota|free gpu quota|pro gpu quota|gpu quota.*left|gpu duration.*exceeded|sign in to hugging face.*gpu|no gpu was available|daily.*limit|exceeded your current quota/i.test(
     text,
   );
 }
@@ -983,6 +983,19 @@ function extractGradioOutputText(val: unknown): string {
   return '';
 }
 
+function isGradioUiHelperName(apiName: string): boolean {
+  const lower = apiName.replace(/^\/+/, '').trim().toLowerCase();
+  if (!lower || lower.startsWith('gradio_') || lower.startsWith('_')) return true;
+  if (
+    /^(update|change|toggle|show|hide|switch|select|on_|handle_|reset|clear|refresh|load_preset|set_|check_login|lambda|get_example|populate|sync_ui|preview_)/i.test(
+      lower,
+    )
+  ) {
+    return true;
+  }
+  return /(_ui|_visibility|_selection|_dropdown|_slider|_preset|_tab|_panel|_state|_change|_click)$/i.test(lower);
+}
+
 function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
   const resolvePath = (p: string): string => {
     if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
@@ -1002,10 +1015,28 @@ function extractGradioMediaUrl(val: unknown, spaceHost: string): string | null {
   }
   if (val && typeof val === 'object') {
     const obj = val as Record<string, unknown>;
-    if (typeof obj.url === 'string') return resolvePath(obj.url);
-    if (typeof obj.path === 'string') return resolvePath(obj.path);
-    if (obj.image) return extractGradioMediaUrl(obj.image, spaceHost);
-    if (obj.value) return extractGradioMediaUrl(obj.value, spaceHost);
+    // Ignore empty Gradio UI update payloads that carry no media file
+    if (obj.__type__ === 'update' && !obj.url && !obj.path && !obj.value && !obj.image) {
+      return null;
+    }
+    if (typeof obj.url === 'string' && obj.url.trim()) return resolvePath(obj.url.trim());
+    if (typeof obj.path === 'string' && obj.path.trim()) return resolvePath(obj.path.trim());
+    if (obj.image) {
+      const found = extractGradioMediaUrl(obj.image, spaceHost);
+      if (found) return found;
+    }
+    if (obj.video) {
+      const found = extractGradioMediaUrl(obj.video, spaceHost);
+      if (found) return found;
+    }
+    if (obj.audio) {
+      const found = extractGradioMediaUrl(obj.audio, spaceHost);
+      if (found) return found;
+    }
+    if (obj.value) {
+      const found = extractGradioMediaUrl(obj.value, spaceHost);
+      if (found) return found;
+    }
   }
   return null;
 }
@@ -1014,12 +1045,19 @@ async function resolveGradioContext(
   ctx: ProviderExecutionContext,
   signal?: AbortSignal,
 ): Promise<ProviderExecutionContext> {
+  const rawApiName = (
+    typeof ctx.modelParameters?.apiName === 'string'
+      ? ctx.modelParameters.apiName
+      : ctx.modelIdentifier.split('::')[1] || 'predict'
+  ).replace(/^\/+/, '');
+  const isStaleUiHelper = isGradioUiHelperName(rawApiName);
+
   const hasParams =
     Array.isArray(ctx.modelParameters?.parameters) && ctx.modelParameters.parameters.length > 0;
   const paramSpaceHost =
     typeof ctx.modelParameters?.spaceHost === 'string' ? ctx.modelParameters.spaceHost : '';
 
-  if (hasParams && paramSpaceHost) {
+  if (hasParams && paramSpaceHost && !isStaleUiHelper) {
     return ctx;
   }
 
@@ -1027,7 +1065,7 @@ async function resolveGradioContext(
     ? normalizeBaseUrl(paramSpaceHost)
     : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
 
-  if (hasParams) {
+  if (hasParams && !isStaleUiHelper) {
     return {
       ...ctx,
       modelParameters: { ...(ctx.modelParameters ?? {}), spaceHost },
@@ -1037,12 +1075,6 @@ async function resolveGradioContext(
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (ctx.apiKey.trim()) headers.Authorization = `Bearer ${ctx.apiKey.trim()}`;
   const merged = mergeHeaders(headers, ctx.additionalHeaders);
-
-  const apiName = (
-    typeof ctx.modelParameters?.apiName === 'string'
-      ? ctx.modelParameters.apiName
-      : ctx.modelIdentifier.split('::')[1] || 'predict'
-  ).replace(/^\/+/, '');
 
   for (const candidate of [
     { path: '/gradio_api/info', prefix: '/gradio_api' },
@@ -1063,21 +1095,36 @@ async function resolveGradioContext(
             parameters?: Array<{
               label?: string;
               parameter_name?: string;
-              type?: { type?: string };
+              type?: { type?: string; enum?: unknown[] };
               component?: string;
               parameter_has_default?: boolean;
               parameter_default?: unknown;
             }>;
+            returns?: Array<{ label?: string; component?: string }>;
           }
         >;
       };
       const endpoints = info.named_endpoints ?? {};
-      const entry =
-        endpoints[`/${apiName}`] ?? endpoints[apiName] ?? Object.values(endpoints)[0];
-      const matchedKey =
-        endpoints[`/${apiName}`] || endpoints[apiName]
-          ? apiName
-          : Object.keys(endpoints)[0]?.replace(/^\/+/, '') || apiName;
+      const realEntries = Object.entries(endpoints).filter(([k, v]) => {
+        const clean = k.replace(/^\/+/, '');
+        return !isGradioUiHelperName(clean) && ((v.parameters?.length ?? 0) > 0 || (v.returns?.length ?? 0) > 0);
+      });
+
+      let matchedKey = rawApiName;
+      let entry = !isStaleUiHelper ? (endpoints[`/${rawApiName}`] ?? endpoints[rawApiName]) : undefined;
+
+      if (!entry) {
+        // Prefer inference endpoints like generate, infer, predict, run
+        const preferred =
+          realEntries.find(([k]) => /^\/?(generate|infer|predict|run|txt2img|create|synthesize|transcribe)/i.test(k)) ??
+          realEntries[0] ??
+          Object.entries(endpoints)[0];
+        if (preferred) {
+          matchedKey = preferred[0].replace(/^\/+/, '');
+          entry = preferred[1];
+        }
+      }
+
       if (entry?.parameters && entry.parameters.length > 0) {
         return {
           ...ctx,
@@ -1089,9 +1136,11 @@ async function resolveGradioContext(
             parameters: entry.parameters.map((p, idx) => ({
               index: idx,
               name: p.parameter_name || p.label || `arg_${idx}`,
+              label: p.label || p.parameter_name || `arg_${idx}`,
               component: (p.component || p.type?.type || 'textbox').toLowerCase(),
               hasDefault: Boolean(p.parameter_has_default),
               defaultValue: p.parameter_default ?? null,
+              ...(Array.isArray(p.type?.enum) ? { enum: p.type.enum } : {}),
             })),
           },
         };
@@ -1107,53 +1156,197 @@ async function resolveGradioContext(
   };
 }
 
+async function uploadMediaToGradioSpace(
+  ctx: ProviderExecutionContext,
+  buffer: Buffer,
+  mimeType: string,
+  fileName: string,
+  signal?: AbortSignal,
+): Promise<{ path?: string; url?: string; meta: { _type: 'gradio.FileData' } }> {
+  const spaceHost =
+    typeof ctx.modelParameters?.spaceHost === 'string' && ctx.modelParameters.spaceHost
+      ? normalizeBaseUrl(ctx.modelParameters.spaceHost)
+      : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
+  const prefix =
+    typeof ctx.modelParameters?.endpointPrefix === 'string'
+      ? ctx.modelParameters.endpointPrefix
+      : '/gradio_api';
+
+  const headers: Record<string, string> = {};
+  if (ctx.apiKey.trim()) headers.Authorization = `Bearer ${ctx.apiKey.trim()}`;
+  const mergedHeaders = mergeHeaders(headers, ctx.additionalHeaders);
+
+  for (const uploadUrl of [`${spaceHost}${prefix}/upload`, `${spaceHost}/upload`]) {
+    try {
+      const form = new FormData();
+      form.append('files', new Blob([new Uint8Array(buffer)], { type: mimeType }), fileName);
+      const res = await fetchWithTimeout(
+        uploadUrl,
+        { method: 'POST', headers: mergedHeaders, body: form },
+        20000,
+        signal,
+      );
+      if (!res.ok) continue;
+      const uploaded = (await res.json()) as unknown;
+      if (Array.isArray(uploaded) && typeof uploaded[0] === 'string' && uploaded[0].trim()) {
+        return { path: uploaded[0].trim(), meta: { _type: 'gradio.FileData' } };
+      }
+    } catch {
+      // fall through to next upload path or data URI fallback
+    }
+  }
+
+  return {
+    url: `data:${mimeType};base64,${buffer.toString('base64')}`,
+    meta: { _type: 'gradio.FileData' },
+  };
+}
+
+function mapAspectRatioToDimensions(aspectRatio?: string): { width: number; height: number } {
+  switch (aspectRatio) {
+    case '16:9':
+      return { width: 1024, height: 576 };
+    case '9:16':
+      return { width: 576, height: 1024 };
+    case '4:3':
+      return { width: 1024, height: 768 };
+    case '3:4':
+      return { width: 768, height: 1024 };
+    default:
+      return { width: 1024, height: 1024 };
+  }
+}
+
 function buildGradioInputPayload(
   ctx: ProviderExecutionContext,
   promptText: string,
   systemPrompt?: string,
   history?: Array<{ role: string; content: string }>,
-  mediaDataUri?: string,
+  mediaInput?: string | { path?: string; url?: string; meta: { _type: 'gradio.FileData' } },
+  options?: { aspectRatio?: string; mode?: 'generate' | 'edit' | 'variation' },
 ): unknown[] {
   const paramSpecs = Array.isArray(ctx.modelParameters?.parameters)
     ? (ctx.modelParameters.parameters as Array<{
         index?: number;
         name?: string;
+        label?: string;
         component?: string;
         hasDefault?: boolean;
         defaultValue?: unknown;
+        enum?: unknown[];
       }>)
     : null;
 
+  const mediaPayload =
+    typeof mediaInput === 'string'
+      ? { url: mediaInput, meta: { _type: 'gradio.FileData' } }
+      : mediaInput;
+
   if (!paramSpecs || paramSpecs.length === 0) {
-    return mediaDataUri ? [promptText, mediaDataUri] : [promptText];
+    return mediaPayload ? [promptText, mediaPayload] : [promptText];
   }
 
-  let injectedPrompt = false;
-  let injectedMedia = false;
+  const isExcludedTextbox = (pname: string, plabel: string): boolean =>
+    /negative|repo|file|lora|weight|system|token|key|password|seed|url|model|checkpoint/i.test(`${pname} ${plabel}`);
 
-  return paramSpecs.map((spec) => {
+  // Pick the single best prompt slot before filling defaults
+  let promptSlotIndex = paramSpecs.findIndex((spec) => {
     const comp = (spec.component ?? '').toLowerCase();
     const pname = (spec.name ?? '').toLowerCase();
-
-    if (mediaDataUri && !injectedMedia && (comp.includes('image') || comp.includes('audio') || comp.includes('file'))) {
-      injectedMedia = true;
-      return { url: mediaDataUri, meta: { _type: 'gradio.FileData' } };
+    const plabel = (spec.label ?? '').toLowerCase();
+    if (comp.includes('image') || comp.includes('audio') || comp.includes('file') || comp.includes('slider') || comp.includes('checkbox') || comp.includes('number')) {
+      return false;
     }
+    if (isExcludedTextbox(pname, plabel)) return false;
+    return /prompt|message|query|instruction|text|input/i.test(`${pname} ${plabel}`);
+  });
+
+  if (promptSlotIndex === -1) {
+    promptSlotIndex = paramSpecs.findIndex((spec) => {
+      const comp = (spec.component ?? '').toLowerCase();
+      const pname = (spec.name ?? '').toLowerCase();
+      const plabel = (spec.label ?? '').toLowerCase();
+      return (comp.includes('textbox') || comp.includes('text')) && !isExcludedTextbox(pname, plabel);
+    });
+  }
+
+  const dims = mapAspectRatioToDimensions(options?.aspectRatio);
+  const isCfWorker = Boolean(getCloudflareRequestContext()?.waitUntil);
+  let injectedMedia = false;
+
+  return paramSpecs.map((spec, idx) => {
+    const comp = (spec.component ?? '').toLowerCase();
+    const pname = (spec.name ?? '').toLowerCase();
+    const plabel = (spec.label ?? '').toLowerCase();
+    const isMediaComp =
+      comp.includes('image') || comp.includes('audio') || comp.includes('video') || comp.includes('file') || comp.includes('gallery');
+
+    if (isMediaComp) {
+      if (mediaPayload && !injectedMedia) {
+        injectedMedia = true;
+        return mediaPayload;
+      }
+      return spec.hasDefault ? (spec.defaultValue ?? null) : null;
+    }
+
     if (comp.includes('chatbot') || pname.includes('history')) {
       return (history ?? []).map((h) => [h.role === 'user' ? h.content : null, h.role === 'assistant' ? h.content : null]);
     }
     if (pname.includes('system') && systemPrompt) {
       return systemPrompt;
     }
-    if (
-      !injectedPrompt &&
-      (comp.includes('textbox') || comp.includes('text') || pname.includes('prompt') || pname.includes('message') || pname.includes('input'))
-    ) {
-      injectedPrompt = true;
+    if (idx === promptSlotIndex) {
       return promptText;
     }
+
+    // Mode selection (e.g., Text to Image vs Edit Image on AIO Spaces)
+    if (
+      (pname.includes('mode') || plabel.includes('mode')) &&
+      Array.isArray(spec.enum) &&
+      spec.enum.length > 0
+    ) {
+      if (options?.mode === 'edit' || options?.mode === 'variation') {
+        const editChoice = spec.enum.find((v) => typeof v === 'string' && /edit|img2img|ref/i.test(v));
+        if (editChoice !== undefined) return editChoice;
+      } else if (options?.mode === 'generate') {
+        const genChoice = spec.enum.find((v) => typeof v === 'string' && /text to image|txt2img|generate/i.test(v));
+        if (genChoice !== undefined) return genChoice;
+      }
+    }
+
+    // Aspect ratio dropdown matching (e.g. "Landscape · 16:9 (1344x768)")
+    if (
+      options?.aspectRatio &&
+      (pname.includes('aspect') || pname.includes('ratio') || plabel.includes('aspect')) &&
+      Array.isArray(spec.enum)
+    ) {
+      const ratioMatch = spec.enum.find(
+        (v) => typeof v === 'string' && v.includes(options.aspectRatio!),
+      );
+      if (ratioMatch !== undefined) return ratioMatch;
+    }
+
+    // Explicit width / height sliders
+    if (options?.aspectRatio && (comp.includes('slider') || comp.includes('number'))) {
+      if (pname === 'width' || plabel === 'width') return dims.width;
+      if (pname === 'height' || plabel === 'height') return dims.height;
+    }
+
+    // Cap very heavy default inference steps (e.g. 30-50 steps on slow ZeroGPU Spaces) so Cloudflare Workers completes cleanly
+    if (
+      (pname.includes('step') || plabel.includes('step')) &&
+      (comp.includes('slider') || comp.includes('number')) &&
+      typeof spec.defaultValue === 'number' &&
+      spec.defaultValue > 12
+    ) {
+      return isCfWorker ? Math.min(spec.defaultValue, 12) : Math.min(spec.defaultValue, 20);
+    }
+
     if (spec.hasDefault) {
       return spec.defaultValue ?? null;
+    }
+    if (Array.isArray(spec.enum) && spec.enum.length > 0) {
+      return spec.enum[0];
     }
     if (comp.includes('slider') || comp.includes('number')) return 1;
     if (comp.includes('checkbox')) return false;
@@ -1202,7 +1395,7 @@ async function runGradioSpaceCall(
     const res = await fetchWithTimeout(
       url,
       { method: 'POST', headers: mergedHeaders, body: JSON.stringify({ data: dataArgs }) },
-      30000,
+      20000,
       signal,
     );
     if (res.status !== 404) {
@@ -1218,7 +1411,7 @@ async function runGradioSpaceCall(
     const legacyRes = await fetchWithTimeout(
       legacyUrl,
       { method: 'POST', headers: mergedHeaders, body: JSON.stringify({ data: dataArgs }) },
-      60000,
+      45000,
       signal,
     );
     if (!legacyRes.ok) throw classifyHttpError(legacyRes.status, await legacyRes.text(), ctx.apiKey);
@@ -1227,7 +1420,18 @@ async function runGradioSpaceCall(
   }
 
   if (!submitRes.ok) {
-    throw classifyHttpError(submitRes.status, await submitRes.text(), ctx.apiKey);
+    const errBody = await submitRes.text();
+    if (submitRes.status === 503 && /queue is stopped|sleeping|building|paused|no space/i.test(errBody)) {
+      throw new AIProviderError({
+        code: 'PROVIDER_ERROR',
+        message: `HF Space unavailable (${submitRes.status}): ${redactSecrets(errBody.slice(0, 200), ctx.apiKey ? [ctx.apiKey] : [])}`,
+        userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
+        retryable: false,
+        httpStatus: 503,
+        credentialFailureKind: 'transient',
+      });
+    }
+    throw classifyHttpError(submitRes.status, errBody, ctx.apiKey);
   }
 
   const { event_id: eventId } = (await submitRes.json()) as { event_id?: string };
@@ -1239,19 +1443,22 @@ async function runGradioSpaceCall(
     });
   }
 
-  const sseRes = await fetchWithTimeout(
-    `${activeCallUrl}/${encodeURIComponent(eventId)}`,
-    { method: 'GET', headers: mergedHeaders },
-    90000,
-    signal,
-  );
-  if (!sseRes.ok) {
-    throw classifyHttpError(sseRes.status, await sseRes.text(), ctx.apiKey);
-  }
+  // Keep a single active AbortController across BOTH the SSE connect AND the entire streaming body read.
+  // Inside Cloudflare Workers waitUntil (30s hard kill), finish cleanly before 24s so catch+refund always execute.
+  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
+  const sseTimeoutMs = isCfBackgroundWaitUntil ? 24_000 : 55_000;
+  const sseController = new AbortController();
+  let timedOut = false;
+  const sseTimer = setTimeout(() => {
+    timedOut = true;
+    sseController.abort();
+  }, sseTimeoutMs);
+  const onExternalAbort = () => sseController.abort();
+  signal?.addEventListener('abort', onExternalAbort, { once: true });
 
-  const sseText = await sseRes.text();
-  const blocks = sseText.split(/\r?\n\r?\n/);
-  for (const block of blocks) {
+  const parseSseBlock = (
+    block: string,
+  ): { kind: 'complete'; data: unknown[] } | { kind: 'error'; raw: string } | null => {
     const lines = block.split(/\r?\n/);
     let eventName = '';
     const dataLines: string[] = [];
@@ -1261,31 +1468,132 @@ async function runGradioSpaceCall(
     }
     const payloadRaw = dataLines.join('\n');
     if (eventName === 'error') {
-      const isQuota = isQuotaExhaustedSignal(payloadRaw);
-      throw new AIProviderError({
-        code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
-        message: `HF Space error: ${redactSecrets(payloadRaw, ctx.apiKey ? [ctx.apiKey] : [])}`,
-        userMessageFa: isQuota
-          ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
-          : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
-        retryable: true,
-        credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
-      });
+      return { kind: 'error', raw: payloadRaw };
     }
     if (eventName === 'complete' && payloadRaw) {
       const parsed = JSON.parse(payloadRaw) as unknown;
-      return {
-        outputData: Array.isArray(parsed) ? parsed : [parsed],
-        spaceHost,
-      };
+      return { kind: 'complete', data: Array.isArray(parsed) ? parsed : [parsed] };
     }
-  }
+    return null;
+  };
 
-  throw new AIProviderError({
-    code: 'PROVIDER_ERROR',
-    message: 'Hugging Face Space stream ended without complete event.',
-    userMessageFa: 'خروجی کاملی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
-  });
+  try {
+    const sseRes = await fetch(`${activeCallUrl}/${encodeURIComponent(eventId)}`, {
+      method: 'GET',
+      headers: mergeHeaders({ Accept: 'text/event-stream' }, mergedHeaders),
+      signal: sseController.signal,
+    });
+    if (!sseRes.ok) {
+      throw classifyHttpError(sseRes.status, await sseRes.text(), ctx.apiKey);
+    }
+
+    if (!sseRes.body) {
+      const sseText = await sseRes.text();
+      for (const block of sseText.split(/\r?\n\r?\n/)) {
+        const parsed = parseSseBlock(block);
+        if (parsed?.kind === 'error') {
+          const isQuota = isQuotaExhaustedSignal(parsed.raw);
+          throw new AIProviderError({
+            code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
+            message: `HF Space error: ${redactSecrets(parsed.raw, ctx.apiKey ? [ctx.apiKey] : [])}`,
+            userMessageFa: isQuota
+              ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
+              : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
+            retryable: true,
+            credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
+          });
+        }
+        if (parsed?.kind === 'complete') {
+          return { outputData: parsed.data, spaceHost };
+        }
+      }
+      throw new AIProviderError({
+        code: 'PROVIDER_ERROR',
+        message: 'Hugging Face Space stream ended without complete event.',
+        userMessageFa: 'خروجی کاملی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+      });
+    }
+
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split(/\r?\n\r?\n/);
+        buffer = parts.pop() ?? '';
+
+        for (const block of parts) {
+          if (!block.trim()) continue;
+          const parsed = parseSseBlock(block);
+          if (parsed?.kind === 'error') {
+            await reader.cancel().catch(() => {});
+            const isQuota = isQuotaExhaustedSignal(parsed.raw);
+            throw new AIProviderError({
+              code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
+              message: `HF Space error: ${redactSecrets(parsed.raw, ctx.apiKey ? [ctx.apiKey] : [])}`,
+              userMessageFa: isQuota
+                ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
+                : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
+              retryable: true,
+              credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
+            });
+          }
+          if (parsed?.kind === 'complete') {
+            await reader.cancel().catch(() => {});
+            return { outputData: parsed.data, spaceHost };
+          }
+        }
+      }
+
+      // Process any trailing block after stream EOF
+      if (buffer.trim()) {
+        const parsed = parseSseBlock(buffer);
+        if (parsed?.kind === 'error') {
+          const isQuota = isQuotaExhaustedSignal(parsed.raw);
+          throw new AIProviderError({
+            code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
+            message: `HF Space error: ${redactSecrets(parsed.raw, ctx.apiKey ? [ctx.apiKey] : [])}`,
+            userMessageFa: isQuota
+              ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
+              : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
+            retryable: true,
+            credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
+          });
+        }
+        if (parsed?.kind === 'complete') {
+          return { outputData: parsed.data, spaceHost };
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    throw new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: 'Hugging Face Space stream ended without complete event.',
+      userMessageFa: 'خروجی کاملی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+    });
+  } catch (err) {
+    if (err instanceof AIProviderError) throw err;
+    if (timedOut) {
+      throw new AIProviderError({
+        code: 'TIMEOUT',
+        message: `Hugging Face Space SSE queue timed out after ${Math.round(sseTimeoutMs / 1000)}s.`,
+        userMessageFa: 'زمان پاسخ‌گویی این مدل به پایان رسید (صف شلوغ است). لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+        retryable: true,
+        credentialFailureKind: 'transient',
+      });
+    }
+    throw err;
+  } finally {
+    clearTimeout(sseTimer);
+    signal?.removeEventListener('abort', onExternalAbort);
+  }
 }
 
 // =============================================================================
@@ -1756,7 +2064,7 @@ async function executeTextOnProvider(
         await input.onChunk(text);
       }
       return {
-        text: text || 'پاسخی از Hugging Face Space دریافت نشد.',
+        text: text || 'پاسخی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
         inputTokens: inTok,
         outputTokens: outTok,
         costUsd: 0,
@@ -2505,7 +2813,10 @@ async function executeImageGenOnProvider(
 
     if (ctx.providerType === 'huggingface_space') {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
-      const args = buildGradioInputPayload(resolvedCtx, input.prompt);
+      const args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
+        aspectRatio: input.aspectRatio,
+        mode: 'generate',
+      });
       const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
       if (!mediaUrl) {
@@ -2777,12 +3088,21 @@ async function executeImageEditOnProvider(
 
     if (ctx.providerType === 'huggingface_space') {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
-      const dataUri = `data:${input.sourceMimeType};base64,${input.sourceImageBuffer.toString('base64')}`;
+      const uploadedImg = await uploadMediaToGradioSpace(
+        resolvedCtx,
+        input.sourceImageBuffer,
+        input.sourceMimeType,
+        input.sourceMimeType.includes('png') ? 'source.png' : 'source.jpg',
+        input.signal,
+      );
       const promptText =
         input.mode === 'variation'
           ? `Create a stylized variation. ${input.prompt || ''}`.trim()
           : input.prompt;
-      const args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, dataUri);
+      const args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
+        aspectRatio: input.aspectRatio,
+        mode: input.mode,
+      });
       const { outputData, spaceHost } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       const mediaUrl = extractGradioMediaUrl(outputData, spaceHost);
       if (!mediaUrl) {
@@ -3031,8 +3351,14 @@ async function executeTranscribeOnProvider(
 
     if (ctx.providerType === 'huggingface_space') {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
-      const dataUri = `data:${input.mimeType};base64,${input.audioBuffer.toString('base64')}`;
-      const args = buildGradioInputPayload(resolvedCtx, '', undefined, undefined, dataUri);
+      const uploadedAudio = await uploadMediaToGradioSpace(
+        resolvedCtx,
+        input.audioBuffer,
+        input.mimeType || 'audio/ogg',
+        input.fileName || 'voice.ogg',
+        input.signal,
+      );
+      const args = buildGradioInputPayload(resolvedCtx, '', undefined, undefined, uploadedAudio);
       const { outputData } = await runGradioSpaceCall(resolvedCtx, args, input.signal);
       return {
         text: extractGradioOutputText(outputData).trim(),

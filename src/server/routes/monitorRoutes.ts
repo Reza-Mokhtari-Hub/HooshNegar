@@ -22,6 +22,7 @@ import {
 import { getEnvValidationSummary, isAiMockModeEnabled } from '../config/env.ts';
 import { enqueueBackgroundJob } from '../queue/qstash.ts';
 import { refundFailedRequest } from '../services/usageService.ts';
+import { reapStaleRunningJobs } from '../services/maintenanceService.ts';
 import { runEndToEndTelegramSimulation } from '../telegram/bot.ts';
 import { recordAuditLog } from '../security/audit.ts';
 import {
@@ -486,6 +487,7 @@ export function createMonitorRouter(): Router {
   // =========================================================================
   router.get('/monitor/jobs', async (_req: AdminRequest, res: Response) => {
     try {
+      await reapStaleRunningJobs().catch(() => 0);
       const db = getDb();
       const rows = await db
         .select({

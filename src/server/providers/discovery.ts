@@ -1006,10 +1006,42 @@ export async function discoverProviderModels(
         }
       >;
 
-      const endpointEntries = Object.entries(namedEndpoints);
+      const isGradioUiHelperEndpoint = (
+        apiName: string,
+        paramsLen: number,
+        returnsLen: number,
+      ): boolean => {
+        const lower = apiName.trim().toLowerCase();
+        if (!lower || lower.startsWith('gradio_') || lower.startsWith('_')) return true;
+        if (paramsLen === 0 && returnsLen === 0) return true;
+        if (
+          /^(update|change|toggle|show|hide|switch|select|on_|handle_|reset|clear|refresh|load_preset|set_|check_login|lambda|get_example|populate|sync_ui|preview_)/i.test(
+            lower,
+          )
+        ) {
+          return true;
+        }
+        if (/(_ui|_visibility|_selection|_dropdown|_slider|_preset|_tab|_panel|_state|_change|_click)$/i.test(lower)) {
+          return true;
+        }
+        return false;
+      };
+
+      const rawEndpointEntries = Object.entries(namedEndpoints).filter(([rawApiPath]) => {
+        const apiName = rawApiPath.replace(/^\/+/, '');
+        return Boolean(apiName) && !apiName.startsWith('gradio_');
+      });
+
+      const realEndpointEntries = rawEndpointEntries.filter(([rawApiPath, ep]) => {
+        const apiName = rawApiPath.replace(/^\/+/, '');
+        return !isGradioUiHelperEndpoint(apiName, (ep.parameters ?? []).length, (ep.returns ?? []).length);
+      });
+
+      const endpointEntries = realEndpointEntries.length > 0 ? realEndpointEntries : rawEndpointEntries;
+
       for (const [rawApiPath, ep] of endpointEntries) {
         const apiName = rawApiPath.replace(/^\/+/, '');
-        if (!apiName || apiName.startsWith('gradio_')) continue;
+        if (!apiName || apiName.startsWith('gradio_') || apiName.startsWith('_')) continue;
 
         const paramsList = ep.parameters ?? [];
         const returnsList = ep.returns ?? [];
@@ -1058,7 +1090,7 @@ export async function discoverProviderModels(
           modelIdentifier: `${resolved.spaceId}::${apiName}`.slice(0, 195),
           category,
           capabilities,
-          description: `Hugging Face Space endpoint /${apiName} (${paramsList.length} ورودی)`,
+          description: `مدل اختصاصی /${apiName} (${paramsList.length} پارامتر)`,
           maxInputSize: 32000,
           maxOutputSize: 4096,
           creditCost,
@@ -1069,13 +1101,18 @@ export async function discoverProviderModels(
             spaceId: resolved.spaceId,
             apiName,
             endpointPrefix,
-            parameters: paramsList.map((p, idx) => ({
-              index: idx,
-              name: p.parameter_name || p.label || `arg_${idx}`,
-              component: (p.component || p.type?.type || 'textbox').toLowerCase(),
-              hasDefault: Boolean(p.parameter_has_default),
-              defaultValue: p.parameter_default ?? null,
-            })),
+            parameters: paramsList.map((p, idx) => {
+              const pType = p.type as { type?: string; enum?: unknown[] } | undefined;
+              return {
+                index: idx,
+                name: p.parameter_name || p.label || `arg_${idx}`,
+                label: p.label || p.parameter_name || `arg_${idx}`,
+                component: (p.component || pType?.type || 'textbox').toLowerCase(),
+                hasDefault: Boolean(p.parameter_has_default),
+                defaultValue: p.parameter_default ?? null,
+                ...(Array.isArray(pType?.enum) ? { enum: pType.enum } : {}),
+              };
+            }),
             returns: returnsList.map((r, idx) => ({
               index: idx,
               label: r.label || `out_${idx}`,
@@ -1468,11 +1505,54 @@ export async function syncProviderModelsToDatabase(params: {
   const createdModelIds: string[] = [];
   let skippedCount = 0;
 
+  const existingByNorm = new Map(
+    existing.map((m) => [normalizeModelIdentifierForProvider(params.providerType, m.modelIdentifier).toLowerCase(), m]),
+  );
+
   await db.transaction(async (tx) => {
+    // For Hugging Face Spaces, automatically deactivate legacy UI-helper endpoints (e.g. ::update_mode_ui)
+    if (params.providerType === 'huggingface_space' && params.discoveredModels.length > 0) {
+      const discoveredNormSet = new Set(
+        params.discoveredModels.map((item) =>
+          normalizeModelIdentifierForProvider(params.providerType, item.modelIdentifier).toLowerCase(),
+        ),
+      );
+      for (const ex of existing) {
+        const normId = normalizeModelIdentifierForProvider(params.providerType, ex.modelIdentifier).toLowerCase();
+        const apiPart = normId.split('::')[1] ?? '';
+        const looksLikeUiHelper =
+          apiPart.startsWith('_') ||
+          /^(update|change|toggle|show|hide|switch|select|on_|handle_|reset|clear|refresh|load_preset|set_|check_login|lambda|get_example|populate|sync_ui|preview_)/i.test(
+            apiPart,
+          ) ||
+          /(_ui|_visibility|_selection|_dropdown|_slider|_preset|_tab|_panel|_state|_change|_click)$/i.test(apiPart);
+        if (looksLikeUiHelper && !discoveredNormSet.has(normId)) {
+          await tx
+            .update(aiModels)
+            .set({ isActive: false, updatedAt: new Date() })
+            .where(eq(aiModels.id, ex.id));
+        }
+      }
+    }
+
     for (let idx = 0; idx < params.discoveredModels.length; idx++) {
       const item = params.discoveredModels[idx]!;
       const cleanId = normalizeModelIdentifierForProvider(params.providerType, item.modelIdentifier);
-      if (!cleanId || existingNormalizedSet.has(cleanId.toLowerCase())) {
+      if (!cleanId) {
+        skippedCount++;
+        continue;
+      }
+      if (existingNormalizedSet.has(cleanId.toLowerCase())) {
+        // Refresh Space parameter schema metadata on resync so existing HF Space models get latest parameter enums/defaults
+        if (params.providerType === 'huggingface_space' && item.modelParameters && Object.keys(item.modelParameters).length > 0) {
+          const matchedExisting = existingByNorm.get(cleanId.toLowerCase());
+          if (matchedExisting) {
+            await tx
+              .update(aiModels)
+              .set({ modelParameters: item.modelParameters, updatedAt: new Date() })
+              .where(eq(aiModels.id, matchedExisting.id));
+          }
+        }
         skippedCount++;
         continue;
       }

@@ -1309,5 +1309,194 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     expect(noBindTest.ok).toBe(false);
     expect(noBindTest.message).toContain('Account ID');
   });
+
+  it('filters HF Space UI helpers (update_mode_ui), auto-redirects legacy rows, and fails over ZeroGPU tokens on streaming SSE', async () => {
+    process.env.AI_MOCK_MODE = 'false';
+    const db = getDb();
+
+    const qwenGradioInfo = {
+      named_endpoints: {
+        '/update_mode_ui': {
+          parameters: [
+            { parameter_name: 'mode', label: 'Generation Mode', component: 'Radio', parameter_has_default: true, parameter_default: 'Text to Image' },
+          ],
+          returns: [{ label: 'Image 1', component: 'Image' }],
+        },
+        '/update_lora_selection': {
+          parameters: [
+            { parameter_name: 'selected_lora', label: 'Select LoRA', component: 'Dropdown', parameter_has_default: true, parameter_default: 'None' },
+          ],
+          returns: [{ label: 'Image 1', component: 'Image' }],
+        },
+        '/_check_login_status': { parameters: [], returns: [] },
+        '/generate': {
+          parameters: [
+            { parameter_name: 'prompt', label: 'Prompt', component: 'Textbox', parameter_has_default: false, parameter_default: null },
+            { parameter_name: 'mode', label: 'Generation Mode', component: 'Radio', parameter_has_default: true, parameter_default: 'Text to Image', type: { type: 'string', enum: ['Text to Image', 'Edit Image (1 Ref)'] } },
+            { parameter_name: 'ref_image_1', label: 'Image 1', component: 'Image', parameter_has_default: false, parameter_default: null },
+            { parameter_name: 'custom_repo', label: 'HF LoRA Repo', component: 'Textbox', parameter_has_default: false, parameter_default: null },
+            { parameter_name: 'aspect_ratio', label: 'Aspect Ratio', component: 'Dropdown', parameter_has_default: true, parameter_default: 'Square · 1:1 (1024x1024)', type: { type: 'string', enum: ['Square · 1:1 (1024x1024)', 'Landscape · 16:9 (1344x768)'] } },
+            { parameter_name: 'steps', label: 'Inference Steps', component: 'Slider', parameter_has_default: true, parameter_default: 30 },
+          ],
+          returns: [{ label: 'Generated Output', component: 'Image' }],
+        },
+      },
+    };
+
+    const capturedPosts: Array<{ auth: string; url: string; data: unknown[] }> = [];
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xaa, 0xbb]);
+
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const auth =
+        (init?.headers && !Array.isArray(init.headers)
+          ? (init.headers as Record<string, string>).Authorization || (init.headers as Record<string, string>).authorization
+          : '') ?? '';
+
+      if (url.includes('/api/spaces/owner/qwen-aio')) {
+        return new Response(JSON.stringify({ host: 'https://owner-qwen-aio.hf.space', sdk: 'gradio' }), { status: 200 });
+      }
+      if (url.endsWith('/gradio_api/info')) {
+        return new Response(JSON.stringify(qwenGradioInfo), { status: 200 });
+      }
+      if (url.endsWith('/gradio_api/call/generate')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { data?: unknown[] };
+        capturedPosts.push({ auth, url, data: body.data ?? [] });
+        const eventId = auth.includes('hf_token_1') ? 'evt-quota' : 'evt-ok';
+        return new Response(JSON.stringify({ event_id: eventId }), { status: 200 });
+      }
+      if (url.endsWith('/gradio_api/call/generate/evt-quota')) {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: error\ndata: "You have exceeded your GPU quota (60s requested vs. 0s left)"\n\n'));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      if (url.endsWith('/gradio_api/call/generate/evt-ok')) {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: heartbeat\ndata: null\n\n'));
+            controller.enqueue(
+              encoder.encode(
+                'event: complete\ndata: [{"url":"https://owner-qwen-aio.hf.space/gradio_api/file=/tmp/out.png"}]\n\n',
+              ),
+            );
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      if (url.includes('/gradio_api/file=/tmp/out.png')) {
+        return new Response(pngBytes, { status: 200, headers: { 'Content-Type': 'image/png' } });
+      }
+      return new Response('Not Found', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    // 1. Discovery skips update_mode_ui, update_lora_selection, _check_login_status and imports ONLY /generate
+    const disc = await discoverProviderModels({
+      providerType: 'huggingface_space',
+      baseUrl: 'https://huggingface.co/spaces/owner/qwen-aio',
+      apiKey: 'hf_token_1',
+    });
+    expect(disc.ok).toBe(true);
+    expect(disc.models).toHaveLength(1);
+    expect(disc.models[0]?.modelIdentifier).toBe('owner/qwen-aio::generate');
+    expect(disc.models[0]?.name).toBe('qwen-aio');
+
+    // 2. Sync automatically deactivates legacy ::update_mode_ui models already in DB
+    const [hfProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'HF Qwen Space Test',
+        slug: `hf-qwen-space-${Date.now()}`,
+        providerType: 'huggingface_space',
+        baseUrl: 'https://huggingface.co/spaces/owner/qwen-aio',
+        isActive: true,
+      })
+      .returning();
+
+    const enc1 = encryptSecret('hf_token_1');
+    const enc2 = encryptSecret('hf_token_2');
+    const [cred1] = await db
+      .insert(providerCredentials)
+      .values({
+        providerId: hfProv!.id,
+        label: 'hf-acc-1',
+        encryptedApiKey: enc1.ciphertext,
+        iv: enc1.iv,
+        authTag: enc1.authTag,
+        maskedPreview: maskSecret('hf_token_1'),
+        priority: 10,
+        status: 'active',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(providerCredentials).values({
+      providerId: hfProv!.id,
+      label: 'hf-acc-2',
+      encryptedApiKey: enc2.ciphertext,
+      iv: enc2.iv,
+      authTag: enc2.authTag,
+      maskedPreview: maskSecret('hf_token_2'),
+      priority: 20,
+      status: 'active',
+      isActive: true,
+    });
+
+    const [legacyHelperModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: hfProv!.id,
+        name: 'qwen-aio (update_mode_ui)',
+        modelIdentifier: 'owner/qwen-aio::update_mode_ui',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: legacyHelperModel!.id, capability: 'image_generation' });
+
+    await syncProviderModelsToDatabase({
+      providerId: hfProv!.id,
+      providerType: 'huggingface_space',
+      discoveredModels: disc.models,
+    });
+
+    const [legacyAfterSync] = await db
+      .select()
+      .from(aiModels)
+      .where(eq(aiModels.id, legacyHelperModel!.id));
+    expect(legacyAfterSync?.isActive).toBe(false);
+
+    // 3. Even if a legacy ::update_mode_ui row were still active, execution auto-redirects to /generate,
+    //    maps parameters properly (null image, 16:9 enum, capped steps), and fails over from hf_token_1 -> hf_token_2!
+    await db.update(aiModels).set({ isActive: true }).where(eq(aiModels.id, legacyHelperModel!.id));
+    const route = await loadModelExecutionRoute(legacyHelperModel!.id);
+    const imgOut = await generateImageWithRoute(route, {
+      prompt: 'persian garden at dusk',
+      aspectRatio: '16:9',
+    });
+
+    expect(imgOut.result.images[0]?.buffer.equals(pngBytes)).toBe(true);
+    expect(capturedPosts).toHaveLength(2);
+    expect(capturedPosts[0]?.auth).toBe('Bearer hf_token_1');
+    expect(capturedPosts[1]?.auth).toBe('Bearer hf_token_2');
+    // Verify exact Gradio payload: [prompt, mode, ref_image_1=null, custom_repo='', aspect_ratio=16:9 enum, steps<=20]
+    expect(capturedPosts[1]?.data[0]).toBe('persian garden at dusk');
+    expect(capturedPosts[1]?.data[1]).toBe('Text to Image');
+    expect(capturedPosts[1]?.data[2]).toBeNull();
+    expect(capturedPosts[1]?.data[3]).toBe('');
+    expect(capturedPosts[1]?.data[4]).toBe('Landscape · 16:9 (1344x768)');
+    expect(Number(capturedPosts[1]?.data[5])).toBeLessThanOrEqual(20);
+
+    const [cred1After] = await db
+      .select()
+      .from(providerCredentials)
+      .where(eq(providerCredentials.id, cred1!.id));
+    expect(cred1After?.status).toBe('quota_exhausted');
+  });
 });
 

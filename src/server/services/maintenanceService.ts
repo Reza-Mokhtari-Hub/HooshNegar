@@ -18,6 +18,54 @@ export interface MaintenanceRunSummary {
 }
 
 /**
+ * Automatically recovers orphaned/stuck queued or running jobs (for example when a slow external
+ * ZeroGPU Space exceeds runtime limits) and atomically refunds reserved credits.
+ */
+export async function reapStaleRunningJobs(options?: {
+  nowOverride?: Date;
+  maxAgeMs?: number;
+  videoMaxAgeMs?: number;
+}): Promise<number> {
+  const now = options?.nowOverride ?? new Date();
+  const maxAgeMs = options?.maxAgeMs ?? 3 * 60 * 1000; // 3 minutes for non-video jobs
+  const videoMaxAgeMs = options?.videoMaxAgeMs ?? 15 * 60 * 1000; // 15 minutes for async video jobs
+  const db = getDb();
+
+  const oldestCheckThreshold = new Date(now.getTime() - Math.min(maxAgeMs, videoMaxAgeMs));
+  const candidates = await db
+    .select({
+      id: generationJobs.id,
+      requestId: generationJobs.requestId,
+      capability: generationJobs.capability,
+      updatedAt: generationJobs.updatedAt,
+    })
+    .from(generationJobs)
+    .where(
+      and(
+        inArray(generationJobs.status, ['queued', 'running']),
+        lt(generationJobs.updatedAt, oldestCheckThreshold),
+      ),
+    );
+
+  let recovered = 0;
+  for (const job of candidates) {
+    const limitMs = job.capability === 'video_generation' ? videoMaxAgeMs : maxAgeMs;
+    const ageMs = now.getTime() - new Date(job.updatedAt).getTime();
+    if (ageMs < limitMs) continue;
+
+    await refundFailedRequest({
+      requestId: job.requestId,
+      jobId: job.id,
+      errorCode: 'STALE_JOB_TIMEOUT',
+      errorMessage: 'Job exceeded maximum processing time and reserved credits were refunded.',
+    });
+    recovered += 1;
+  }
+
+  return recovered;
+}
+
+/**
  * Idempotent scheduled maintenance runner invoked by Cloudflare Workers Cron Triggers,
  * Upstash QStash, or manually by a super_admin from the System Settings page.
  */
@@ -47,28 +95,8 @@ export async function runScheduledMaintenance(nowOverride?: Date): Promise<Maint
     cleanedExpiredFiles = 0;
   }
 
-  // 4. Recover stale queued/running AI jobs older than 15 minutes and refund reserved credits
-  const staleThreshold = new Date(now.getTime() - 15 * 60 * 1000);
-  const staleJobs = await db
-    .select({ id: generationJobs.id, requestId: generationJobs.requestId })
-    .from(generationJobs)
-    .where(
-      and(
-        inArray(generationJobs.status, ['queued', 'running']),
-        lt(generationJobs.updatedAt, staleThreshold),
-      ),
-    );
-
-  let recoveredStaleJobs = 0;
-  for (const job of staleJobs) {
-    await refundFailedRequest({
-      requestId: job.requestId,
-      jobId: job.id,
-      errorCode: 'STALE_JOB_TIMEOUT',
-      errorMessage: 'Job exceeded maximum processing time and reserved credits were refunded.',
-    });
-    recoveredStaleJobs += 1;
-  }
+  // 4. Recover stale queued/running AI jobs and refund reserved credits
+  const recoveredStaleJobs = await reapStaleRunningJobs({ nowOverride: now });
 
   return {
     expiredSubscriptions: exp.expiredCount,
