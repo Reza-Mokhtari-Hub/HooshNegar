@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Plus, Pencil, Trash2, Search, RefreshCw, Sparkles } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Plus, Pencil, Trash2, Search, RefreshCw, Sparkles, ShieldCheck } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
 import { DICTIONARIES, formatNumber, type Locale } from '../../i18n';
 import {
@@ -11,6 +11,7 @@ import {
   type PlanTier,
 } from '../../shared/validation';
 import type { ProviderRecord } from './ProvidersSection';
+import { ModelHealthPrunerModal } from './ModelHealthPrunerModal';
 import {
   Button,
   EmptyState,
@@ -87,6 +88,7 @@ export function ModelsSection({ locale }: { locale: Locale }) {
   const [feedback, setFeedback] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
 
   const [formOpen, setFormOpen] = useState(false);
+  const [prunerOpen, setPrunerOpen] = useState(false);
   const [editing, setEditing] = useState<ModelRecord | null>(null);
   const [providerId, setProviderId] = useState('');
   const [name, setName] = useState('');
@@ -348,6 +350,14 @@ export function ModelsSection({ locale }: { locale: Locale }) {
     return matchSearch && matchCap;
   });
 
+  const modelCountsByProvider = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const m of models) {
+      counts[m.providerId] = (counts[m.providerId] ?? 0) + 1;
+    }
+    return counts;
+  }, [models]);
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -359,10 +369,22 @@ export function ModelsSection({ locale }: { locale: Locale }) {
               : 'Capability-based model registry supporting text, vision, image, audio, video, embeddings, and documents.'}
           </p>
         </div>
-        <Button onClick={openCreate} disabled={providers.length === 0}>
-          <Plus className="w-4 h-4" />
-          <span>{locale === 'fa' ? 'افزودن مدل جدید' : 'Add AI Model'}</span>
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            onClick={() => setPrunerOpen(true)}
+            disabled={models.length === 0}
+          >
+            <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+            <span>
+              {locale === 'fa' ? 'پالایش هوشمند مدل‌های سالم' : 'Smart Health Pruner'}
+            </span>
+          </Button>
+          <Button onClick={openCreate} disabled={providers.length === 0}>
+            <Plus className="w-4 h-4" />
+            <span>{locale === 'fa' ? 'افزودن مدل جدید' : 'Add AI Model'}</span>
+          </Button>
+        </div>
       </div>
 
       {providers.length === 0 && !loading && (
@@ -941,6 +963,15 @@ export function ModelsSection({ locale }: { locale: Locale }) {
           </div>
         </form>
       </Modal>
+
+      <ModelHealthPrunerModal
+        open={prunerOpen}
+        onClose={() => setPrunerOpen(false)}
+        locale={locale}
+        providers={providers}
+        modelCountsByProvider={modelCountsByProvider}
+        onCompleted={loadData}
+      />
     </div>
   );
 }

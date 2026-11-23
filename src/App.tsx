@@ -29,6 +29,7 @@ import {
   Wallet,
   LifeBuoy,
   Bell,
+  Sparkles,
 } from 'lucide-react';
 import { ApiError, apiRequest, setCsrfToken, setUnauthorizedHandler } from './lib/api';
 import './lib/firebase';
@@ -40,6 +41,7 @@ import { TelegramMiniApp } from './miniapp/TelegramMiniApp';
 import { isMiniAppEntryRoute } from './miniapp/telegramSdk';
 import { Button } from './components/ui/primitives';
 import { DashboardSection } from './components/sections/DashboardSection';
+import { AiManagerSection } from './components/sections/AiManagerSection';
 import { ProvidersSection } from './components/sections/ProvidersSection';
 import { ModelsSection } from './components/sections/ModelsSection';
 import { CredentialsSection } from './components/sections/CredentialsSection';
@@ -75,6 +77,7 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { id: 'dashboard', icon: LayoutDashboard, group: 'core' },
+  { id: 'aiManager', icon: Sparkles, group: 'core' },
   { id: 'providers', icon: Cpu, group: 'core' },
   { id: 'models', icon: Boxes, group: 'core' },
   { id: 'credentials', icon: KeyRound, group: 'core' },
@@ -301,6 +304,8 @@ export default function App() {
         return <SettingsSection locale={locale} onAppNameUpdated={setAppNameOverride} />;
       case 'security':
         return <SecuritySection locale={locale} />;
+      case 'aiManager':
+        return <AiManagerSection locale={locale} adminRole={admin.role} />;
       default:
         return <DashboardSection locale={locale} onNavigate={setActiveSection} />;
     }
@@ -458,6 +463,17 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant={activeSection === 'aiManager' ? 'primary' : 'outline'}
+                size="sm"
+                onClick={() => setActiveSection('aiManager')}
+                title={locale === 'fa' ? 'دستیار هوشمند مدیریت سامانه' : 'AI Site Manager'}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">
+                  {locale === 'fa' ? 'دستیار هوشمند' : 'AI Manager'}
+                </span>
+              </Button>
               <Button
                 variant="ghost"
                 size="sm"

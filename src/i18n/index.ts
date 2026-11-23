@@ -4,6 +4,7 @@ export type Locale = 'fa' | 'en';
 
 export type NavSectionId =
   | 'dashboard'
+  | 'aiManager'
   | 'providers'
   | 'models'
   | 'credentials'
@@ -86,6 +87,7 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     phaseLabel: 'فاز ۳ · اشتراک، استارز و مالی',
     nav: {
       dashboard: 'داشبورد',
+      aiManager: 'دستیار هوشمند مدیریت',
       providers: 'ارائه‌دهندگان هوش مصنوعی',
       models: 'مدل‌های هوش مصنوعی',
       credentials: 'کلیدها و اعتبارنامه‌ها',
@@ -204,6 +206,7 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     phaseLabel: 'Phase 3 · Subscriptions, Stars & Finance',
     nav: {
       dashboard: 'Dashboard',
+      aiManager: 'AI Site Manager',
       providers: 'AI Providers',
       models: 'AI Models',
       credentials: 'API Credentials',

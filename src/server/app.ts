@@ -15,6 +15,7 @@ import { createMonitorRouter } from './routes/monitorRoutes.ts';
 import { createBillingRouter } from './routes/billingRoutes.ts';
 import { createFinanceRouter } from './routes/financeRoutes.ts';
 import { createSupportNotificationRouter } from './routes/supportNotificationRoutes.ts';
+import { createAiManagerRouter } from './routes/aiManagerRoutes.ts';
 import {
   apiRateLimitMiddleware,
   securityHeadersMiddleware,
@@ -155,6 +156,7 @@ export function createApiApp(): Express {
   app.use('/api', createBillingRouter());
   app.use('/api', createFinanceRouter());
   app.use('/api', createSupportNotificationRouter());
+  app.use('/api', createAiManagerRouter());
 
   // 404 handler for unknown API routes
   app.use('/api', (_req: Request, res: Response) => {

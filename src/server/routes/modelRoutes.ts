@@ -1,8 +1,9 @@
 import { Router, type Response } from 'express';
 import { desc, eq } from 'drizzle-orm';
+import { z } from 'zod';
 import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities } from '../../db/schema.ts';
-import { modelCreateSchema, modelUpdateSchema } from '../../shared/validation.ts';
+import { MODEL_CATEGORIES, modelCreateSchema, modelUpdateSchema } from '../../shared/validation.ts';
 import { recordAuditLog } from '../security/audit.ts';
 import {
   getClientIp,
@@ -12,6 +13,20 @@ import {
 } from '../middleware/auth.ts';
 import { getSystemBillingSettings } from '../services/walletService.ts';
 import { normalizeModelIdentifierForProvider } from '../providers/discovery.ts';
+import { runBatchModelHealthCheck } from '../providers/modelHealthService.ts';
+
+const modelHealthCheckSchema = z.object({
+  providerId: z.string().uuid().optional(),
+  category: z.enum(MODEL_CATEGORIES).optional(),
+  modelIds: z.array(z.string().uuid()).max(50).optional(),
+  onlyActive: z.boolean().optional().default(true),
+  offset: z.number().int().min(0).optional().default(0),
+  limit: z.number().int().min(1).max(20).optional().default(8),
+  action: z
+    .enum(['report_only', 'deactivate_broken', 'delete_broken'])
+    .optional()
+    .default('report_only'),
+});
 
 export function createModelRouter(): Router {
   const router = Router();
@@ -352,6 +367,75 @@ export function createModelRouter(): Router {
       res.status(500).json({ error: 'خطا در حذف مدل.' });
     }
   });
+
+  router.post(
+    '/models/health-check',
+    requireRole('operator'),
+    async (req: AdminRequest, res: Response) => {
+      const ip = getClientIp(req);
+      const ua = req.headers['user-agent'] ?? '';
+      try {
+        const parsed = modelHealthCheckSchema.safeParse(req.body ?? {});
+        if (!parsed.success) {
+          res.status(400).json({
+            error: parsed.error.issues[0]?.message ?? 'پارامترهای بررسی سلامت مدل‌ها نامعتبر است.',
+          });
+          return;
+        }
+
+        const data = parsed.data;
+        // Deleting or deactivating models requires admin or super_admin role
+        if (
+          data.action !== 'report_only' &&
+          req.admin?.role !== 'admin' &&
+          req.admin?.role !== 'super_admin'
+        ) {
+          res.status(403).json({
+            error: 'برای غیرفعال‌سازی یا حذف مدل‌های خراب به دسترسی مدیر (admin) نیاز است.',
+          });
+          return;
+        }
+
+        const report = await runBatchModelHealthCheck({
+          providerId: data.providerId,
+          category: data.category,
+          modelIds: data.modelIds,
+          onlyActive: data.onlyActive,
+          offset: data.offset,
+          limit: data.limit,
+          action: data.action,
+        });
+
+        if (
+          data.action !== 'report_only' &&
+          (report.summary.deactivated > 0 || report.summary.deleted > 0)
+        ) {
+          await recordAuditLog({
+            adminUserId: req.admin!.id,
+            actorEmail: req.admin!.email,
+            action:
+              data.action === 'delete_broken'
+                ? 'model.health_prune_deleted'
+                : 'model.health_prune_deactivated',
+            resourceType: 'ai_model',
+            severity: data.action === 'delete_broken' ? 'warning' : 'info',
+            ipAddress: ip,
+            userAgent: ua,
+            details: {
+              providerId: data.providerId ?? 'all',
+              category: data.category ?? 'all',
+              summary: report.summary,
+            },
+          });
+        }
+
+        res.json(report);
+      } catch (err) {
+        console.error('[models/health-check]', err instanceof Error ? err.message : 'unknown');
+        res.status(500).json({ error: 'خطا در اجرای بررسی سلامت مدل‌ها.' });
+      }
+    },
+  );
 
   return router;
 }
