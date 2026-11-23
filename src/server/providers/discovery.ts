@@ -4,6 +4,62 @@ import { aiModels, modelCapabilities } from '../../db/schema.ts';
 import type { CapabilityType, ModelCategory, ProviderType } from '../../shared/validation.ts';
 import { redactSecrets } from '../security/crypto.ts';
 import { SsrfProtectionError, validatePublicHttpsUrl } from '../security/ssrf.ts';
+import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
+
+export const CLOUDFLARE_WORKERS_AI_CURATED_MODELS: DiscoveredModelSpec[] = [
+  {
+    name: 'FLUX.1 Schnell (رایگان کلودفلر)',
+    modelIdentifier: '@cf/black-forest-labs/flux-1-schnell',
+    category: 'image',
+    capabilities: ['image_generation'],
+    description: 'تولید تصویر سریع و باکیفیت روی Cloudflare Workers AI (سهمیه رایگان روزانه بدون نیاز به Billing گوگل).',
+    maxInputSize: 4096,
+    maxOutputSize: 4096,
+    creditCost: 2,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: { steps: 4 },
+  },
+  {
+    name: 'SDXL Lightning (سریع و رایگان کلودفلر)',
+    modelIdentifier: '@cf/bytedance/stable-diffusion-xl-lightning',
+    category: 'image',
+    capabilities: ['image_generation'],
+    description: 'مدل فوق‌سریع ساخت تصویر با کیفیت بالا روی Cloudflare Workers AI (سهمیه رایگان روزانه).',
+    maxInputSize: 4096,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Stable Diffusion XL (رایگان کلودفلر)',
+    modelIdentifier: '@cf/stabilityai/stable-diffusion-xl-base-1.0',
+    category: 'image',
+    capabilities: ['image_generation'],
+    description: 'تولید تصویر SDXL با پشتیبانی از نسبت‌های تصویر مختلف روی Cloudflare Workers AI.',
+    maxInputSize: 4096,
+    maxOutputSize: 4096,
+    creditCost: 2,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Llama 3.3 70B Fast (رایگان کلودفلر)',
+    modelIdentifier: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    category: 'llm',
+    capabilities: ['text_generation', 'chat'],
+    description: 'مدل متنی سریع Llama 3.3 70B اجراشده روی لبه Cloudflare Workers AI.',
+    maxInputSize: 32000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+];
 
 export interface DiscoveredModelSpec {
   name: string;
@@ -433,12 +489,16 @@ function classifyModelMetadata(params: {
     const caps: CapabilityType[] = lower.includes('imagen')
       ? ['image_generation']
       : ['image_generation', 'image_editing', 'image_variation'];
+    const isGoogleImage = lower.includes('imagen') || lower.includes('gemini-') || lower.includes('nano-banana');
+    const imageDesc = isGoogleImage
+      ? `${description ? `${description} — ` : ''}توجه: مدل‌های تصویری گوگل در کلید رایگان AI Studio معمولاً سهمیه صفر (Billing لازم) دارند.`.slice(0, 600)
+      : description;
     return {
       name,
       modelIdentifier: cleanId,
       category: 'image',
       capabilities: caps,
-      description,
+      description: imageDesc,
       maxInputSize: Math.min(maxInputSize, 65536),
       maxOutputSize: Math.min(maxOutputSize, 8192),
       creditCost: 5,
@@ -697,7 +757,7 @@ export async function discoverProviderModels(
         }>;
       };
       const discovered = (json?.data ?? [])
-        .slice(0, 60)
+        .slice(0, 50)
         .map((m) =>
           classifyModelMetadata({
             id: m.id ?? '',
@@ -707,6 +767,33 @@ export async function discoverProviderModels(
           }),
         )
         .filter((x): x is DiscoveredModelSpec => Boolean(x));
+
+      // Also discover warm text-to-image inference models so Hugging Face Router supports image generation out-of-the-box
+      try {
+        const imgListUrl =
+          'https://huggingface.co/api/models?pipeline_tag=text-to-image&inference=warm&sort=likes&direction=-1&limit=10';
+        const imgRes = await fetchJsonSafe(imgListUrl, headers, apiKey, fetchImpl, 10000);
+        if (imgRes.ok && Array.isArray(imgRes.data)) {
+          const seen = new Set(discovered.map((d) => d.modelIdentifier.toLowerCase()));
+          for (const rawItem of imgRes.data) {
+            if (!rawItem || typeof rawItem !== 'object') continue;
+            const item = rawItem as { id?: string; pipeline_tag?: string; tags?: string[] };
+            if (!item.id || seen.has(item.id.toLowerCase())) continue;
+            const imgSpec = classifyModelMetadata({
+              id: item.id,
+              displayName: item.id.split('/').pop() || item.id,
+              pipelineTag: item.pipeline_tag || 'text-to-image',
+              description: Array.isArray(item.tags) ? item.tags.slice(0, 4).join(', ') : '',
+            });
+            if (imgSpec) {
+              seen.add(imgSpec.modelIdentifier.toLowerCase());
+              discovered.push(imgSpec);
+            }
+          }
+        }
+      } catch {
+        // Non-fatal: continue with /v1/models discovery results
+      }
 
       return {
         ok: true,
@@ -962,6 +1049,51 @@ export async function discoverProviderModels(
         resolvedBaseUrl: base,
         models: discovered,
         message: `${discovered.length} مدل از سرویس شناسایی شد.`,
+      };
+    }
+
+    // 6. CLOUDFLARE WORKERS AI (Native env.AI binding or Cloudflare REST API)
+    if (config.providerType === 'cloudflare_workers_ai') {
+      const hasNativeBinding = Boolean(getCloudflareAiBinding());
+      if (hasNativeBinding) {
+        return {
+          ok: true,
+          resolvedBaseUrl: 'https://api.cloudflare.com/client/v4',
+          models: CLOUDFLARE_WORKERS_AI_CURATED_MODELS,
+          message: `${CLOUDFLARE_WORKERS_AI_CURATED_MODELS.length} مدل رایگان Cloudflare Workers AI (تصویری و متنی) با اتصال بومی شناسایی شد.`,
+        };
+      }
+
+      const accountId = (config.organizationId ?? '').trim();
+      if (!accountId || !apiKey) {
+        return {
+          ok: false,
+          models: [],
+          message:
+            'خارج از محیط Cloudflare Worker، برای همگام‌سازی REST باید شناسه اکانت (Account ID در فیلد شناسه سازمان) و API Token وارد شود؛ پس از دیپلوی روی Cloudflare بدون کلید کار می‌کند.',
+        };
+      }
+
+      const verifyUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=1`;
+      const res = await fetchJsonSafe(
+        verifyUrl,
+        mergeHeaders({ Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }, config.additionalHeaders),
+        apiKey,
+        fetchImpl,
+      );
+      if (!res.ok) {
+        return {
+          ok: false,
+          models: [],
+          message: `خطای احراز هویت Cloudflare Workers AI (HTTP ${res.status}): ${res.rawText.slice(0, 200)}`,
+        };
+      }
+
+      return {
+        ok: true,
+        resolvedBaseUrl: 'https://api.cloudflare.com/client/v4',
+        models: CLOUDFLARE_WORKERS_AI_CURATED_MODELS,
+        message: `${CLOUDFLARE_WORKERS_AI_CURATED_MODELS.length} مدل رایگان Cloudflare Workers AI شناسایی شد.`,
       };
     }
 

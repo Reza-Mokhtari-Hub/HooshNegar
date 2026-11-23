@@ -8,6 +8,7 @@ export const PROVIDER_TYPES = [
   'fal_ai',
   'huggingface',
   'huggingface_space',
+  'cloudflare_workers_ai',
   'custom',
 ] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
@@ -130,7 +131,12 @@ export const providerCreateSchema = z
         message: 'کلید API معتبر وارد کنید (حداقل ۶ کاراکتر)',
       });
     }
-    if (data.providerType !== 'huggingface_space' && primary.length < 6 && extra.length === 0) {
+    if (
+      data.providerType !== 'huggingface_space' &&
+      data.providerType !== 'cloudflare_workers_ai' &&
+      primary.length < 6 &&
+      extra.length === 0
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['apiKey'],

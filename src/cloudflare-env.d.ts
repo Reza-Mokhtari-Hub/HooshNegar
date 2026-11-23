@@ -62,9 +62,14 @@ export interface CloudflareDurableObjectNamespace {
   get(id: unknown): CloudflareDurableObjectStub;
 }
 
+export interface CloudflareAiBinding {
+  run(model: string, inputs: Record<string, unknown>): Promise<unknown>;
+}
+
 export interface CloudflareWorkerEnv {
   ASSETS?: CloudflareFetcher;
   MEDIA_BUCKET?: CloudflareR2Bucket;
   STATE_DB?: CloudflareDurableObjectNamespace;
+  AI?: CloudflareAiBinding;
   [key: string]: unknown;
 }

@@ -6,6 +6,9 @@
     "nodejs_compat"
   ],
   "keep_vars": true,
+  "ai": {
+    "binding": "AI"
+  },
   "durable_objects": {
     "bindings": [
       {

@@ -84,24 +84,33 @@ const DEFAULT_BASE_URLS: Record<ProviderType, string> = {
   fal_ai: 'https://api.fal.ai',
   huggingface: 'https://router.huggingface.co',
   huggingface_space: 'https://huggingface.co/spaces/owner/space',
+  cloudflare_workers_ai: 'https://api.cloudflare.com/client/v4',
   custom: 'https://api.example.com/v1',
 };
 
 function getUrlHint(providerType: ProviderType, locale: Locale): string {
   if (locale === 'en') {
-    if (providerType === 'google_gemini') return 'Use https://generativelanguage.googleapis.com (with or without /v1beta).';
+    if (providerType === 'google_gemini') {
+      return 'Use https://generativelanguage.googleapis.com (Note: Google AI Studio free keys have limit: 0 on image models; use Cloudflare Workers AI for free image generation).';
+    }
     if (providerType === 'huggingface') return 'Router: https://router.huggingface.co or direct model URL https://huggingface.co/owner/model.';
     if (providerType === 'huggingface_space') return 'Space URL: https://huggingface.co/spaces/owner/space or https://owner-space.hf.space (API token optional for public Spaces).';
+    if (providerType === 'cloudflare_workers_ai') {
+      return 'Uses native Cloudflare Workers AI binding automatically on deploy (10,000 free Neurons/day, no API key needed). Outside Workers, enter Account ID + API Token.';
+    }
     return 'Must be a valid public HTTPS endpoint URL.';
   }
   if (providerType === 'google_gemini') {
-    return 'آدرس استاندارد: https://generativelanguage.googleapis.com (در صورت وجود /v1beta به‌صورت خودکار نرمال‌سازی می‌شود).';
+    return 'آدرس استاندارد: https://generativelanguage.googleapis.com (توجه: کلید رایگان Google AI Studio روی مدل‌های تصویری سهمیه صفر دارد؛ برای ساخت تصویر رایگان از Cloudflare Workers AI استفاده کنید).';
   }
   if (providerType === 'huggingface') {
     return 'آدرس روتر: https://router.huggingface.co یا آدرس مستقیم مدل مانند https://huggingface.co/owner/model';
   }
   if (providerType === 'huggingface_space') {
     return 'آدرس اسپیس: https://huggingface.co/spaces/owner/space یا https://owner-space.hf.space (برای اسپیس‌های عمومی کلید اختیاری است).';
+  }
+  if (providerType === 'cloudflare_workers_ai') {
+    return 'روی Cloudflare Workers به صورت بومی و رایگان (۱۰,۰۰۰ Neuron روزانه بدون نیاز به کلید) کار می‌کند؛ در اجرای خارج از Worker شناسه اکانت و توکن کلودفلر وارد کنید.';
   }
   return 'آدرس باید یک دامنه عمومی معتبر با پروتکل HTTPS باشد.';
 }
@@ -664,7 +673,11 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
                               ? locale === 'fa'
                                 ? 'عمومی (بدون کلید)'
                                 : 'Public (no token)'
-                              : '—'}
+                              : p.providerType === 'cloudflare_workers_ai'
+                                ? locale === 'fa'
+                                  ? 'بومی کلودفلر (رایگان / بدون کلید)'
+                                  : 'Native Cloudflare AI (Free)'
+                                : '—'}
                           </div>
                         )}
                       </td>
@@ -859,23 +872,36 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
           {!editing && (
             <div className="space-y-3">
               <div>
-                <FieldLabel htmlFor="prov-key" required={providerType !== 'huggingface_space'}>
+                <FieldLabel
+                  htmlFor="prov-key"
+                  required={providerType !== 'huggingface_space' && providerType !== 'cloudflare_workers_ai'}
+                >
                   {providerType === 'huggingface_space'
                     ? locale === 'fa'
                       ? 'توکن Hugging Face (اختیاری برای اسپیس‌های عمومی)'
                       : 'Hugging Face Token (Optional for Public Spaces)'
-                    : locale === 'fa'
-                      ? 'کلید API اصلی (AES-256-GCM)'
-                      : 'Primary API Key (AES-256-GCM)'}
+                    : providerType === 'cloudflare_workers_ai'
+                      ? locale === 'fa'
+                        ? 'توکن API کلودفلر (روی Worker نیازی نیست — اختیاری)'
+                        : 'Cloudflare API Token (Optional — auto-bound on Workers)'
+                      : locale === 'fa'
+                        ? 'کلید API اصلی (AES-256-GCM)'
+                        : 'Primary API Key (AES-256-GCM)'}
                 </FieldLabel>
                 <Input
                   id="prov-key"
                   type="password"
                   dir="ltr"
-                  required={providerType !== 'huggingface_space'}
+                  required={providerType !== 'huggingface_space' && providerType !== 'cloudflare_workers_ai'}
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={providerType === 'huggingface' || providerType === 'huggingface_space' ? 'hf_...' : 'sk-... / AIza...'}
+                  placeholder={
+                    providerType === 'huggingface' || providerType === 'huggingface_space'
+                      ? 'hf_...'
+                      : providerType === 'cloudflare_workers_ai'
+                        ? 'Optional on Cloudflare Workers'
+                        : 'sk-... / AIza...'
+                  }
                   autoComplete="off"
                 />
               </div>
@@ -902,14 +928,20 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <FieldLabel htmlFor="prov-org">
-                {locale === 'fa' ? 'شناسه سازمان (اختیاری)' : 'Organization ID (Optional)'}
+                {providerType === 'cloudflare_workers_ai'
+                  ? locale === 'fa'
+                    ? 'شناسه اکانت کلودفلر (Account ID — فقط خارج از Worker)'
+                    : 'Cloudflare Account ID (REST fallback only)'
+                  : locale === 'fa'
+                    ? 'شناسه سازمان (اختیاری)'
+                    : 'Organization ID (Optional)'}
               </FieldLabel>
               <Input
                 id="prov-org"
                 dir="ltr"
                 value={organizationId}
                 onChange={(e) => setOrganizationId(e.target.value)}
-                placeholder="org-..."
+                placeholder={providerType === 'cloudflare_workers_ai' ? '32-char Cloudflare Account ID' : 'org-...'}
               />
             </div>
 

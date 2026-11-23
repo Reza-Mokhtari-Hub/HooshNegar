@@ -80,6 +80,11 @@ export function MiniAppStudioTab({
     (preferredId && modeModels.some((m) => m.id === preferredId)
       ? preferredId
       : modeModels.find((m) => m.isDefault)?.id ?? modeModels[0]?.id) ?? '';
+  const currentModel = modeModels.find((m) => m.id === currentModelId) ?? null;
+  const suggestedAltModel =
+    modeModels.find((m) => m.id !== currentModelId && m.providerId !== currentModel?.providerId) ??
+    modeModels.find((m) => m.id !== currentModelId) ??
+    null;
 
   // Poll async jobs (video generation)
   useEffect(() => {
@@ -272,7 +277,7 @@ export function MiniAppStudioTab({
               ) : (
                 modeModels.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.name} — {m.creditCost} اعتبار
+                    {m.name} ({m.providerName}) — {m.creditCost} اعتبار
                   </option>
                 ))
               )}
@@ -417,10 +422,25 @@ export function MiniAppStudioTab({
           {error && (
             <div
               role="alert"
-              className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 text-rose-800 dark:text-rose-200 text-xs flex items-center gap-2"
+              className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 text-rose-800 dark:text-rose-200 text-xs space-y-2"
             >
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span className="leading-relaxed">{error}</span>
+              </div>
+              {suggestedAltModel && /limit:\s*0|billing|سهمیه|429|403/i.test(error) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedModelByMode((prev) => ({ ...prev, [mode]: suggestedAltModel.id }));
+                    setError('');
+                    triggerMiniAppHaptic('tap');
+                  }}
+                  className="min-h-[36px] px-3 rounded-lg bg-white dark:bg-slate-900 border border-rose-300 dark:border-rose-800 text-rose-900 dark:text-rose-100 font-medium hover:bg-rose-100 dark:hover:bg-rose-900/50 cursor-pointer transition-colors"
+                >
+                  تغییر مدل به: {suggestedAltModel.name} ({suggestedAltModel.providerName})
+                </button>
+              )}
             </div>
           )}
 

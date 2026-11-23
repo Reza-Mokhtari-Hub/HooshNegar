@@ -1,18 +1,26 @@
-import { count, eq } from 'drizzle-orm';
+import { and, count, eq } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { runMigrations } from '../../db/migrate.ts';
 import {
   adminUsers,
+  aiModels,
+  aiProviders,
   notificationTemplates,
   referralProgramSettings,
   subscriptionPlans,
   systemSettings,
   telegramBotSettings,
 } from '../../db/schema.ts';
+import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
+import {
+  CLOUDFLARE_WORKERS_AI_CURATED_MODELS,
+  syncProviderModelsToDatabase,
+} from '../providers/discovery.ts';
 import { hashPassword } from '../security/password.ts';
 import { recordAuditLog } from '../security/audit.ts';
 
 let bootstrapPromise: Promise<void> | null = null;
+let cloudflareAiSeeded = false;
 
 export const DEFAULT_SYSTEM_SETTINGS = {
   appName: 'هوش‌نگار',
@@ -117,9 +125,97 @@ export const DEFAULT_NOTIFICATION_TEMPLATES = [
   },
 ] as const;
 
+export async function ensureCloudflareWorkersAiSeeded(): Promise<void> {
+  if (cloudflareAiSeeded || !getCloudflareAiBinding()) {
+    return;
+  }
+
+  try {
+    const db = getDb();
+    const existing = await db
+      .select({ id: aiProviders.id })
+      .from(aiProviders)
+      .where(eq(aiProviders.providerType, 'cloudflare_workers_ai'))
+      .limit(1);
+
+    let providerId = existing[0]?.id;
+    const now = new Date();
+
+    if (!providerId) {
+      const [created] = await db
+        .insert(aiProviders)
+        .values({
+          name: 'Cloudflare Workers AI (رایگان)',
+          slug: 'cloudflare-workers-ai-free',
+          providerType: 'cloudflare_workers_ai',
+          baseUrl: 'https://api.cloudflare.com/client/v4',
+          connectionStatus: 'connected',
+          lastTestLatencyMs: 1,
+          lastTestMessage: 'اتصال بومی Cloudflare Workers AI فعال است (۱۰,۰۰۰ Neuron رایگان روزانه).',
+          lastTestedAt: now,
+          isActive: true,
+          priority: 15,
+        })
+        .onConflictDoNothing()
+        .returning({ id: aiProviders.id });
+
+      if (created) {
+        providerId = created.id;
+      } else {
+        const [reloaded] = await db
+          .select({ id: aiProviders.id })
+          .from(aiProviders)
+          .where(eq(aiProviders.providerType, 'cloudflare_workers_ai'))
+          .limit(1);
+        providerId = reloaded?.id;
+      }
+    }
+
+    if (providerId) {
+      const freeImageModels = CLOUDFLARE_WORKERS_AI_CURATED_MODELS.filter((m) => m.category === 'image');
+      await syncProviderModelsToDatabase({
+        providerId,
+        providerType: 'cloudflare_workers_ai',
+        discoveredModels: freeImageModels,
+        activateAll: true,
+      });
+
+      // Elevate FLUX.1 Schnell so free image generation appears first in Telegram & Mini App
+      const existingDefaultImage = await db
+        .select({ id: aiModels.id })
+        .from(aiModels)
+        .where(and(eq(aiModels.category, 'image'), eq(aiModels.isDefault, true)))
+        .limit(1);
+
+      await db
+        .update(aiModels)
+        .set({
+          priority: 15,
+          ...(existingDefaultImage.length === 0 ? { isDefault: true } : {}),
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(aiModels.providerId, providerId),
+            eq(aiModels.modelIdentifier, '@cf/black-forest-labs/flux-1-schnell'),
+          ),
+        );
+    }
+
+    cloudflareAiSeeded = true;
+  } catch (err) {
+    console.warn(
+      '[bootstrap:cloudflare-ai]',
+      err instanceof Error ? err.message : 'Unable to auto-seed Cloudflare Workers AI',
+    );
+  }
+}
+
 export async function ensurePlatformReady(): Promise<void> {
   if (bootstrapPromise) {
-    return bootstrapPromise;
+    await bootstrapPromise;
+    await ensureCloudflareWorkersAiSeeded();
+    return;
   }
 
   bootstrapPromise = (async () => {
@@ -298,6 +394,7 @@ export async function ensurePlatformReady(): Promise<void> {
 
   try {
     await bootstrapPromise;
+    await ensureCloudflareWorkersAiSeeded();
   } catch (err) {
     bootstrapPromise = null;
     throw err;
@@ -306,4 +403,5 @@ export async function ensurePlatformReady(): Promise<void> {
 
 export function resetBootstrapCacheForTests(): void {
   bootstrapPromise = null;
+  cloudflareAiSeeded = false;
 }

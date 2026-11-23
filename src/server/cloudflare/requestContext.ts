@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
+import type { CloudflareAiBinding, CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
 
 export interface CloudflareSqlExecutor {
   execSql(
@@ -27,6 +27,7 @@ export interface CloudflareRequestContext {
   sqlExecutor?: CloudflareSqlExecutor;
   blobStore?: CloudflareBlobStore;
   r2Bucket?: CloudflareR2Bucket;
+  aiBinding?: CloudflareAiBinding;
   waitUntil?: (promise: Promise<unknown>) => void;
   childWaitUntilTasks?: Promise<unknown>[];
   requestOrigin?: string;
@@ -35,6 +36,7 @@ export interface CloudflareRequestContext {
 declare global {
   var _hooshnegarCfRequestAls: AsyncLocalStorage<CloudflareRequestContext> | undefined;
   var _hooshnegarCfWaitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  var _hooshnegarCfAiBinding: CloudflareAiBinding | undefined;
 }
 
 function getAls(): AsyncLocalStorage<CloudflareRequestContext> {
@@ -63,4 +65,12 @@ export function setGlobalCloudflareWaitUntil(
 
 export function getCloudflareWaitUntil(): ((promise: Promise<unknown>) => void) | undefined {
   return getCloudflareRequestContext()?.waitUntil ?? global._hooshnegarCfWaitUntil;
+}
+
+export function setGlobalCloudflareAiBinding(aiBinding: CloudflareAiBinding | undefined): void {
+  global._hooshnegarCfAiBinding = aiBinding;
+}
+
+export function getCloudflareAiBinding(): CloudflareAiBinding | undefined {
+  return getCloudflareRequestContext()?.aiBinding ?? global._hooshnegarCfAiBinding;
 }

@@ -159,6 +159,7 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       fal_ai: 'fal.ai',
       huggingface: 'Hugging Face (مدل / Router)',
       huggingface_space: 'Hugging Face Space (اسپیس / Gradio)',
+      cloudflare_workers_ai: 'Cloudflare Workers AI (رایگان)',
       custom: 'ارائه‌دهنده سفارشی',
     },
     connectionStatuses: {
@@ -276,6 +277,7 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       fal_ai: 'fal.ai',
       huggingface: 'Hugging Face (Models / Router)',
       huggingface_space: 'Hugging Face Space (Gradio / ZeroGPU)',
+      cloudflare_workers_ai: 'Cloudflare Workers AI (Free)',
       custom: 'Custom HTTP Provider',
     },
     connectionStatuses: {

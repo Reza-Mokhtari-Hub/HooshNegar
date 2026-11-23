@@ -3,6 +3,7 @@ import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities, providerCredentials } from '../../db/schema.ts';
 import type { CapabilityType } from '../../shared/validation.ts';
 import { isAiMockModeEnabled } from '../config/env.ts';
+import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { assertSafeOutboundUrl, SsrfProtectionError } from '../security/ssrf.ts';
 import {
@@ -80,9 +81,51 @@ function isInvalidKeySignal(text: string): boolean {
   );
 }
 
-function classifyHttpError(status: number, bodyText: string, apiKey: string): AIProviderError {
+function extractReadableUpstreamError(bodyText: string, secrets: string[]): {
+  summary: string;
+  quotaModel: string | null;
+} {
+  let cleanText = bodyText.trim();
+  try {
+    const parsed = JSON.parse(cleanText) as {
+      error?: { message?: unknown; status?: unknown } | string;
+      message?: unknown;
+    };
+    if (typeof parsed?.error === 'string') {
+      cleanText = parsed.error;
+    } else if (parsed?.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string') {
+      cleanText = parsed.error.message;
+    } else if (typeof parsed?.message === 'string') {
+      cleanText = parsed.message;
+    }
+  } catch {
+    // keep raw text when not JSON
+  }
+
+  const quotaModelMatch = /\bmodel:\s*([a-zA-Z0-9._:/-]+)/i.exec(bodyText) ?? /\bmodel:\s*([a-zA-Z0-9._:/-]+)/i.exec(cleanText);
+  const quotaModel = quotaModelMatch?.[1] ?? null;
+
+  const compact = cleanText.replace(/\s+/g, ' ').trim();
+  const limitSegmentMatch = /(Quota exceeded for metric:[^.\n]+(?:,\s*limit:\s*\d+)?(?:,\s*model:\s*[a-zA-Z0-9._:/-]+)?)/i.exec(compact);
+  const prioritized = limitSegmentMatch?.[1]
+    ? `${limitSegmentMatch[1]} — ${compact}`
+    : compact;
+
+  return {
+    summary: redactSecrets(prioritized.slice(0, 260), secrets),
+    quotaModel,
+  };
+}
+
+function classifyHttpError(
+  status: number,
+  bodyText: string,
+  apiKey: string,
+  modelIdentifier?: string,
+): AIProviderError {
   const secrets = apiKey ? [apiKey] : [];
-  const safeMsg = redactSecrets(bodyText.slice(0, 300), secrets);
+  const { summary: safeMsg, quotaModel } = extractReadableUpstreamError(bodyText, secrets);
+  const modelLabel = quotaModel || modelIdentifier || '';
 
   if (status === 402) {
     return new AIProviderError({
@@ -126,10 +169,15 @@ function classifyHttpError(status: number, bodyText: string, apiKey: string): AI
 
   if (status === 429) {
     if (isModelQuotaZeroSignal(bodyText)) {
+      const isGoogleFreeTier =
+        /generate_content_free_tier|generativelanguage\.googleapis\.com|ai\.google\.dev|free_tier/i.test(bodyText);
+      const modelDisplay = modelLabel ? ` «${modelLabel}»` : '';
       return new AIProviderError({
         code: 'RATE_LIMITED',
-        message: `Provider model quota is zero (429): ${safeMsg}`,
-        userMessageFa: 'سهمیه رایگان این مدل در حساب API شما صفر است یا نیازمند فعال‌سازی Billing است.',
+        message: `Model${modelLabel ? ` "${modelLabel}"` : ''} free-tier quota is zero (429): ${safeMsg}`,
+        userMessageFa: isGoogleFreeTier
+          ? `گوگل برای مدل${modelDisplay} در کلیدهای رایگان Google AI Studio سهمیه پیش‌فرض صفر (limit: 0) تعیین کرده است (حتی بدون هیچ استفاده‌ای). برای ساخت تصویر رایگان از مدل‌های «Cloudflare Workers AI (رایگان)» مانند FLUX.1 Schnell استفاده کنید یا در Google AI Studio بخش Billing را فعال نمایید.`
+          : `سهمیه رایگان مدل${modelDisplay} در حساب API شما صفر است (limit: 0) یا نیازمند فعال‌سازی Billing است.`,
         retryable: false,
         httpStatus: 429,
         credentialFailureKind: 'transient',
@@ -519,11 +567,25 @@ async function loadProviderContextForId(params: {
   };
 
   let candidateCreds = usableCreds;
+  const supportsKeylessRuntime =
+    provider.providerType === 'huggingface_space' ||
+    (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
+
+  // When running natively inside Cloudflare Workers with `env.AI`, prefer keyless native binding immediately
+  if (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding())) {
+    const nativeCtx: ProviderExecutionContext = {
+      ...baseMeta,
+      apiKey: '',
+      credentialId: null,
+    };
+    nativeCtx.credentialPool = [nativeCtx];
+    return nativeCtx;
+  }
 
   // Recover automatically if active keys exist in DB but were previously poisoned by 403/cooldown
   if (candidateCreds.length === 0) {
     if (nonDisabledCreds.length === 0) {
-      if (provider.providerType === 'huggingface_space') {
+      if (supportsKeylessRuntime) {
         const anonCtx: ProviderExecutionContext = {
           ...baseMeta,
           apiKey: '',
@@ -566,7 +628,7 @@ async function loadProviderContextForId(params: {
         return aCool - bCool;
       });
       candidateCreds = recoverableCreds;
-    } else if (provider.providerType === 'huggingface_space') {
+    } else if (supportsKeylessRuntime) {
       const anonCtx: ProviderExecutionContext = {
         ...baseMeta,
         apiKey: '',
@@ -606,7 +668,7 @@ async function loadProviderContextForId(params: {
   }
 
   if (contexts.length === 0) {
-    if (provider.providerType === 'huggingface_space') {
+    if (supportsKeylessRuntime) {
       const anonCtx: ProviderExecutionContext = {
         ...baseMeta,
         apiKey: '',
@@ -1715,6 +1777,88 @@ async function executeTextOnProvider(
       };
     }
 
+    if (ctx.providerType === 'cloudflare_workers_ai') {
+      const messagesPayload: Array<{ role: string; content: string }> = [];
+      if (input.systemPrompt) {
+        messagesPayload.push({ role: 'system', content: input.systemPrompt });
+      }
+      for (const m of input.messages) {
+        if (m.role === 'system') continue;
+        messagesPayload.push({ role: m.role, content: m.content });
+      }
+
+      const payload: Record<string, unknown> = {
+        messages: messagesPayload,
+        max_tokens: Math.min(input.maxTokens ?? ctx.maxOutputSize ?? 2048, 4096),
+      };
+      const tempVal = input.temperature ?? (ctx.modelParameters?.temperature as number | undefined);
+      if (typeof tempVal === 'number') payload.temperature = tempVal;
+
+      const extractCfText = (raw: unknown): string => {
+        if (typeof raw === 'string') return raw.trim();
+        if (!raw || typeof raw !== 'object') return '';
+        const obj = raw as {
+          response?: unknown;
+          result?: { response?: unknown; choices?: Array<{ message?: { content?: string } }> };
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        if (typeof obj.response === 'string') return obj.response.trim();
+        if (typeof obj.result?.response === 'string') return obj.result.response.trim();
+        const choiceText =
+          obj.choices?.[0]?.message?.content ?? obj.result?.choices?.[0]?.message?.content;
+        return typeof choiceText === 'string' ? choiceText.trim() : '';
+      };
+
+      const aiBinding = getCloudflareAiBinding();
+      let rawResp: unknown;
+      if (aiBinding) {
+        rawResp = await aiBinding.run(ctx.modelIdentifier, payload);
+      } else {
+        const accountId = (ctx.organizationId ?? '').trim();
+        if (!accountId || !ctx.apiKey.trim()) {
+          throw new AIProviderError({
+            code: 'INVALID_API_KEY',
+            message: 'Cloudflare Workers AI requires native Worker binding or Account ID + API Token.',
+            userMessageFa:
+              'برای اجرای Cloudflare Workers AI خارج از Worker، شناسه اکانت (Account ID) و API Token را ثبت کنید.',
+            retryable: false,
+          });
+        }
+        const restBase = normalizeBaseUrl(ctx.baseUrl || 'https://api.cloudflare.com/client/v4').replace(/\/accounts\/.+$/i, '');
+        const restUrl = `${restBase}/accounts/${encodeURIComponent(accountId)}/ai/run/${ctx.modelIdentifier}`;
+        const res = await fetchWithTimeout(
+          restUrl,
+          {
+            method: 'POST',
+            headers: mergeHeaders(
+              { 'Content-Type': 'application/json', Authorization: `Bearer ${ctx.apiKey}` },
+              ctx.additionalHeaders,
+            ),
+            body: JSON.stringify(payload),
+          },
+          60000,
+          input.signal,
+        );
+        if (!res.ok) {
+          throw classifyHttpError(res.status, await res.text(), ctx.apiKey, ctx.modelIdentifier);
+        }
+        rawResp = await res.json();
+      }
+
+      const text = extractCfText(rawResp);
+      const inTok = estimateTokensRough(input.messages.map((m) => m.content).join('\n'));
+      const outTok = estimateTokensRough(text);
+      if (input.onChunk && text) {
+        await input.onChunk(text);
+      }
+      return {
+        text: text || 'پاسخی از Cloudflare Workers AI دریافت نشد.',
+        inputTokens: inTok,
+        outputTokens: outTok,
+        costUsd: 0,
+      };
+    }
+
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider type ${ctx.providerType} does not support text/chat completion.`,
@@ -1875,7 +2019,7 @@ async function executeImageGenOnProvider(
           input.signal,
         );
         if (!res.ok) {
-          throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+          throw classifyHttpError(res.status, await res.text(), ctx.apiKey, modelId);
         }
         const json = (await res.json()) as {
           predictions?: Array<{
@@ -1957,13 +2101,13 @@ async function executeImageGenOnProvider(
             input.signal,
           );
           if (!res.ok) {
-            throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+            throw classifyHttpError(res.status, await res.text(), ctx.apiKey, modelId);
           }
         } else {
-          throw classifyHttpError(res.status, errBody, ctx.apiKey);
+          throw classifyHttpError(res.status, errBody, ctx.apiKey, modelId);
         }
       } else if (!res.ok) {
-        throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+        throw classifyHttpError(res.status, await res.text(), ctx.apiKey, modelId);
       }
 
       const json = (await res.json()) as GeminiGenerateContentResponse;
@@ -2033,7 +2177,7 @@ async function executeImageGenOnProvider(
         90000,
         input.signal,
       );
-      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey, ctx.modelIdentifier);
       const json = (await res.json()) as {
         data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
       };
@@ -2186,7 +2330,7 @@ async function executeImageGenOnProvider(
         90000,
         input.signal,
       );
-      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey, hfRepoId);
       const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
       if (contentType.includes('application/json')) {
         const jsonBody = (await res.json()) as {
@@ -2236,6 +2380,142 @@ async function executeImageGenOnProvider(
           },
         ],
         costUsd: 0.02,
+      };
+    }
+
+    if (ctx.providerType === 'cloudflare_workers_ai') {
+      const modelId = ctx.modelIdentifier.trim();
+      const lowerModel = modelId.toLowerCase();
+      const dimMap: Record<string, { width: number; height: number }> = {
+        '1:1': { width: 1024, height: 1024 },
+        '16:9': { width: 1024, height: 576 },
+        '9:16': { width: 576, height: 1024 },
+        '4:3': { width: 1024, height: 768 },
+        '3:4': { width: 768, height: 1024 },
+      };
+      const dims = dimMap[input.aspectRatio ?? '1:1'] ?? { width: 1024, height: 1024 };
+
+      const payload: Record<string, unknown> = lowerModel.includes('flux-1-schnell')
+        ? {
+            prompt: input.prompt,
+            steps: Math.min(Math.max(Number(ctx.modelParameters?.steps ?? 4), 1), 8),
+          }
+        : {
+            prompt: input.prompt,
+            width: dims.width,
+            height: dims.height,
+          };
+
+      const detectImageFormat = (buf: Buffer): { mimeType: string; extension: string } => {
+        if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+          return { mimeType: 'image/png', extension: 'png' };
+        }
+        if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+          return { mimeType: 'image/jpeg', extension: 'jpg' };
+        }
+        if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === 'RIFF') {
+          return { mimeType: 'image/webp', extension: 'webp' };
+        }
+        return { mimeType: 'image/png', extension: 'png' };
+      };
+
+      const decodeCfImageOutput = async (raw: unknown): Promise<{ buffer: Buffer; mimeType: string; extension: string }> => {
+        if (raw instanceof Uint8Array) {
+          const buffer = Buffer.from(raw);
+          return { buffer, ...detectImageFormat(buffer) };
+        }
+        if (raw instanceof ArrayBuffer) {
+          const buffer = Buffer.from(raw);
+          return { buffer, ...detectImageFormat(buffer) };
+        }
+        if (raw && typeof raw === 'object' && 'arrayBuffer' in raw && typeof (raw as Response).arrayBuffer === 'function') {
+          const buffer = Buffer.from(await (raw as Response).arrayBuffer());
+          return { buffer, ...detectImageFormat(buffer) };
+        }
+        if (raw && typeof raw === 'object' && 'getReader' in raw && typeof (raw as ReadableStream).getReader === 'function') {
+          const reader = (raw as ReadableStream<Uint8Array>).getReader();
+          const chunks: Uint8Array[] = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) chunks.push(value);
+          }
+          const buffer = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+          return { buffer, ...detectImageFormat(buffer) };
+        }
+        if (raw && typeof raw === 'object') {
+          const obj = raw as { image?: unknown; result?: { image?: unknown } };
+          const b64 = typeof obj.image === 'string' ? obj.image : typeof obj.result?.image === 'string' ? obj.result.image : null;
+          if (b64) {
+            const buffer = Buffer.from(b64, 'base64');
+            return { buffer, ...detectImageFormat(buffer) };
+          }
+        }
+        throw new AIProviderError({
+          code: 'PROVIDER_ERROR',
+          message: 'Cloudflare Workers AI returned no recognizable image output.',
+          userMessageFa: 'خروجی تصویر معتبری از Cloudflare Workers AI دریافت نشد.',
+        });
+      };
+
+      const aiBinding = getCloudflareAiBinding();
+      if (aiBinding) {
+        const rawOut = await aiBinding.run(modelId, payload);
+        const decoded = await decodeCfImageOutput(rawOut);
+        if (decoded.buffer.byteLength === 0) {
+          throw new AIProviderError({
+            code: 'PROVIDER_ERROR',
+            message: 'Cloudflare Workers AI returned empty image buffer.',
+            userMessageFa: 'تصویر خروجی Cloudflare Workers AI خالی بود. لطفاً دوباره تلاش کنید.',
+          });
+        }
+        return {
+          images: [decoded],
+          costUsd: 0,
+        };
+      }
+
+      const accountId = (ctx.organizationId ?? '').trim();
+      if (!accountId || !ctx.apiKey.trim()) {
+        throw new AIProviderError({
+          code: 'INVALID_API_KEY',
+          message: 'Cloudflare Workers AI requires native Worker binding or Account ID + API Token.',
+          userMessageFa:
+            'برای اجرای Cloudflare Workers AI خارج از Worker، شناسه اکانت (Account ID) و API Token را ثبت کنید یا نسخه جدید را روی Cloudflare دیپلوی نمایید.',
+          retryable: false,
+        });
+      }
+
+      const restBase = normalizeBaseUrl(ctx.baseUrl || 'https://api.cloudflare.com/client/v4').replace(/\/accounts\/.+$/i, '');
+      const restUrl = `${restBase}/accounts/${encodeURIComponent(accountId)}/ai/run/${modelId}`;
+      const res = await fetchWithTimeout(
+        restUrl,
+        {
+          method: 'POST',
+          headers: mergeHeaders(
+            { 'Content-Type': 'application/json', Authorization: `Bearer ${ctx.apiKey}` },
+            ctx.additionalHeaders,
+          ),
+          body: JSON.stringify(payload),
+        },
+        90000,
+        input.signal,
+      );
+      if (!res.ok) {
+        throw classifyHttpError(res.status, await res.text(), ctx.apiKey, modelId);
+      }
+
+      const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || '';
+      if (contentType.includes('application/json')) {
+        const jsonBody = await res.json();
+        const decoded = await decodeCfImageOutput(jsonBody);
+        return { images: [decoded], costUsd: 0 };
+      }
+
+      const buffer = Buffer.from(await res.arrayBuffer());
+      return {
+        images: [{ buffer, ...detectImageFormat(buffer) }],
+        costUsd: 0,
       };
     }
 

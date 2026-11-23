@@ -20,6 +20,7 @@ import { runScheduledMaintenance } from './src/server/services/maintenanceServic
 import { setCloudflareBlobStore, setCloudflareR2Bucket } from './src/server/storage/storageAdapter.ts';
 import {
   runWithCloudflareRequestContext,
+  setGlobalCloudflareAiBinding,
   setGlobalCloudflareWaitUntil,
   type CloudflareRequestContext,
 } from './src/server/cloudflare/requestContext.ts';
@@ -273,7 +274,8 @@ async function syncWorkerEnvToProcessEnv(
       typeof (value as { get?: unknown }).get === 'function' &&
       key !== 'ASSETS' &&
       key !== 'MEDIA_BUCKET' &&
-      key !== 'STATE_DB'
+      key !== 'STATE_DB' &&
+      key !== 'AI'
     ) {
       // Support Cloudflare Secrets Store bindings (`await env.MY_SECRET.get()`)
       try {
@@ -291,6 +293,11 @@ async function syncWorkerEnvToProcessEnv(
   if (env.MEDIA_BUCKET) {
     setCloudflareR2Bucket(env.MEDIA_BUCKET);
     reqCtx.r2Bucket = env.MEDIA_BUCKET;
+  }
+
+  if (env.AI && typeof env.AI.run === 'function') {
+    setGlobalCloudflareAiBinding(env.AI);
+    reqCtx.aiBinding = env.AI;
   }
 
   if (env.STATE_DB) {

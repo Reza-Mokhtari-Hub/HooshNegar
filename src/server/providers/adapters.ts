@@ -8,6 +8,7 @@ import {
   resolveHuggingFaceRouterRoot,
 } from './discovery.ts';
 import type { ProviderType } from '../../shared/validation.ts';
+import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
 import { redactSecrets } from '../security/crypto.ts';
 import { SsrfProtectionError, validatePublicHttpsUrl } from '../security/ssrf.ts';
 
@@ -490,6 +491,52 @@ export const customAdapter: AIProviderAdapter = {
   },
 };
 
+export const cloudflareWorkersAiAdapter: AIProviderAdapter = {
+  type: 'cloudflare_workers_ai',
+  protocolName: 'Cloudflare Workers AI (Free Edge Inference)',
+  defaultBaseUrl: 'https://api.cloudflare.com/client/v4',
+  buildTestRequest(config) {
+    const accountId = (config.organizationId ?? '').trim();
+    const base = normalizeBaseUrl(config.baseUrl || this.defaultBaseUrl).replace(/\/accounts\/.+$/i, '');
+    const url = accountId
+      ? `${base}/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=5`
+      : `${base}/user/tokens/verify`;
+    return {
+      url,
+      method: 'GET',
+      headers: mergeSafeHeaders(
+        {
+          ...(config.apiKey.trim() ? { Authorization: `Bearer ${config.apiKey.trim()}` } : {}),
+          Accept: 'application/json',
+        },
+        config.additionalHeaders,
+      ),
+      protocol: this.protocolName,
+    };
+  },
+  parseTestResponse(status, bodyText, latencyMs, apiKey) {
+    if (status >= 200 && status < 300) {
+      return {
+        ok: true,
+        status: 'connected',
+        httpStatus: status,
+        latencyMs,
+        discoveredModelsCount: 4,
+        protocol: this.protocolName,
+        message: 'اتصال به Cloudflare Workers AI با موفقیت تأیید شد.',
+      };
+    }
+    return {
+      ok: false,
+      status: status === 429 ? 'degraded' : 'failed',
+      httpStatus: status,
+      latencyMs,
+      protocol: this.protocolName,
+      message: `خطای Cloudflare Workers AI HTTP ${status}: ${extractSafeErrorMessage(bodyText, apiKey)}`,
+    };
+  },
+};
+
 const ADAPTER_REGISTRY: Record<ProviderType, AIProviderAdapter> = {
   openai_compatible: openaiCompatibleAdapter,
   google_gemini: googleGeminiAdapter,
@@ -498,6 +545,7 @@ const ADAPTER_REGISTRY: Record<ProviderType, AIProviderAdapter> = {
   fal_ai: falAiAdapter,
   huggingface: huggingfaceAdapter,
   huggingface_space: huggingfaceSpaceAdapter,
+  cloudflare_workers_ai: cloudflareWorkersAiAdapter,
   custom: customAdapter,
 };
 
@@ -511,6 +559,31 @@ export async function testProviderConnection(
 ): Promise<ProviderTestResult> {
   const adapter = getProviderAdapter(config.providerType);
   const startedAt = Date.now();
+
+  if (config.providerType === 'cloudflare_workers_ai') {
+    if (getCloudflareAiBinding()) {
+      return {
+        ok: true,
+        status: 'connected',
+        httpStatus: 200,
+        latencyMs: Math.max(1, Date.now() - startedAt),
+        discoveredModelsCount: 4,
+        protocol: 'Cloudflare Workers AI (Native Binding)',
+        message: 'اتصال بومی به Cloudflare Workers AI فعال است (۱۰,۰۰۰ Neuron رایگان روزانه بدون نیاز به کلید API).',
+      };
+    }
+    if (!config.organizationId?.trim() || !config.apiKey.trim()) {
+      return {
+        ok: false,
+        status: 'failed',
+        httpStatus: null,
+        latencyMs: Date.now() - startedAt,
+        protocol: adapter.protocolName,
+        message:
+          'در حالت خارج از Cloudflare Worker باید شناسه اکانت (Account ID در فیلد شناسه سازمان) و API Token وارد شود؛ پس از دیپلوی روی Cloudflare بدون کلید کار می‌کند.',
+      };
+    }
+  }
 
   let effectiveConfig = config;
   let resolvedBaseUrl: string | undefined;

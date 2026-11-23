@@ -7,15 +7,21 @@ import {
   modelCapabilities,
   providerCredentials,
 } from '../../db/schema.ts';
-import { ensurePlatformReady } from '../services/bootstrap.ts';
+import {
+  ensureCloudflareWorkersAiSeeded,
+  ensurePlatformReady,
+  resetBootstrapCacheForTests,
+} from '../services/bootstrap.ts';
+import { setGlobalCloudflareAiBinding } from '../cloudflare/requestContext.ts';
 import { encryptSecret, maskSecret } from '../security/crypto.ts';
+import { testProviderConnection } from './adapters.ts';
 import {
   discoverProviderModels,
   normalizeGeminiModelId,
   normalizeGeminiRootBaseUrl,
   syncProviderModelsToDatabase,
 } from './discovery.ts';
-import { generateTextWithRoute, loadModelExecutionRoute } from './engine.ts';
+import { generateImageWithRoute, generateTextWithRoute, loadModelExecutionRoute } from './engine.ts';
 import {
   ensureTelegramUser,
   getAvailableModelsForUser,
@@ -33,6 +39,7 @@ beforeAll(async () => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  setGlobalCloudflareAiBinding(undefined);
   process.env.AI_MOCK_MODE = 'true';
 });
 
@@ -909,7 +916,8 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       generateImageWithRoute(flashRoute, { prompt: 'neon cat' }),
     ).rejects.toMatchObject({
       code: 'RATE_LIMITED',
-      userMessageFa: expect.stringMatching(/سهمیه رایگان این مدل در حساب API شما صفر است/),
+      message: expect.stringMatching(/gemini-2\.5-flash-image.*limit: 0|Quota exceeded.*limit: 0/i),
+      userMessageFa: expect.stringMatching(/limit: 0.*Cloudflare Workers AI/s),
     });
 
     const [credAfterLimitZero] = await db
@@ -1062,6 +1070,173 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       size: '1792x1024',
       n: 1,
     });
+
+    // 6. Hugging Face Router discovery also registers warm text-to-image models alongside chat LLMs
+    const hfDiscovery = await discoverProviderModels(
+      {
+        providerType: 'huggingface',
+        baseUrl: 'https://router.huggingface.co',
+        apiKey: 'hf_test_router',
+      },
+      (async (url: RequestInfo | URL) => {
+        const href = String(url);
+        if (href.includes('router.huggingface.co/v1/models')) {
+          return new Response(
+            JSON.stringify({ data: [{ id: 'Qwen/Qwen2.5-72B-Instruct' }] }),
+            { status: 200 },
+          );
+        }
+        if (href.includes('huggingface.co/api/models')) {
+          return new Response(
+            JSON.stringify([
+              { id: 'black-forest-labs/FLUX.1-schnell', pipeline_tag: 'text-to-image', tags: ['flux'] },
+            ]),
+            { status: 200 },
+          );
+        }
+        return new Response('not found', { status: 404 });
+      }) as unknown as typeof fetch,
+    );
+    expect(hfDiscovery.ok).toBe(true);
+    expect(hfDiscovery.models.some((m) => m.modelIdentifier === 'Qwen/Qwen2.5-72B-Instruct')).toBe(true);
+    const fluxDisc = hfDiscovery.models.find((m) => m.modelIdentifier === 'black-forest-labs/FLUX.1-schnell');
+    expect(fluxDisc?.category).toBe('image');
+    expect(fluxDisc?.capabilities).toContain('image_generation');
+  });
+
+  it('auto-seeds free Cloudflare Workers AI image models and executes FLUX.1 Schnell, SDXL Lightning, and Llama via native env.AI binding without API keys', async () => {
+    const db = getDb();
+    process.env.AI_MOCK_MODE = 'false';
+
+    const calls: Array<{ model: string; inputs: Record<string, unknown> }> = [];
+    const jpegHeaderBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+    const pngHeaderBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]);
+
+    setGlobalCloudflareAiBinding({
+      async run(model, inputs) {
+        calls.push({ model, inputs });
+        if (model === '@cf/black-forest-labs/flux-1-schnell') {
+          return { image: jpegHeaderBytes.toString('base64') };
+        }
+        if (model === '@cf/bytedance/stable-diffusion-xl-lightning') {
+          return new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(pngHeaderBytes));
+              controller.close();
+            },
+          });
+        }
+        if (model === '@cf/meta/llama-3.3-70b-instruct-fp8-fast') {
+          return { response: 'پاسخ رایگان از کلودفلر' };
+        }
+        throw new Error(`Unexpected model: ${model}`);
+      },
+    });
+
+    // Clear any existing default image models so auto-seed sets FLUX.1 Schnell as default
+    await db.update(aiModels).set({ isDefault: false }).where(eq(aiModels.category, 'image'));
+    resetBootstrapCacheForTests();
+    await ensureCloudflareWorkersAiSeeded();
+
+    // 1. Verify connection test and model discovery succeed natively with zero keys
+    const testRes = await testProviderConnection({
+      providerType: 'cloudflare_workers_ai',
+      baseUrl: 'https://api.cloudflare.com/client/v4',
+      apiKey: '',
+    });
+    expect(testRes.ok).toBe(true);
+    expect(testRes.status).toBe('connected');
+    expect(testRes.protocol).toContain('Native Binding');
+
+    const discRes = await discoverProviderModels({
+      providerType: 'cloudflare_workers_ai',
+      baseUrl: 'https://api.cloudflare.com/client/v4',
+      apiKey: '',
+    });
+    expect(discRes.ok).toBe(true);
+    expect(discRes.models.length).toBeGreaterThanOrEqual(4);
+
+    // 2. Verify provider & 3 free image models were auto-seeded with FLUX.1 Schnell prioritized
+    const [cfProvider] = await db
+      .select()
+      .from(aiProviders)
+      .where(eq(aiProviders.providerType, 'cloudflare_workers_ai'))
+      .limit(1);
+    expect(cfProvider).toBeTruthy();
+    expect(cfProvider?.isActive).toBe(true);
+
+    const seededModels = await db
+      .select()
+      .from(aiModels)
+      .where(eq(aiModels.providerId, cfProvider!.id));
+    const fluxModel = seededModels.find((m) => m.modelIdentifier === '@cf/black-forest-labs/flux-1-schnell');
+    const sdxlModel = seededModels.find(
+      (m) => m.modelIdentifier === '@cf/bytedance/stable-diffusion-xl-lightning',
+    );
+    expect(fluxModel).toBeTruthy();
+    expect(fluxModel?.isDefault).toBe(true);
+    expect(fluxModel?.priority).toBe(15);
+    expect(sdxlModel).toBeTruthy();
+
+    // 3. Execute FLUX.1 Schnell (JSON base64 JPEG output) with zero stored credentials
+    const fluxRoute = await loadModelExecutionRoute(fluxModel!.id);
+    const fluxOut = await generateImageWithRoute(fluxRoute, {
+      prompt: 'یک قلعه ایرانی در کویر',
+      aspectRatio: '1:1',
+    });
+    expect(fluxOut.result.images[0]?.mimeType).toBe('image/jpeg');
+    expect(fluxOut.result.images[0]?.extension).toBe('jpg');
+    expect(fluxOut.result.images[0]?.buffer.equals(jpegHeaderBytes)).toBe(true);
+    expect(calls[0]).toEqual({
+      model: '@cf/black-forest-labs/flux-1-schnell',
+      inputs: { prompt: 'یک قلعه ایرانی در کویر', steps: 4 },
+    });
+
+    // 4. Execute SDXL Lightning (ReadableStream PNG binary output + 16:9 dimensions)
+    const sdxlRoute = await loadModelExecutionRoute(sdxlModel!.id);
+    const sdxlOut = await generateImageWithRoute(sdxlRoute, {
+      prompt: 'غروب خلیج فارس',
+      aspectRatio: '16:9',
+    });
+    expect(sdxlOut.result.images[0]?.mimeType).toBe('image/png');
+    expect(sdxlOut.result.images[0]?.extension).toBe('png');
+    expect(sdxlOut.result.images[0]?.buffer.equals(pngHeaderBytes)).toBe(true);
+    expect(calls[1]).toEqual({
+      model: '@cf/bytedance/stable-diffusion-xl-lightning',
+      inputs: { prompt: 'غروب خلیج فارس', width: 1024, height: 576 },
+    });
+
+    // 5. Execute Llama 3.3 70B text chat via native binding
+    const [llamaModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: cfProvider!.id,
+        name: 'Llama 3.3 70B',
+        modelIdentifier: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+        category: 'llm',
+        isActive: true,
+      })
+      .returning();
+    await db
+      .insert(modelCapabilities)
+      .values({ modelId: llamaModel!.id, capability: 'chat' });
+
+    const llamaRoute = await loadModelExecutionRoute(llamaModel!.id);
+    const llamaOut = await generateTextWithRoute(llamaRoute, {
+      systemPrompt: 'به فارسی جواب بده',
+      messages: [{ role: 'user', content: 'سلام' }],
+    });
+    expect(llamaOut.result.text).toBe('پاسخ رایگان از کلودفلر');
+
+    // 6. Outside Worker without binding or Account ID+Token, testProviderConnection gives clear guidance
+    setGlobalCloudflareAiBinding(undefined);
+    const noBindTest = await testProviderConnection({
+      providerType: 'cloudflare_workers_ai',
+      baseUrl: 'https://api.cloudflare.com/client/v4',
+      apiKey: '',
+    });
+    expect(noBindTest.ok).toBe(false);
+    expect(noBindTest.message).toContain('Account ID');
   });
 });
 

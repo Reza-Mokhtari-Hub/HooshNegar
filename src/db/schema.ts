@@ -42,6 +42,7 @@ export const providerTypeEnum = pgEnum('provider_type', [
   'fal_ai',
   'huggingface',
   'huggingface_space',
+  'cloudflare_workers_ai',
   'custom',
 ]);
 

@@ -23,6 +23,7 @@ import {
   type SyncModelsResult,
 } from '../providers/discovery.ts';
 import { recordAuditLog } from '../security/audit.ts';
+import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
 import { SsrfProtectionError, validatePublicHttpsUrl } from '../security/ssrf.ts';
 import {
   getClientIp,
@@ -726,7 +727,11 @@ export function createProviderRouter(): Router {
         const bestCred =
           activeCreds.find((c) => isCredentialHealthy(c, nowMs)) ?? activeCreds[0] ?? null;
 
-        if (!bestCred && provider.providerType !== 'huggingface_space') {
+        const isKeylessAllowed =
+          provider.providerType === 'huggingface_space' ||
+          (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
+
+        if (!bestCred && !isKeylessAllowed) {
           res.status(400).json({
             error: 'هیچ کلید API فعالی برای این ارائه‌دهنده ثبت نشده است.',
             code: 'NO_ACTIVE_CREDENTIAL',
@@ -987,7 +992,11 @@ export function createProviderRouter(): Router {
         const nowMs = Date.now();
         const cred = creds.find((c) => isCredentialHealthy(c, nowMs)) ?? creds[0] ?? null;
 
-        if (!cred && provider.providerType !== 'huggingface_space') {
+        const isKeylessAllowed =
+          provider.providerType === 'huggingface_space' ||
+          (provider.providerType === 'cloudflare_workers_ai' && Boolean(getCloudflareAiBinding()));
+
+        if (!cred && !isKeylessAllowed) {
           res.status(400).json({
             error: 'هیچ کلید API فعالی برای این ارائه‌دهنده ثبت نشده است.',
             code: 'NO_ACTIVE_CREDENTIAL',

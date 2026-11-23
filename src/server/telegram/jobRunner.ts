@@ -850,7 +850,7 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
       aiErr.httpStatus ? `HTTP ${aiErr.httpStatus}` : '',
       aiErr.message,
     ].filter(Boolean);
-    const diagnosticHint = redactSecrets(diagParts.join(' • ')).slice(0, 180);
+    const diagnosticHint = redactSecrets(diagParts.join(' • ')).slice(0, 280);
 
     await sendSafeErrorToChat(
       api,
