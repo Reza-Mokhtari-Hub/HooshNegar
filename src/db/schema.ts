@@ -262,6 +262,7 @@ export interface TelegramUserBotState {
     aspectRatio?: string;
     quality?: string;
     sourceFileId?: string;
+    sourceImageMimeType?: string;
   };
   audioParams?: {
     voice?: string;

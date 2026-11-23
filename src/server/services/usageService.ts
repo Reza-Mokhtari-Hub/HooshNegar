@@ -755,7 +755,7 @@ export async function refundFailedRequest(params: {
         creditsCharged: '0',
         latencyMs: params.latencyMs ?? null,
         errorCode: params.errorCode,
-        errorMessage: redactSecrets(params.errorMessage).slice(0, 500),
+        errorMessage: redactSecrets(params.errorMessage).slice(0, 2000),
         completedAt: now,
       })
       .where(eq(aiRequests.id, reqRow.id));
@@ -765,7 +765,7 @@ export async function refundFailedRequest(params: {
         .update(generationJobs)
         .set({
           status: targetStatus,
-          errorMessage: redactSecrets(params.errorMessage).slice(0, 500),
+          errorMessage: redactSecrets(params.errorMessage).slice(0, 2000),
           finishedAt: now,
           updatedAt: now,
         })

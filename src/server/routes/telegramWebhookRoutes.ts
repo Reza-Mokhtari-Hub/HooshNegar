@@ -13,6 +13,7 @@ import {
 } from '../queue/qstash.ts';
 import { processTelegramUpdate } from '../telegram/bot.ts';
 import {
+  executeMediaPollJob,
   executeQueuedGenerationJob,
   executeVideoPollJob,
 } from '../telegram/jobRunner.ts';
@@ -33,7 +34,7 @@ function constantTimeStringEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-async function dispatchJobPayload(payload: QueuedJobPayload): Promise<void> {
+export async function dispatchJobPayload(payload: QueuedJobPayload): Promise<void> {
   const db = getDb();
 
   if (payload.kind === 'telegram_update' && payload.update) {
@@ -72,6 +73,11 @@ async function dispatchJobPayload(payload: QueuedJobPayload): Promise<void> {
 
   if (payload.kind === 'ai_generation_job' && payload.jobId) {
     await executeQueuedGenerationJob(payload.jobId);
+    return;
+  }
+
+  if (payload.kind === 'media_poll_job' && payload.jobId) {
+    await executeMediaPollJob(payload.jobId);
     return;
   }
 
@@ -329,11 +335,14 @@ export function createTelegramWebhookRouter(): Router {
         res.status(400).json({ ok: false, error: 'Missing jobId' });
         return;
       }
-      const result = await executeVideoPollJob(payload.jobId);
+      const result =
+        payload.kind === 'media_poll_job'
+          ? await executeMediaPollJob(payload.jobId)
+          : await executeVideoPollJob(payload.jobId);
       res.json({ ok: true, result });
     } catch (err) {
       console.error('[jobs/poll]', redactSecrets(err instanceof Error ? err.message : 'unknown'));
-      res.status(500).json({ ok: false, error: 'Video poll failed' });
+      res.status(500).json({ ok: false, error: 'Poll execution failed' });
     }
   });
 

@@ -1275,43 +1275,61 @@ export function createTelegramBotInstance(botToken: string): Bot {
   // =========================================================================
   // PHOTO HANDLER (Image Edit / Variation / Image-to-Video / Vision)
   // =========================================================================
-  bot.on('message:photo', async (ctx) => {
-    const ensured = await resolveContextUser(ctx);
-    if (!ensured) return;
-    const photos = ctx.message.photo;
-    const largest = photos[photos.length - 1];
-    if (!largest) return;
+  async function handleIncomingImageFile(params: {
+    ctx: Context;
+    ensured: EnsuredTelegramUser;
+    fileId: string;
+    mimeType: string;
+    caption: string;
+    fileName?: string;
+  }): Promise<boolean> {
+    const { ctx, ensured, fileId, mimeType, caption } = params;
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.message?.message_id;
+    if (!chatId || !messageId) return false;
 
-    const caption = (ctx.message.caption ?? '').trim();
     const mode = ensured.telegramAccount.botState.mode ?? 'chat';
 
-    if (mode === 'image_edit_photo') {
-      const curImg = { ...(ensured.telegramAccount.botState.imageParams ?? {}), sourceFileId: largest.file_id, sourceMimeType: 'image/jpeg' };
+    if (
+      mode === 'image_edit_photo' ||
+      mode === 'image_edit_prompt' ||
+      mode === 'image_prompt'
+    ) {
+      const curImg = {
+        ...(ensured.telegramAccount.botState.imageParams ?? {}),
+        sourceFileId: fileId,
+        sourceMimeType: mimeType,
+      };
       if (!caption) {
         await updateTelegramUserState(ensured.telegramAccount.id, {
           mode: 'image_edit_prompt',
           imageParams: curImg,
         });
-        await ctx.reply('✏️ تصویر دریافت شد! اکنون دستور ویرایش مورد نظر خود را بنویسید:');
-        return;
+        await ctx.reply(
+          '✏️ تصویر دریافت شد! اکنون دستور ویرایش مورد نظر خود را بنویسید (مثلاً: پس‌زمینه را غروب آفتاب کن):',
+        );
+        return true;
       }
-      await updateTelegramUserState(ensured.telegramAccount.id, { mode: 'image_prompt', imageParams: curImg });
+      await updateTelegramUserState(ensured.telegramAccount.id, {
+        mode: 'image_prompt',
+        imageParams: curImg,
+      });
       await enqueueAiJobFromContext({
         ctx,
         ensured,
         capability: 'image_editing',
         promptPreview: caption,
-        idempotencyKey: `tgmsg:${ctx.chat.id}:${ctx.message.message_id}`,
+        idempotencyKey: `tgmsg:${chatId}:${messageId}`,
         jobPayload: {
           prompt: caption,
-          sourceFileId: largest.file_id,
-          sourceMimeType: 'image/jpeg',
+          sourceFileId: fileId,
+          sourceMimeType: mimeType,
           aspectRatio: curImg.aspectRatio ?? '1:1',
           resolution: curImg.resolution ?? '1K',
         },
         statusText: '🪄 در حال ویرایش تصویر با هوش مصنوعی...',
       });
-      return;
+      return true;
     }
 
     if (mode === 'image_variation_photo') {
@@ -1322,46 +1340,77 @@ export function createTelegramBotInstance(botToken: string): Bot {
         ensured,
         capability: 'image_variation',
         promptPreview: caption || 'ایجاد نسخه مشابه از تصویر',
-        idempotencyKey: `tgmsg:${ctx.chat.id}:${ctx.message.message_id}`,
+        idempotencyKey: `tgmsg:${chatId}:${messageId}`,
         jobPayload: {
           prompt: caption || 'ایجاد نسخه مشابه خلاقانه از تصویر',
-          sourceFileId: largest.file_id,
-          sourceMimeType: 'image/jpeg',
+          sourceFileId: fileId,
+          sourceMimeType: mimeType,
           aspectRatio: curImg.aspectRatio ?? '1:1',
         },
         statusText: '🔁 در حال تولید نسخه مشابه از تصویر...',
       });
-      return;
+      return true;
     }
 
-    if (mode === 'video_image_photo') {
-      const curVid = { ...(ensured.telegramAccount.botState.videoParams ?? {}), sourceFileId: largest.file_id };
+    if (mode === 'video_image_photo' || mode === 'video_image_prompt') {
+      const curVid = {
+        ...(ensured.telegramAccount.botState.videoParams ?? {}),
+        sourceFileId: fileId,
+        sourceImageMimeType: mimeType,
+      };
       if (!caption) {
         await updateTelegramUserState(ensured.telegramAccount.id, {
           mode: 'video_image_prompt',
           videoParams: curVid,
         });
         await ctx.reply('🎬 تصویر دریافت شد! اکنون توضیح حرکت و صحنه ویدیو را بنویسید:');
-        return;
+        return true;
       }
-      await updateTelegramUserState(ensured.telegramAccount.id, { mode: 'video_prompt', videoParams: curVid });
+      await updateTelegramUserState(ensured.telegramAccount.id, {
+        mode: 'video_prompt',
+        videoParams: curVid,
+      });
       await enqueueAiJobFromContext({
         ctx,
         ensured,
         capability: 'video_generation',
         promptPreview: caption,
-        idempotencyKey: `tgmsg:${ctx.chat.id}:${ctx.message.message_id}`,
+        idempotencyKey: `tgmsg:${chatId}:${messageId}`,
         jobPayload: {
           prompt: caption,
-          sourceFileId: largest.file_id,
+          sourceFileId: fileId,
+          sourceImageMimeType: mimeType,
           durationSeconds: curVid.durationSeconds ?? 5,
           aspectRatio: curVid.aspectRatio ?? '16:9',
           quality: curVid.quality ?? '720p',
         },
         statusText: '🎬 در حال ارسال تصویر برای تولید ویدیو...',
       });
-      return;
+      return true;
     }
+
+    return false;
+  }
+
+  bot.on('message:photo', async (ctx) => {
+    const ensured = await resolveContextUser(ctx);
+    if (!ensured) return;
+    const photos = ctx.message.photo;
+    const largest = photos[photos.length - 1];
+    if (!largest) return;
+
+    const caption = (ctx.message.caption ?? '').trim();
+    const handledInStudioMode = await handleIncomingImageFile({
+      ctx,
+      ensured,
+      fileId: largest.file_id,
+      mimeType: 'image/jpeg',
+      caption,
+      fileName: 'photo.jpg',
+    });
+    if (handledInStudioMode) return;
+
+    const mode = ensured.telegramAccount.botState.mode ?? 'chat';
 
     // Default: Vision / Document image analysis
     const conv = await getOrCreateActiveConversation({
@@ -1388,26 +1437,53 @@ export function createTelegramBotInstance(botToken: string): Bot {
   });
 
   // =========================================================================
-  // DOCUMENT HANDLER (Safe PDF / DOCX / TXT / CSV / Image Analysis)
+  // DOCUMENT HANDLER (Uncompressed Image Edit/Video OR Safe PDF / DOCX / TXT / CSV)
   // =========================================================================
   bot.on('message:document', async (ctx) => {
     const ensured = await resolveContextUser(ctx);
     if (!ensured) return;
     const doc = ctx.message.document;
+    const rawCaption = (ctx.message.caption ?? '').trim();
+    const fileName = doc.file_name ?? 'document.bin';
+    const rawMime = (doc.mime_type ?? '').trim().toLowerCase();
+    const isImageDoc =
+      rawMime.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(fileName);
+
+    if (isImageDoc) {
+      const inferredMime =
+        rawMime && rawMime.startsWith('image/')
+          ? rawMime
+          : /\.png$/i.test(fileName)
+            ? 'image/png'
+            : /\.webp$/i.test(fileName)
+              ? 'image/webp'
+              : 'image/jpeg';
+
+      const handledInStudioMode = await handleIncomingImageFile({
+        ctx,
+        ensured,
+        fileId: doc.file_id,
+        mimeType: inferredMime,
+        caption: rawCaption,
+        fileName,
+      });
+      if (handledInStudioMode) return;
+    }
+
     const caption =
-      (ctx.message.caption ?? '').trim() ||
+      rawCaption ||
       'این سند را به صورت ساختارمند خلاصه کن و نکات کلیدی آن را به فارسی استخراج کن.';
 
     await enqueueAiJobFromContext({
       ctx,
       ensured,
       capability: 'document_analysis',
-      promptPreview: `${doc.file_name ?? 'document'}: ${caption}`,
+      promptPreview: `${fileName}: ${caption}`,
       idempotencyKey: `tgmsg:${ctx.chat.id}:${ctx.message.message_id}`,
       jobPayload: {
         prompt: caption,
         telegramFileId: doc.file_id,
-        fileName: doc.file_name ?? 'document.bin',
+        fileName,
         mimeType: doc.mime_type,
       },
       statusText: `📁 در حال بررسی امنیتی و تحلیل فایل «${doc.file_name ?? 'سند'}»...`,
@@ -1587,6 +1663,7 @@ export function createTelegramBotInstance(botToken: string): Bot {
         jobPayload: {
           prompt: text,
           sourceFileId: vidParams.sourceFileId,
+          sourceImageMimeType: vidParams.sourceImageMimeType ?? 'image/jpeg',
           durationSeconds: vidParams.durationSeconds ?? 5,
           aspectRatio: vidParams.aspectRatio ?? '16:9',
           quality: vidParams.quality ?? '720p',
@@ -1667,7 +1744,6 @@ export function createTelegramBotInstance(botToken: string): Bot {
     } catch {
       // ignore delivery failure
     }
-    throw err.error ?? err;
   });
 
   return bot;

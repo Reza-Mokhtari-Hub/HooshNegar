@@ -4,6 +4,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { httpServerHandler, type HttpServerHandler } from 'cloudflare:node';
 import type {
   CloudflareExecutionContext,
+  CloudflareQueueBatch,
   CloudflareScheduledController,
   CloudflareWorkerEnv,
 } from './src/cloudflare-env.d.ts';
@@ -15,6 +16,11 @@ import {
   translatePgQueryToSqlite,
 } from './src/db/pgToSqliteTranslator.ts';
 import { createApiApp } from './src/server/app.ts';
+import {
+  dispatchJobPayload,
+  initBackgroundJobProcessor,
+} from './src/server/routes/telegramWebhookRoutes.ts';
+import type { QueuedJobPayload } from './src/server/queue/qstash.ts';
 import { ensurePlatformReady } from './src/server/services/bootstrap.ts';
 import { runScheduledMaintenance } from './src/server/services/maintenanceService.ts';
 import {
@@ -28,6 +34,7 @@ import {
 import {
   runWithCloudflareRequestContext,
   setGlobalCloudflareAiBinding,
+  setGlobalCloudflareJobQueue,
   setGlobalCloudflareWaitUntil,
   type CloudflareRequestContext,
 } from './src/server/cloudflare/requestContext.ts';
@@ -330,7 +337,8 @@ async function syncWorkerEnvToProcessEnv(
       key !== 'ASSETS' &&
       key !== 'MEDIA_BUCKET' &&
       key !== 'STATE_DB' &&
-      key !== 'AI'
+      key !== 'AI' &&
+      key !== 'JOB_QUEUE'
     ) {
       // Support Cloudflare Secrets Store bindings (`await env.MY_SECRET.get()`)
       try {
@@ -353,6 +361,11 @@ async function syncWorkerEnvToProcessEnv(
   if (env.AI && typeof env.AI.run === 'function') {
     setGlobalCloudflareAiBinding(env.AI);
     reqCtx.aiBinding = env.AI;
+  }
+
+  if (env.JOB_QUEUE && typeof env.JOB_QUEUE.send === 'function') {
+    setGlobalCloudflareJobQueue(env.JOB_QUEUE);
+    reqCtx.jobQueue = env.JOB_QUEUE;
   }
 
   if (env.STATE_DB) {
@@ -443,5 +456,33 @@ export default {
         console.log('[cloudflare:cron] Maintenance sweep completed:', JSON.stringify(result));
       }),
     );
+  },
+
+  async queue(
+    batch: CloudflareQueueBatch<QueuedJobPayload>,
+    env: CloudflareWorkerEnv,
+    ctx: CloudflareExecutionContext,
+  ): Promise<void> {
+    const waitUntilFn = (promise: Promise<unknown>) => {
+      ctx.waitUntil(promise);
+    };
+    const reqCtx = await syncWorkerEnvToProcessEnv(env, undefined, waitUntilFn);
+    initBackgroundJobProcessor();
+
+    await runWithCloudflareRequestContext(reqCtx, async () => {
+      await ensurePlatformReady();
+      for (const msg of batch.messages) {
+        try {
+          await dispatchJobPayload(msg.body);
+          msg.ack();
+        } catch (err) {
+          console.error(
+            `[cloudflare:queue] Failed processing ${msg.body?.kind ?? 'unknown'} (${msg.body?.jobId ?? msg.id}):`,
+            err instanceof Error ? err.message : 'unknown',
+          );
+          msg.retry({ delaySeconds: 15 });
+        }
+      }
+    });
   },
 };

@@ -66,10 +66,37 @@ export interface CloudflareAiBinding {
   run(model: string, inputs: Record<string, unknown>): Promise<unknown>;
 }
 
+export interface CloudflareQueueSendOptions {
+  delaySeconds?: number;
+  contentType?: 'json' | 'text' | 'bytes' | 'v8';
+}
+
+export interface CloudflareQueueBinding<T = unknown> {
+  send(message: T, options?: CloudflareQueueSendOptions): Promise<void>;
+  sendBatch?(messages: Array<{ body: T; delaySeconds?: number }>): Promise<void>;
+}
+
+export interface CloudflareQueueMessage<T = unknown> {
+  readonly id: string;
+  readonly timestamp: Date;
+  readonly body: T;
+  readonly attempts?: number;
+  ack(): void;
+  retry(options?: { delaySeconds?: number }): void;
+}
+
+export interface CloudflareQueueBatch<T = unknown> {
+  readonly queue: string;
+  readonly messages: ReadonlyArray<CloudflareQueueMessage<T>>;
+  ackAll(): void;
+  retryAll(options?: { delaySeconds?: number }): void;
+}
+
 export interface CloudflareWorkerEnv {
   ASSETS?: CloudflareFetcher;
   MEDIA_BUCKET?: CloudflareR2Bucket;
   STATE_DB?: CloudflareDurableObjectNamespace;
   AI?: CloudflareAiBinding;
+  JOB_QUEUE?: CloudflareQueueBinding;
   [key: string]: unknown;
 }

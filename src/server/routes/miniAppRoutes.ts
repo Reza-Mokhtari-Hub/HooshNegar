@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from 'express';
-import { and, asc, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 import { Api } from 'grammy';
 import { getDb } from '../../db/index.ts';
@@ -19,15 +19,20 @@ import {
   users,
 } from '../../db/schema.ts';
 import type { CapabilityType } from '../../shared/validation.ts';
-import { enqueueBackgroundJob } from '../queue/qstash.ts';
+import { enqueueBackgroundJob, hasDurableAsyncQueue } from '../queue/qstash.ts';
+import { isAiMockModeEnabled } from '../config/env.ts';
 import { redactSecrets } from '../security/crypto.ts';
 import { getStorageAdapter } from '../storage/storageAdapter.ts';
 import { redeemGiftCreditCoupon } from '../services/referralCouponService.ts';
 import { cancelSubscriptionAutoRenewal } from '../services/subscriptionService.ts';
 import { createTelegramStarsOrder } from '../services/telegramStarsService.ts';
-import { reserveCreditsAndCreateRequest, UsageGuardError } from '../services/usageService.ts';
+import { refundFailedRequest, reserveCreditsAndCreateRequest, UsageGuardError } from '../services/usageService.ts';
 import { reapStaleRunningJobs } from '../services/maintenanceService.ts';
-import { executeQueuedGenerationJob } from '../telegram/jobRunner.ts';
+import {
+  executeMediaPollJob,
+  executeQueuedGenerationJob,
+  executeVideoPollJob,
+} from '../telegram/jobRunner.ts';
 import {
   authenticateMiniAppRequest,
   loadConfiguredBotForMiniApp,
@@ -63,6 +68,7 @@ const generateBodySchema = z.object({
   ]),
   prompt: z.string().trim().max(4000).optional().default(''),
   modelId: z.string().uuid().optional().nullable(),
+  clientRequestId: z.string().trim().min(4).max(80).optional(),
   aspectRatio: z.string().trim().max(16).optional(),
   resolution: z.string().trim().max(16).optional(),
   voice: z.string().trim().max(32).optional(),
@@ -277,6 +283,29 @@ function buildMediaUrl(objectKey: string | null | undefined, sessionToken: strin
   const encodedKey = encodeURIComponent(objectKey);
   const encodedToken = encodeURIComponent(sessionToken);
   return `/api/miniapp/media?key=${encodedKey}&token=${encodedToken}`;
+}
+
+function mapMiniAppJobErrorMessage(errorCode?: string | null, status?: string): string | null {
+  if (status === 'canceled' || errorCode === 'CANCELED' || errorCode === 'ADMIN_CANCELED') {
+    return 'پردازش لغو شد و اعتبار رزروشده به کیف‌پول شما بازگردانده شد.';
+  }
+  if (status !== 'failed') return null;
+
+  switch (errorCode) {
+    case 'RATE_LIMITED':
+      return 'سرویس این مدل موقتاً با محدودیت ترافیک روبه‌رو شده است. اعتبار شما بازگردانده شد؛ لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.';
+    case 'INVALID_API_KEY':
+      return 'این مدل در حال حاضر در دسترس نیست و اعتبار شما بازگردانده شد. لطفاً مدل دیگری انتخاب کنید.';
+    case 'TIMEOUT':
+    case 'STALE_JOB_TIMEOUT':
+      return 'زمان پردازش این مدل به پایان رسید و اعتبار شما به کیف‌پول بازگردانده شد. لطفاً دوباره تلاش کنید یا مدل سریع‌تری انتخاب نمایید.';
+    case 'INVALID_PROMPT':
+      return 'متن یا تصویر ارسالی توسط مدل پذیرفته نشد و اعتبار شما بازگردانده شد. لطفاً ورودی خود را اصلاح کنید.';
+    case 'UNSUPPORTED_MEDIA':
+      return 'فرمت یا اندازه فایل ارسالی پشتیبانی نمی‌شود و اعتبار شما بازگردانده شد.';
+    default:
+      return 'امکان تکمیل این درخواست با مدل انتخابی وجود نداشت و اعتبار شما بازگردانده شد. لطفاً مدل دیگری انتخاب کنید یا دوباره تلاش نمایید.';
+  }
 }
 
 export function createMiniAppRouter(): Router {
@@ -741,7 +770,60 @@ export function createMiniAppRouter(): Router {
         jobPayload.sourceMimeType = d.sourceMimeType ?? d.mimeType ?? 'image/jpeg';
       }
 
-      const idempotencyKey = `miniapp:${d.capability}:${ensured.user.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      const promptPreview = redactSecrets(
+        d.prompt || (d.capability === 'image_variation' ? 'نسخه مشابه تصویر' : `فایل صوتی (${d.fileName ?? 'audio'})`),
+      ).slice(0, 280);
+
+      // Guard against accidental double-taps producing duplicate running jobs within 20s
+      const twentySecondsAgo = new Date(Date.now() - 20_000);
+      const [recentActive] = await db
+        .select({
+          jobId: generationJobs.id,
+          requestId: generationJobs.requestId,
+          status: generationJobs.status,
+          promptPreview: aiRequests.promptPreview,
+        })
+        .from(generationJobs)
+        .innerJoin(aiRequests, eq(generationJobs.requestId, aiRequests.id))
+        .where(
+          and(
+            eq(generationJobs.userId, ensured.user.id),
+            eq(generationJobs.capability, d.capability as CapabilityType),
+            inArray(generationJobs.status, ['queued', 'running']),
+            gte(generationJobs.createdAt, twentySecondsAgo),
+          ),
+        )
+        .orderBy(desc(generationJobs.createdAt))
+        .limit(1);
+
+      if (recentActive && (recentActive.promptPreview ?? '') === promptPreview) {
+        const [freshWallet] = await db
+          .select({ balance: creditWallets.balance, reserved: creditWallets.reservedBalance })
+          .from(creditWallets)
+          .where(eq(creditWallets.userId, ensured.user.id))
+          .limit(1);
+
+        res.json({
+          ok: true,
+          requestId: recentActive.requestId,
+          jobId: recentActive.jobId,
+          status: recentActive.status,
+          responseText: null,
+          storageObjectKey: null,
+          mediaUrl: null,
+          deduplicated: true,
+          wallet: {
+            balance: Number(freshWallet?.balance ?? ensured.walletBalance),
+            reservedBalance: Number(freshWallet?.reserved ?? ensured.reservedBalance),
+          },
+        });
+        return;
+      }
+
+      const idempotencyKey = d.clientRequestId
+        ? `miniapp:${d.capability}:${ensured.user.id}:${d.clientRequestId}`
+        : `miniapp:${d.capability}:${ensured.user.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+
       let reserved;
       try {
         reserved = await reserveCreditsAndCreateRequest({
@@ -750,7 +832,7 @@ export function createMiniAppRouter(): Router {
           capability: d.capability as CapabilityType,
           idempotencyKey,
           telegramChatId: ensured.telegramAccount.telegramChatId,
-          promptPreview: d.prompt || `فایل صوتی (${d.fileName ?? 'audio'})`,
+          promptPreview,
           jobPayload,
         });
       } catch (err) {
@@ -761,7 +843,67 @@ export function createMiniAppRouter(): Router {
         throw err;
       }
 
-      const execRes = await executeQueuedGenerationJob(reserved.jobId);
+      if (reserved.alreadyExists) {
+        const [[existingJob], [existingReq], [freshWallet]] = await Promise.all([
+          db.select().from(generationJobs).where(eq(generationJobs.id, reserved.jobId)).limit(1),
+          db
+            .select({ responsePreview: aiRequests.responsePreview, errorCode: aiRequests.errorCode })
+            .from(aiRequests)
+            .where(eq(aiRequests.id, reserved.requestId))
+            .limit(1),
+          db
+            .select({ balance: creditWallets.balance, reserved: creditWallets.reservedBalance })
+            .from(creditWallets)
+            .where(eq(creditWallets.userId, ensured.user.id))
+            .limit(1),
+        ]);
+
+        const existingStatus = existingJob?.status ?? 'running';
+        if (existingStatus === 'failed') {
+          res.status(502).json({
+            ok: false,
+            error: mapMiniAppJobErrorMessage(existingReq?.errorCode, existingStatus),
+            jobId: reserved.jobId,
+            deduplicated: true,
+            wallet: {
+              balance: Number(freshWallet?.balance ?? ensured.walletBalance),
+              reservedBalance: Number(freshWallet?.reserved ?? 0),
+            },
+          });
+          return;
+        }
+
+        res.json({
+          ok: existingStatus !== 'canceled',
+          requestId: reserved.requestId,
+          jobId: reserved.jobId,
+          status: existingStatus,
+          responseText: existingReq?.responsePreview ?? null,
+          storageObjectKey: existingJob?.storageObjectKey ?? null,
+          mediaUrl: buildMediaUrl(existingJob?.storageObjectKey, auth.sessionToken),
+          deduplicated: true,
+          wallet: {
+            balance: Number(freshWallet?.balance ?? ensured.walletBalance),
+            reservedBalance: Number(freshWallet?.reserved ?? 0),
+          },
+        });
+        return;
+      }
+
+      const maxSyncWaitMs = isAiMockModeEnabled()
+        ? undefined
+        : d.capability === 'video_generation'
+          ? 6_000
+          : d.capability === 'image_generation' ||
+              d.capability === 'image_editing' ||
+              d.capability === 'image_variation'
+            ? 10_000
+            : undefined;
+
+      const execRes = await executeQueuedGenerationJob(
+        reserved.jobId,
+        maxSyncWaitMs !== undefined ? { maxSyncWaitMs } : undefined,
+      );
       const [freshWallet] = await db
         .select({ balance: creditWallets.balance, reserved: creditWallets.reservedBalance })
         .from(creditWallets)
@@ -829,8 +971,44 @@ export function createMiniAppRouter(): Router {
         }
       }
 
+      // Active client-driven polling fallback when no durable external queue is configured (or rescue if delayed >25s)
+      if ((job.status === 'running' || job.status === 'queued') && job.providerJobId) {
+        const meta = (job.resultMetadata ?? {}) as Record<string, unknown>;
+        const lastPolledAtMs =
+          typeof meta.lastPolledAtMs === 'number'
+            ? meta.lastPolledAtMs
+            : new Date(job.updatedAt).getTime();
+        const ageSincePollMs = Date.now() - lastPolledAtMs;
+        const shouldAdvancePoll =
+          (!hasDurableAsyncQueue() && ageSincePollMs >= 2_200) || ageSincePollMs >= 25_000;
+
+        if (shouldAdvancePoll) {
+          if (job.capability === 'video_generation') {
+            await executeVideoPollJob(job.id, { scheduleNextPoll: false }).catch(() => null);
+          } else if (
+            job.capability === 'image_generation' ||
+            job.capability === 'image_editing' ||
+            job.capability === 'image_variation'
+          ) {
+            await executeMediaPollJob(job.id, {
+              maxWaitMs: 6_500,
+              scheduleNextPoll: false,
+            }).catch(() => null);
+          }
+          const [refreshed] = await db
+            .select()
+            .from(generationJobs)
+            .where(and(eq(generationJobs.id, jobId), eq(generationJobs.userId, auth.ensured.user.id)))
+            .limit(1);
+          if (refreshed) job = refreshed;
+        }
+      }
+
       const [reqRow] = await db
-        .select({ responsePreview: aiRequests.responsePreview })
+        .select({
+          responsePreview: aiRequests.responsePreview,
+          errorCode: aiRequests.errorCode,
+        })
         .from(aiRequests)
         .where(eq(aiRequests.id, job.requestId))
         .limit(1);
@@ -850,10 +1028,9 @@ export function createMiniAppRouter(): Router {
           responseText: reqRow?.responsePreview ?? null,
           storageObjectKey: job.storageObjectKey,
           mediaUrl: buildMediaUrl(job.storageObjectKey, auth.sessionToken),
-          errorMessage:
-            job.status === 'failed'
-              ? 'امکان تکمیل این درخواست با مدل انتخابی وجود نداشت. لطفاً مدل دیگری انتخاب کنید یا دوباره تلاش نمایید.'
-              : null,
+          errorCode:
+            job.status === 'failed' || job.status === 'canceled' ? reqRow?.errorCode ?? null : null,
+          errorMessage: mapMiniAppJobErrorMessage(reqRow?.errorCode, job.status),
         },
         wallet: {
           balance: Number(freshWallet?.balance ?? auth.ensured.walletBalance),
@@ -862,6 +1039,52 @@ export function createMiniAppRouter(): Router {
       });
     } catch {
       res.status(500).json({ error: 'خطا در بررسی وضعیت پردازش.' });
+    }
+  });
+
+  router.post('/jobs/:id/cancel', async (req: MiniAppRequest, res: Response) => {
+    try {
+      const auth = req.miniAppAuth!;
+      const jobId = String(req.params.id ?? '');
+      const db = getDb();
+
+      const [job] = await db
+        .select()
+        .from(generationJobs)
+        .where(and(eq(generationJobs.id, jobId), eq(generationJobs.userId, auth.ensured.user.id)))
+        .limit(1);
+
+      if (!job) {
+        res.status(404).json({ error: 'پردازش مورد نظر یافت نشد.' });
+        return;
+      }
+
+      if (job.status === 'queued' || job.status === 'running') {
+        await refundFailedRequest({
+          requestId: job.requestId,
+          jobId: job.id,
+          errorCode: 'CANCELED',
+          errorMessage: 'لغو توسط کاربر در مینی‌اپ',
+          canceled: true,
+        });
+      }
+
+      const [freshWallet] = await db
+        .select({ balance: creditWallets.balance, reserved: creditWallets.reservedBalance })
+        .from(creditWallets)
+        .where(eq(creditWallets.userId, auth.ensured.user.id))
+        .limit(1);
+
+      res.json({
+        ok: true,
+        status: job.status === 'succeeded' ? 'succeeded' : 'canceled',
+        wallet: {
+          balance: Number(freshWallet?.balance ?? auth.ensured.walletBalance),
+          reservedBalance: Number(freshWallet?.reserved ?? 0),
+        },
+      });
+    } catch {
+      res.status(500).json({ error: 'خطا در لغو پردازش.' });
     }
   });
 

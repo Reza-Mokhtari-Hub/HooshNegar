@@ -52,7 +52,11 @@ export interface ProviderExecutionContext {
   baseUrl: string;
   apiKey: string;
   credentialId?: string | null;
+  credentialLabel?: string | null;
+  maskedPreview?: string | null;
   credentialPool?: ProviderExecutionContext[];
+  attemptDeadlineAtMs?: number;
+  attemptSignal?: AbortSignal;
   organizationId?: string | null;
   additionalHeaders?: Record<string, string>;
   modelId: string;

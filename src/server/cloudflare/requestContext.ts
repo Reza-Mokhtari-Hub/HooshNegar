@@ -1,5 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { CloudflareAiBinding, CloudflareR2Bucket } from '../../cloudflare-env.d.ts';
+import type {
+  CloudflareAiBinding,
+  CloudflareQueueBinding,
+  CloudflareR2Bucket,
+} from '../../cloudflare-env.d.ts';
 
 export interface CloudflareSqlExecutor {
   execSql(
@@ -28,6 +32,7 @@ export interface CloudflareRequestContext {
   blobStore?: CloudflareBlobStore;
   r2Bucket?: CloudflareR2Bucket;
   aiBinding?: CloudflareAiBinding;
+  jobQueue?: CloudflareQueueBinding;
   waitUntil?: (promise: Promise<unknown>) => void;
   childWaitUntilTasks?: Promise<unknown>[];
   requestOrigin?: string;
@@ -37,6 +42,7 @@ declare global {
   var _hooshnegarCfRequestAls: AsyncLocalStorage<CloudflareRequestContext> | undefined;
   var _hooshnegarCfWaitUntil: ((promise: Promise<unknown>) => void) | undefined;
   var _hooshnegarCfAiBinding: CloudflareAiBinding | undefined;
+  var _hooshnegarCfJobQueue: CloudflareQueueBinding | undefined;
 }
 
 function getAls(): AsyncLocalStorage<CloudflareRequestContext> {
@@ -73,4 +79,12 @@ export function setGlobalCloudflareAiBinding(aiBinding: CloudflareAiBinding | un
 
 export function getCloudflareAiBinding(): CloudflareAiBinding | undefined {
   return getCloudflareRequestContext()?.aiBinding ?? global._hooshnegarCfAiBinding;
+}
+
+export function setGlobalCloudflareJobQueue(jobQueue: CloudflareQueueBinding | undefined): void {
+  global._hooshnegarCfJobQueue = jobQueue;
+}
+
+export function getCloudflareJobQueue(): CloudflareQueueBinding | undefined {
+  return getCloudflareRequestContext()?.jobQueue ?? global._hooshnegarCfJobQueue;
 }

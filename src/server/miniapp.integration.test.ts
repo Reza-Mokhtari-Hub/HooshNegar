@@ -15,6 +15,7 @@ import {
 } from '../db/schema.ts';
 import { createApiApp } from './app.ts';
 import { ensurePlatformReady } from './services/bootstrap.ts';
+import { reserveCreditsAndCreateRequest, refundFailedRequest } from './services/usageService.ts';
 import { encryptSecret, maskSecret } from './security/crypto.ts';
 import { signTelegramWebAppInitDataForTests } from './telegram/miniAppAuth.ts';
 
@@ -129,6 +130,8 @@ beforeAll(async () => {
 
   await db.insert(modelCapabilities).values([
     { modelId: imgModel!.id, capability: 'image_generation' },
+    { modelId: imgModel!.id, capability: 'image_editing' },
+    { modelId: imgModel!.id, capability: 'image_variation' },
   ]);
 
   await db.insert(coupons).values({
@@ -306,5 +309,94 @@ describe('Telegram Mini App End-to-End API Integration', () => {
       .from(supportTickets)
       .where(eq(supportTickets.userId, String(userObj.id)));
     expect(tickets.length).toBe(1);
+
+    // 7) Execute image_editing with clientRequestId and verify idempotent replay does not double-charge
+    const editClientReqId = 'req-edit-idem-001';
+    const sampleImgBase64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+    const editRes = await httpRequest('/api/miniapp/generate', {
+      method: 'POST',
+      headers: authHeaders,
+      body: {
+        capability: 'image_editing',
+        prompt: 'پس‌زمینه را طلایی کن',
+        sourceImageBase64: sampleImgBase64,
+        sourceMimeType: 'image/png',
+        aspectRatio: '1:1',
+        clientRequestId: editClientReqId,
+      },
+    });
+    expect(editRes.status).toBe(200);
+    expect(editRes.json.ok).toBe(true);
+    expect(String(editRes.json.mediaUrl ?? '')).toContain('/api/miniapp/media?key=');
+    expect((editRes.json.wallet as { balance: number }).balance).toBe(55);
+
+    const replayRes = await httpRequest('/api/miniapp/generate', {
+      method: 'POST',
+      headers: authHeaders,
+      body: {
+        capability: 'image_editing',
+        prompt: 'پس‌زمینه را طلایی کن',
+        sourceImageBase64: sampleImgBase64,
+        sourceMimeType: 'image/png',
+        aspectRatio: '1:1',
+        clientRequestId: editClientReqId,
+      },
+    });
+    expect(replayRes.status).toBe(200);
+    expect(replayRes.json.deduplicated).toBe(true);
+    expect(replayRes.json.jobId).toBe(editRes.json.jobId);
+    expect((replayRes.json.wallet as { balance: number }).balance).toBe(55);
+
+    // 8) Reserve a job, cancel it via /api/miniapp/jobs/:id/cancel -> credits refunded cleanly
+    const [activeImgModel] = await db
+      .select({ id: aiModels.id })
+      .from(aiModels)
+      .where(eq(aiModels.modelIdentifier, 'imagen-3.0-fast-generate-001'))
+      .limit(1);
+    const pendingReservation = await reserveCreditsAndCreateRequest({
+      userId: String(userObj.id),
+      modelId: activeImgModel!.id,
+      capability: 'image_editing',
+      idempotencyKey: `miniapp:cancel-test:${Date.now()}`,
+      promptPreview: 'تست لغو پردازش',
+      jobPayload: { prompt: 'cancel me', silentDelivery: true },
+    });
+
+    const cancelRes = await httpRequest(`/api/miniapp/jobs/${pendingReservation.jobId}/cancel`, {
+      method: 'POST',
+      headers: authHeaders,
+    });
+    expect(cancelRes.status).toBe(200);
+    expect(cancelRes.json.ok).toBe(true);
+    expect(cancelRes.json.status).toBe('canceled');
+    expect((cancelRes.json.wallet as { balance: number; reservedBalance: number }).balance).toBe(55);
+    expect((cancelRes.json.wallet as { balance: number; reservedBalance: number }).reservedBalance).toBe(0);
+
+    // 9) Reserve and mark a job failed with internal multi-key trace -> GET /jobs/:id maps clean Persian error
+    const failReservation = await reserveCreditsAndCreateRequest({
+      userId: String(userObj.id),
+      modelId: activeImgModel!.id,
+      capability: 'image_editing',
+      idempotencyKey: `miniapp:fail-map-test:${Date.now()}`,
+      promptPreview: 'تست نمایش خطای تمیز',
+      jobPayload: { prompt: 'fail me', silentDelivery: true },
+    });
+    await refundFailedRequest({
+      requestId: failReservation.requestId,
+      jobId: failReservation.jobId,
+      errorCode: 'RATE_LIMITED',
+      errorMessage: '#1 [HF Space · key-a · HTTP 429]: quota exhausted | #2 [HF Space · key-b · TIMEOUT]: aborted',
+    });
+
+    const jobPollRes = await httpRequest(`/api/miniapp/jobs/${failReservation.jobId}`, {
+      headers: authHeaders,
+    });
+    expect(jobPollRes.status).toBe(200);
+    const polledJob = jobPollRes.json.job as { status: string; errorCode: string; errorMessage: string };
+    expect(polledJob.status).toBe('failed');
+    expect(polledJob.errorCode).toBe('RATE_LIMITED');
+    expect(polledJob.errorMessage).toContain('محدودیت ترافیک');
+    expect(polledJob.errorMessage).not.toContain('#1 [');
+    expect(polledJob.errorMessage).not.toContain('key-a');
   });
 });

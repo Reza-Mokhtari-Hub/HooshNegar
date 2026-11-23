@@ -26,6 +26,7 @@ interface BotMonitorResponse {
   };
   infrastructure: {
     qstashConfigured: boolean;
+    cfQueueConfigured?: boolean;
     r2Configured: boolean;
     aiMockMode: boolean;
     databaseMode: string;
@@ -159,7 +160,7 @@ export function BotMonitorSection({ locale }: { locale: Locale }) {
           <Radio className="w-4 h-4 text-blue-700 dark:text-blue-400" />
           <span>{locale === 'fa' ? 'آمادگی زیرساخت فاز ۲' : 'Phase 2 Infrastructure Readiness'}</span>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 text-xs">
           <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800">
             <div className="text-slate-500">{locale === 'fa' ? 'وضعیت ربات تلگرام' : 'Telegram Bot'}</div>
             <div className="mt-1.5 flex items-center justify-between gap-2">
@@ -189,8 +190,23 @@ export function BotMonitorSection({ locale }: { locale: Locale }) {
                     ? 'متصل (تأیید امضا فعال)'
                     : 'Connected (Signed)'
                   : locale === 'fa'
-                    ? 'صف محلی ناهمگام (توسعه)'
-                    : 'Local Async Queue (Dev)'}
+                    ? 'تنظیم نشده'
+                    : 'Not Configured'}
+              </StatusText>
+            </div>
+          </div>
+
+          <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800">
+            <div className="text-slate-500">{locale === 'fa' ? 'صف Cloudflare Queue' : 'Cloudflare Queue'}</div>
+            <div className="mt-1.5">
+              <StatusText tone={data?.infrastructure.cfQueueConfigured ? 'success' : 'neutral'}>
+                {data?.infrastructure.cfQueueConfigured
+                  ? locale === 'fa'
+                    ? 'متصل (JOB_QUEUE فعال)'
+                    : 'Connected (JOB_QUEUE)'
+                  : locale === 'fa'
+                    ? 'متصل نیست (اختیاری)'
+                    : 'Unbound (Optional)'}
               </StatusText>
             </div>
           </div>

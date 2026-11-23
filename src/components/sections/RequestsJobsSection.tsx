@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, RotateCcw, XCircle } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Copy, RefreshCw, RotateCcw, XCircle } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
 import { DICTIONARIES, formatDateTime, formatNumber, type Locale } from '../../i18n';
 import type { CapabilityType } from '../../shared/validation';
@@ -36,6 +36,7 @@ interface GenerationJobItem {
   maxAttempts: number;
   providerJobId: string | null;
   storageObjectKey: string | null;
+  errorCode?: string | null;
   errorMessage: string | null;
   createdAt: string;
   finishedAt: string | null;
@@ -49,6 +50,109 @@ function statusTone(status: string): 'success' | 'warning' | 'danger' | 'neutral
   if (status === 'failed') return 'danger';
   if (status === 'running' || status === 'queued') return 'warning';
   return 'neutral';
+}
+
+function formatDiagnosticLines(message: string): string {
+  return message
+    .replace(/^(Failed after \d+ key\/attempt\(s\):)\s*(#\d+)/, '$1\n$2')
+    .replace(/\s+\|\s+/g, '\n');
+}
+
+function ErrorDiagnosticBox({
+  errorCode,
+  errorMessage,
+  locale,
+  defaultExpanded = false,
+}: {
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  locale: Locale;
+  defaultExpanded?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [copied, setCopied] = useState(false);
+
+  if (!errorCode && !errorMessage) return null;
+
+  const formatted = errorMessage ? formatDiagnosticLines(errorMessage) : '';
+  const isLong = formatted.length > 90 || formatted.includes('\n');
+
+  const handleCopy = async () => {
+    const payload = [errorCode ? `[${errorCode}]` : '', formatted].filter(Boolean).join('\n');
+    try {
+      await navigator.clipboard.writeText(payload);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Ignore clipboard failure
+    }
+  };
+
+  return (
+    <div className="mt-1.5 space-y-1 max-w-md">
+      <div className="flex flex-wrap items-center gap-2">
+        {errorCode && (
+          <span
+            dir="ltr"
+            className="inline-block font-mono text-[11px] font-semibold text-red-700 dark:text-red-400"
+          >
+            {errorCode}
+          </span>
+        )}
+        {formatted && (
+          <>
+            {isLong && (
+              <button
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((v) => !v)}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-blue-700 dark:text-blue-400 hover:underline cursor-pointer"
+              >
+                {expanded ? (
+                  <>
+                    <ChevronUp className="w-3 h-3" />
+                    <span>{locale === 'fa' ? 'بستن جزئیات' : 'Hide trace'}</span>
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="w-3 h-3" />
+                    <span>{locale === 'fa' ? 'جزئیات کامل خطا' : 'Full diagnostic trace'}</span>
+                  </>
+                )}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void handleCopy()}
+              aria-label={locale === 'fa' ? 'کپی متن خطا' : 'Copy error diagnostic'}
+              className="inline-flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 cursor-pointer"
+            >
+              {copied ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+              <span>{copied ? (locale === 'fa' ? 'کپی شد' : 'Copied') : locale === 'fa' ? 'کپی' : 'Copy'}</span>
+            </button>
+          </>
+        )}
+      </div>
+
+      {formatted && !expanded && (
+        <div
+          dir="ltr"
+          className="text-[11px] font-mono text-red-700 dark:text-red-300 line-clamp-2 break-all"
+        >
+          {formatted}
+        </div>
+      )}
+
+      {formatted && expanded && (
+        <pre
+          dir="ltr"
+          className="p-2.5 rounded-lg bg-slate-950 text-slate-100 border border-slate-800 text-[11px] font-mono whitespace-pre-wrap break-all select-all max-h-56 overflow-y-auto leading-relaxed"
+        >
+          {formatted}
+        </pre>
+      )}
+    </div>
+  );
 }
 
 export function AIRequestsSection({ locale }: { locale: Locale }) {
@@ -79,7 +183,7 @@ export function AIRequestsSection({ locale }: { locale: Locale }) {
           <h1 className="text-xl font-bold text-slate-900 dark:text-slate-100">{t.nav.aiRequests}</h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
             {locale === 'fa'
-              ? 'گزارش کامل درخواست‌های پردازش‌شده در موتور چندمدلی به همراه توکن، اعتبار، زمان پاسخ و Failover.'
+              ? 'گزارش کامل درخواست‌های پردازش‌شده در موتور چندمدلی به همراه توکن، اعتبار، زمان پاسخ و لاگ Failover.'
               : 'Complete ledger of multi-provider AI requests with tokens, credits, latency, and failover telemetry.'}
           </p>
         </div>
@@ -127,7 +231,7 @@ export function AIRequestsSection({ locale }: { locale: Locale }) {
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
                 {requests.map((r) => (
-                  <tr key={r.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                  <tr key={r.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 align-top">
                     <td className="py-3 px-4 max-w-xs">
                       <div className="font-semibold text-slate-900 dark:text-slate-100">
                         {t.capabilities[r.capability] ?? r.capability}
@@ -160,6 +264,13 @@ export function AIRequestsSection({ locale }: { locale: Locale }) {
                     </td>
                     <td className="py-3 px-4">
                       <StatusText tone={statusTone(r.status)}>{r.status}</StatusText>
+                      {(r.errorCode || r.errorMessage) && (
+                        <ErrorDiagnosticBox
+                          errorCode={r.errorCode}
+                          errorMessage={r.errorMessage}
+                          locale={locale}
+                        />
+                      )}
                     </td>
                     <td className="py-3 px-4 text-slate-500 tabular-nums">
                       {formatDateTime(r.createdAt, locale)}
@@ -214,8 +325,8 @@ export function GenerationJobsSection({ locale }: { locale: Locale }) {
           <h1 className="text-xl font-bold text-slate-900 dark:text-slate-100">{t.nav.generationJobs}</h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
             {locale === 'fa'
-              ? 'مدیریت صف پردازش‌های ناهمگام (تولید ویدیو، تصویر، صوت و گفتگو) با قابلیت تلاش مجدد و لغو ایمن.'
-              : 'Monitor async background generation jobs with progress tracking, retry, and safe refund cancellation.'}
+              ? 'مدیریت صف پردازش‌های ناهمگام (تولید ویدیو، تصویر، صوت و گفتگو) با لاگ دقیق کلیدها، تلاش مجدد و لغو ایمن.'
+              : 'Monitor async background generation jobs with per-key failure traces, retry, and safe refund cancellation.'}
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
@@ -257,7 +368,7 @@ export function GenerationJobsSection({ locale }: { locale: Locale }) {
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
                 {jobs.map((j) => (
-                  <tr key={j.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                  <tr key={j.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 align-top">
                     <td className="py-3.5 px-4">
                       <div className="font-semibold text-slate-900 dark:text-slate-100">
                         {t.capabilities[j.capability] ?? j.capability}
@@ -284,10 +395,12 @@ export function GenerationJobsSection({ locale }: { locale: Locale }) {
                     </td>
                     <td className="py-3.5 px-4">
                       <StatusText tone={statusTone(j.status)}>{j.status}</StatusText>
-                      {j.errorMessage && (
-                        <div className="text-[11px] text-red-600 truncate max-w-xs mt-0.5">
-                          {j.errorMessage}
-                        </div>
+                      {(j.errorCode || j.errorMessage) && (
+                        <ErrorDiagnosticBox
+                          errorCode={j.errorCode}
+                          errorMessage={j.errorMessage}
+                          locale={locale}
+                        />
                       )}
                     </td>
                     <td className="py-3.5 px-4 text-slate-500 tabular-nums">
@@ -353,8 +466,8 @@ export function FailedRequestsSection({ locale }: { locale: Locale }) {
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
             {locale === 'fa'
-              ? 'بررسی خطاهای ارائه‌دهندگان و تأیید بازگشت خودکار اعتبار کاربران (هیچ هزینه‌ای برای درخواست‌های ناموفق کسر نمی‌شود).'
-              : 'Audit failed and canceled AI requests with error codes and verified zero-charge credit refunds.'}
+              ? 'بررسی دقیق خطای تک‌تک کلیدها و ارائه‌دهندگان (بدون نمایش کلید کامل) به همراه تأیید بازگشت خودکار اعتبار کاربران.'
+              : 'Audit failed and canceled AI requests with redacted per-key traces and verified zero-charge credit refunds.'}
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
@@ -371,8 +484,8 @@ export function FailedRequestsSection({ locale }: { locale: Locale }) {
             title={locale === 'fa' ? 'هیچ درخواست ناموفقی وجود ندارد' : 'No failed requests'}
             description={
               locale === 'fa'
-                ? 'در صورت بروز خطا از سمت ارائه‌دهندگان یا لغو توسط کاربر، جزئیات خطا و تأییدیه بازگشت اعتبار در اینجا ثبت می‌شود.'
-                : 'Failed or canceled AI requests will be logged here with sanitized error diagnostics.'
+                ? 'در صورت بروز خطا از سمت ارائه‌دهندگان یا لغو توسط کاربر، جزئیات خطای هر کلید و تأییدیه بازگشت اعتبار در اینجا ثبت می‌شود.'
+                : 'Failed or canceled AI requests will be logged here with sanitized per-key diagnostics.'
             }
           />
         ) : (
@@ -380,7 +493,7 @@ export function FailedRequestsSection({ locale }: { locale: Locale }) {
             <table className="w-full text-start border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 text-[11px] font-semibold text-slate-500">
-                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'کد خطا / پیام' : 'Error Code / Message'}</th>
+                  <th className="py-3 px-4 text-start">{locale === 'fa' ? 'کد خطا / لاگ کلیدها' : 'Error Code / Trace'}</th>
                   <th className="py-3 px-4 text-start">{locale === 'fa' ? 'مدل / ارائه‌دهنده' : 'Model / Provider'}</th>
                   <th className="py-3 px-4 text-start">{locale === 'fa' ? 'وضعیت اعتبار' : 'Credit Status'}</th>
                   <th className="py-3 px-4 text-start">{locale === 'fa' ? 'زمان' : 'Time'}</th>
@@ -388,14 +501,13 @@ export function FailedRequestsSection({ locale }: { locale: Locale }) {
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
                 {items.map((r) => (
-                  <tr key={r.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
-                    <td className="py-3.5 px-4 max-w-md">
-                      <span dir="ltr" className="inline-block font-mono font-semibold text-red-700 dark:text-red-400">
-                        {r.errorCode || 'PROVIDER_ERROR'}
-                      </span>
-                      <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-0.5 break-words">
-                        {r.errorMessage || '—'}
-                      </div>
+                  <tr key={r.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 align-top">
+                    <td className="py-3.5 px-4 max-w-lg">
+                      <ErrorDiagnosticBox
+                        errorCode={r.errorCode || 'PROVIDER_ERROR'}
+                        errorMessage={r.errorMessage || '—'}
+                        locale={locale}
+                      />
                     </td>
                     <td className="py-3.5 px-4">
                       <div>{r.modelName || '—'}</div>

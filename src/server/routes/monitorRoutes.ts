@@ -20,6 +20,7 @@ import {
   webhookEvents,
 } from '../../db/schema.ts';
 import { getEnvValidationSummary, isAiMockModeEnabled } from '../config/env.ts';
+import { getCloudflareJobQueue } from '../cloudflare/requestContext.ts';
 import { enqueueBackgroundJob } from '../queue/qstash.ts';
 import { refundFailedRequest } from '../services/usageService.ts';
 import { reapStaleRunningJobs } from '../services/maintenanceService.ts';
@@ -114,6 +115,7 @@ export function createMonitorRouter(): Router {
         },
         infrastructure: {
           qstashConfigured: env.qstashConfigured,
+          cfQueueConfigured: Boolean(getCloudflareJobQueue()),
           r2Configured: env.r2Configured,
           aiMockMode: env.aiMockMode,
           databaseMode: env.databaseMode,
@@ -501,6 +503,7 @@ export function createMonitorRouter(): Router {
           maxAttempts: generationJobs.maxAttempts,
           providerJobId: generationJobs.providerJobId,
           storageObjectKey: generationJobs.storageObjectKey,
+          errorCode: aiRequests.errorCode,
           errorMessage: generationJobs.errorMessage,
           startedAt: generationJobs.startedAt,
           finishedAt: generationJobs.finishedAt,
@@ -560,8 +563,18 @@ export function createMonitorRouter(): Router {
           .set({ status: 'queued', errorCode: null, errorMessage: null })
           .where(eq(aiRequests.id, job.requestId));
 
+        const pollKind =
+          job.providerJobId && job.capability === 'video_generation'
+            ? 'video_poll_job'
+            : job.providerJobId &&
+                (job.capability === 'image_generation' ||
+                  job.capability === 'image_editing' ||
+                  job.capability === 'image_variation')
+              ? 'media_poll_job'
+              : 'ai_generation_job';
+
         await enqueueBackgroundJob({
-          kind: job.providerJobId && job.capability === 'video_generation' ? 'video_poll_job' : 'ai_generation_job',
+          kind: pollKind,
           idempotencyKey: `retry:${job.id}:${Date.now()}`,
           jobId: job.id,
           requestId: job.requestId,

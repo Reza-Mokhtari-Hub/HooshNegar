@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import { aiModels, aiProviders, modelCapabilities, providerCredentials } from '../../db/schema.ts';
@@ -335,6 +336,21 @@ function assertCapabilitySupported(ctx: ProviderExecutionContext, required: Capa
   }
 }
 
+interface AttemptBudgetStore {
+  signal?: AbortSignal;
+  deadlineAtMs?: number;
+}
+
+const attemptBudgetAls = new AsyncLocalStorage<AttemptBudgetStore>();
+
+export function runWithProviderDeadline<T>(deadlineAtMs: number, fn: () => Promise<T>): Promise<T> {
+  const existing = attemptBudgetAls.getStore();
+  const effectiveDeadline = existing?.deadlineAtMs
+    ? Math.min(existing.deadlineAtMs, deadlineAtMs)
+    : deadlineAtMs;
+  return attemptBudgetAls.run({ signal: existing?.signal, deadlineAtMs: effectiveDeadline }, fn);
+}
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
@@ -342,16 +358,26 @@ async function fetchWithTimeout(
   externalSignal?: AbortSignal,
 ): Promise<Response> {
   await assertSafeOutboundUrl(url);
+  const store = attemptBudgetAls.getStore();
+  const effectiveTimeoutMs =
+    typeof store?.deadlineAtMs === 'number'
+      ? Math.max(800, Math.min(timeoutMs, store.deadlineAtMs - Date.now()))
+      : timeoutMs;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
   const onExternalAbort = () => controller.abort();
   externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+  store?.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  if (externalSignal?.aborted || store?.signal?.aborted) {
+    controller.abort();
+  }
 
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
     externalSignal?.removeEventListener('abort', onExternalAbort);
+    store?.signal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -652,6 +678,8 @@ async function loadProviderContextForId(params: {
       contexts.push({
         ...baseMeta,
         credentialId: c.id,
+        credentialLabel: c.label,
+        maskedPreview: c.maskedPreview,
         apiKey,
       });
     } catch {
@@ -665,6 +693,8 @@ async function loadProviderContextForId(params: {
         ...baseMeta,
         apiKey: '',
         credentialId: null,
+        credentialLabel: 'Keyless / Anonymous',
+        maskedPreview: 'anonymous',
       };
       anonCtx.credentialPool = [anonCtx];
       return anonCtx;
@@ -682,6 +712,8 @@ async function loadProviderContextForId(params: {
       ...baseMeta,
       apiKey: '',
       credentialId: null,
+      credentialLabel: 'Anonymous HF Fallback',
+      maskedPreview: 'anonymous',
     });
   }
 
@@ -898,23 +930,105 @@ async function markCredentialFailure(credentialId: string | null | undefined, er
   }
 }
 
+function describeCandidateCredential(ctx: ProviderExecutionContext): string {
+  const label = ctx.credentialLabel?.trim();
+  const masked = ctx.maskedPreview?.trim();
+  if (label && masked) return `${label} (${masked})`;
+  if (label) return label;
+  if (masked) return masked;
+  return ctx.apiKey.trim() ? 'key' : 'anonymous';
+}
+
+function formatPoolDiagnosticMessage(traces: string[], secrets: string[]): string {
+  const joined =
+    traces.length === 1
+      ? traces[0]!
+      : `Failed after ${traces.length} key/attempt(s): ${traces.join(' | ')}`;
+  return redactSecrets(joined, secrets);
+}
+
 async function tryExecutionPool<T>(
   baseCtx: ProviderExecutionContext,
   executor: (ctx: ProviderExecutionContext) => Promise<T>,
 ): Promise<T> {
   const pool = baseCtx.credentialPool && baseCtx.credentialPool.length > 0 ? baseCtx.credentialPool : [baseCtx];
+  const allSecrets = pool.map((c) => c.apiKey).filter((k) => Boolean(k && k.trim()));
   let lastError: AIProviderError | null = null;
+  const attemptTraces: string[] = [];
   const poolStartedAt = Date.now();
-  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
+  const callerStore = attemptBudgetAls.getStore();
+  const isCfRuntime =
+    isCloudflareWorker() ||
+    Boolean(getCloudflareRequestContext()?.waitUntil) ||
+    Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
 
-  for (const candidate of pool) {
+  const defaultPoolMaxMs = isCfRuntime ? 23_000 : 75_000;
+  const poolDeadlineAtMs =
+    typeof callerStore?.deadlineAtMs === 'number'
+      ? Math.min(callerStore.deadlineAtMs, poolStartedAt + defaultPoolMaxMs)
+      : poolStartedAt + defaultPoolMaxMs;
+
+  for (let idx = 0; idx < pool.length; idx++) {
+    const candidate = pool[idx]!;
+    const remainingKeys = pool.length - idx;
+    const remainingPoolMs = poolDeadlineAtMs - Date.now();
+    if (idx > 0 && remainingPoolMs < 2_500) {
+      attemptTraces.push(
+        `#${idx + 1} [${candidate.providerName} · ${describeCandidateCredential(candidate)}] skipped (pool deadline reached)`,
+      );
+      break;
+    }
+
+    // When backup keys remain, cap each single key attempt so a hung connection cancels quickly and switches to the next key!
+    const perKeyCapMs =
+      remainingKeys > 1
+        ? isCfRuntime
+          ? Math.max(5_500, Math.min(10_500, Math.floor(remainingPoolMs / Math.min(remainingKeys, 2))))
+          : Math.max(8_000, Math.min(20_000, Math.floor(remainingPoolMs / Math.min(remainingKeys, 2))))
+        : Math.max(3_000, remainingPoolMs);
+
+    const attemptDeadlineAtMs = Date.now() + perKeyCapMs;
+    const attemptController = new AbortController();
+    const onCallerAbort = () => attemptController.abort();
+    callerStore?.signal?.addEventListener('abort', onCallerAbort, { once: true });
+    if (callerStore?.signal?.aborted) {
+      attemptController.abort();
+    }
+    const attemptTimer = setTimeout(() => attemptController.abort(), perKeyCapMs);
+    const attemptStartedAt = Date.now();
+
     try {
-      const result = await executor(candidate);
+      const candidateCtx: ProviderExecutionContext = {
+        ...candidate,
+        attemptDeadlineAtMs,
+        attemptSignal: attemptController.signal,
+      };
+      const result = await attemptBudgetAls.run(
+        { signal: attemptController.signal, deadlineAtMs: attemptDeadlineAtMs },
+        () => executor(candidateCtx),
+      );
       await markCredentialSuccess(candidate.credentialId);
       return result;
     } catch (err) {
-      const aiErr = wrapNetworkError(err, candidate.apiKey);
+      const elapsedMs = Date.now() - attemptStartedAt;
+      let aiErr = wrapNetworkError(err, candidate.apiKey);
+      if (attemptController.signal.aborted && !callerStore?.signal?.aborted && aiErr.code !== 'TIMEOUT') {
+        aiErr = new AIProviderError({
+          code: 'TIMEOUT',
+          message: `Attempt timed out after ${elapsedMs}ms (limit ${perKeyCapMs}ms)`,
+          userMessageFa: aiErr.userMessageFa,
+          retryable: true,
+          httpStatus: 408,
+          credentialFailureKind: 'transient',
+        });
+      }
       lastError = aiErr;
+      const statusPart = aiErr.httpStatus ? ` HTTP ${aiErr.httpStatus}` : '';
+      const cleanReason = redactSecrets(aiErr.message.replace(/\s+/g, ' ').slice(0, 420), allSecrets);
+      attemptTraces.push(
+        `#${idx + 1} [${candidate.providerName} · ${describeCandidateCredential(candidate)} · ${aiErr.code}${statusPart} · ${elapsedMs}ms]: ${cleanReason}`,
+      );
+
       // Never rotate API keys for user input validation, cancelation, or missing capabilities
       if (
         aiErr.code === 'CANCELED' ||
@@ -922,26 +1036,38 @@ async function tryExecutionPool<T>(
         aiErr.code === 'SSRF_BLOCKED' ||
         aiErr.credentialFailureKind === 'prompt_error'
       ) {
-        throw aiErr;
+        throw new AIProviderError({
+          code: aiErr.code,
+          message: formatPoolDiagnosticMessage(attemptTraces, allSecrets),
+          userMessageFa: aiErr.userMessageFa,
+          retryable: aiErr.retryable,
+          httpStatus: aiErr.httpStatus,
+          credentialFailureKind: aiErr.credentialFailureKind,
+        });
       }
       await markCredentialFailure(candidate.credentialId, aiErr);
-      // Inside Cloudflare Workers waitUntil (30s hard kill), if a slow TIMEOUT already consumed >17s,
-      // stop rotating keys so error reporting + credit refund always complete safely before Worker termination.
-      // Fast 429 / ZeroGPU quota / 401 failures still rotate through all accounts immediately!
-      if (isCfBackgroundWaitUntil && aiErr.code === 'TIMEOUT' && Date.now() - poolStartedAt >= 17_000) {
-        break;
-      }
+    } finally {
+      clearTimeout(attemptTimer);
+      callerStore?.signal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
-  throw (
-    lastError ??
-    new AIProviderError({
-      code: 'PROVIDER_ERROR',
-      message: 'All active credentials for provider failed.',
-      userMessageFa: 'سرویس این مدل موقتاً در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
-    })
-  );
+  if (lastError) {
+    throw new AIProviderError({
+      code: lastError.code,
+      message: formatPoolDiagnosticMessage(attemptTraces, allSecrets),
+      userMessageFa: lastError.userMessageFa,
+      retryable: lastError.retryable,
+      httpStatus: lastError.httpStatus,
+      credentialFailureKind: lastError.credentialFailureKind,
+    });
+  }
+
+  throw new AIProviderError({
+    code: 'PROVIDER_ERROR',
+    message: 'All active credentials for provider failed.',
+    userMessageFa: 'سرویس این مدل موقتاً در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+  });
 }
 
 async function runWithFailover<T>(
@@ -968,8 +1094,23 @@ async function runWithFailover<T>(
         aiErr.code === 'PROVIDER_ERROR' ||
         aiErr.code === 'RATE_LIMITED')
     ) {
-      const result = await tryExecutionPool(route.fallback, executor);
-      return { result, usedFallback: true, providerId: route.fallback.providerId };
+      try {
+        const result = await tryExecutionPool(route.fallback, executor);
+        return { result, usedFallback: true, providerId: route.fallback.providerId };
+      } catch (fbErr) {
+        const fbAiErr = wrapNetworkError(fbErr, route.fallback.apiKey);
+        throw new AIProviderError({
+          code: fbAiErr.code,
+          message: redactSecrets(
+            `Primary failed -> ${aiErr.message} || Fallback failed -> ${fbAiErr.message}`,
+            [route.primary.apiKey, route.fallback.apiKey].filter(Boolean),
+          ),
+          userMessageFa: fbAiErr.userMessageFa,
+          retryable: fbAiErr.retryable,
+          httpStatus: fbAiErr.httpStatus,
+          credentialFailureKind: fbAiErr.credentialFailureKind,
+        });
+      }
     }
     throw aiErr;
   }
@@ -1017,14 +1158,25 @@ interface StoredGradioParamSpec {
   isFileList?: boolean;
 }
 
-function createHfDeadline(mode: 'sync' | 'video_poll'): number {
-  const isCfBackgroundWaitUntil = Boolean(getCloudflareRequestContext()?.childWaitUntilTasks);
-  if (mode === 'video_poll') {
-    return Date.now() + (isCfBackgroundWaitUntil ? 19_000 : 28_000);
-  }
-  // Inside Cloudflare Workers waitUntil (30s hard kill), budget max 21.5s total across
-  // resolve + upload + POST + SSE + download so catch + refund + Telegram error ALWAYS execute!
-  return Date.now() + (isCfBackgroundWaitUntil ? 21_500 : 85_000);
+function createHfDeadline(mode: 'sync' | 'video_poll', ctx?: ProviderExecutionContext): number {
+  const cfCtx = getCloudflareRequestContext();
+  const isCfRuntime = isCloudflareWorker() || Boolean(cfCtx?.waitUntil) || Boolean(cfCtx?.childWaitUntilTasks);
+  const storeDeadline = attemptBudgetAls.getStore()?.deadlineAtMs;
+  const ctxDeadline = ctx?.attemptDeadlineAtMs;
+
+  const baseMs =
+    mode === 'video_poll'
+      ? isCfRuntime
+        ? 17_000
+        : 28_000
+      : isCfRuntime
+        ? 18_500
+        : 70_000;
+
+  let deadline = Date.now() + baseMs;
+  if (typeof ctxDeadline === 'number') deadline = Math.min(deadline, ctxDeadline);
+  if (typeof storeDeadline === 'number') deadline = Math.min(deadline, storeDeadline);
+  return Math.max(Date.now() + 2_000, deadline);
 }
 
 function getRemainingBudgetMs(deadlineAtMs: number | undefined, fallbackMs: number, minMs = 1500): number {
@@ -1357,6 +1509,37 @@ function serializeResolvedGradioParam(
   };
 }
 
+function gradioParamsHaveMediaInput(
+  params: Array<{
+    component?: string;
+    label?: string;
+    name?: string;
+    parameter_name?: string;
+    isImageEditor?: boolean;
+    isMultimodalTextbox?: boolean;
+    isFileList?: boolean;
+  }>,
+  mediaKind: 'image' | 'audio' | 'any',
+): boolean {
+  return params.some((p) => {
+    const comp = String(p.component ?? '').toLowerCase();
+    const label = String(p.label ?? p.name ?? p.parameter_name ?? '').toLowerCase();
+    if (p.isMultimodalTextbox) return true;
+    if (mediaKind === 'audio') {
+      return comp.includes('audio') || comp.includes('file') || /audio|speech|voice|sound/.test(label);
+    }
+    return (
+      Boolean(p.isImageEditor) ||
+      Boolean(p.isFileList) ||
+      comp.includes('image') ||
+      comp.includes('paint') ||
+      comp.includes('sketch') ||
+      comp.includes('gallery') ||
+      comp.includes('file')
+    );
+  });
+}
+
 function scoreGradioEndpointForKind(
   apiName: string,
   params: Array<{ component?: string; label?: string; parameter_name?: string; type?: { type?: string } }>,
@@ -1366,6 +1549,8 @@ function scoreGradioEndpointForKind(
   const lower = apiName.replace(/^\/+/, '').toLowerCase();
   const inStr = params.map((p) => `${p.component ?? ''} ${p.label ?? ''} ${p.parameter_name ?? ''}`).join(' ').toLowerCase();
   const outStr = returns.map((r) => `${r.component ?? ''} ${r.label ?? ''}`).join(' ').toLowerCase();
+  const hasImageIn = gradioParamsHaveMediaInput(params, 'image');
+  const hasAudioIn = gradioParamsHaveMediaInput(params, 'audio');
 
   let score = 0;
   if (/^(generate|infer|predict|run|chat|respond|synthesize|transcribe)/.test(lower)) score += 10;
@@ -1373,16 +1558,19 @@ function scoreGradioEndpointForKind(
   switch (preferredKind) {
     case 'image_edit':
       if (outStr.includes('image') || outStr.includes('gallery')) score += 20;
-      if (/image|paint|sketch|file|gallery/.test(inStr)) score += 25;
-      if (/edit|img2img|inpaint|transform|variation|upscale/.test(lower)) score += 20;
+      if (hasImageIn) score += 35;
+      else score -= 55;
+      if (/edit|img2img|inpaint|transform|variation|upscale/.test(lower)) score += 25;
       break;
     case 'image_generate':
       if (outStr.includes('image') || outStr.includes('gallery')) score += 25;
       if (/txt2img|text_to_image|generate|infer/.test(lower)) score += 15;
+      if (/edit|img2img|inpaint/.test(lower) && !/txt2img|generate/.test(lower)) score -= 10;
       break;
     case 'video_i2v':
       if (outStr.includes('video')) score += 30;
-      if (/image|file/.test(inStr)) score += 25;
+      if (hasImageIn) score += 30;
+      else score -= 45;
       if (/i2v|img2vid|image_to_video/.test(lower)) score += 25;
       break;
     case 'video_t2v':
@@ -1394,11 +1582,12 @@ function scoreGradioEndpointForKind(
       if (/tts|speak|synth|voice|speech/.test(lower)) score += 20;
       break;
     case 'stt':
-      if (inStr.includes('audio')) score += 35;
+      if (hasAudioIn) score += 35;
+      else score -= 40;
       if (/stt|transcribe|whisper|asr/.test(lower)) score += 20;
       break;
     case 'vision':
-      if (/image|multimodal|file/.test(inStr) && !outStr.includes('image') && !outStr.includes('video')) score += 30;
+      if (hasImageIn && !outStr.includes('image') && !outStr.includes('video')) score += 30;
       break;
     case 'text':
       if (!outStr.includes('image') && !outStr.includes('video') && !outStr.includes('audio')) score += 20;
@@ -1439,12 +1628,24 @@ async function resolveGradioContext(
     !hasDropdownOrRadio ||
     rawParams.some((p) => Array.isArray(p.enum) && p.enum.length > 0);
 
+  const requiredMediaKind: 'image' | 'audio' | null =
+    options?.preferredKind === 'image_edit' ||
+    options?.preferredKind === 'video_i2v' ||
+    options?.preferredKind === 'vision'
+      ? 'image'
+      : options?.preferredKind === 'stt'
+        ? 'audio'
+        : null;
+  const hasRequiredMediaSlot =
+    !requiredMediaKind || gradioParamsHaveMediaInput(rawParams, requiredMediaKind);
+
   if (
     !options?.forceRefresh &&
     hasParams &&
     hasValidSpaceHost &&
     hasEnumMetadata &&
-    !isStaleUiHelper
+    !isStaleUiHelper &&
+    hasRequiredMediaSlot
   ) {
     return ctx;
   }
@@ -1453,7 +1654,7 @@ async function resolveGradioContext(
     ? normalizeBaseUrl(paramSpaceHost)
     : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
 
-  if (!options?.forceRefresh && hasParams && hasEnumMetadata && !isStaleUiHelper) {
+  if (!options?.forceRefresh && hasParams && hasEnumMetadata && !isStaleUiHelper && hasRequiredMediaSlot) {
     return {
       ...ctx,
       modelParameters: { ...(ctx.modelParameters ?? {}), spaceHost },
@@ -1520,7 +1721,13 @@ async function resolveGradioContext(
       let matchedKey = rawApiName;
       let matchedFnIndex: number | undefined =
         typeof ctx.modelParameters?.fnIndex === 'number' ? ctx.modelParameters.fnIndex : undefined;
-      let entry = !isStaleUiHelper ? (endpoints[`/${rawApiName}`] ?? endpoints[rawApiName]) : undefined;
+      const candidateRawEntry = !isStaleUiHelper ? (endpoints[`/${rawApiName}`] ?? endpoints[rawApiName]) : undefined;
+      let entry =
+        candidateRawEntry &&
+        (!requiredMediaKind ||
+          gradioParamsHaveMediaInput(candidateRawEntry.parameters ?? [], requiredMediaKind))
+          ? candidateRawEntry
+          : undefined;
 
       if (!entry && realEntries.length > 0) {
         const ranked = [...realEntries].sort(
@@ -2284,7 +2491,21 @@ async function readGradioSpaceSse(params: {
   deadlineAtMs: number;
   signal?: AbortSignal;
 }): Promise<{ status: 'complete'; outputData: unknown[] } | { status: 'timeout' }> {
-  const sseTimeoutMs = Math.max(1500, params.deadlineAtMs - Date.now());
+  const attemptStore = attemptBudgetAls.getStore();
+  // Fire our soft SSE timeout at least 900ms before any hard attempt deadline so a slow
+  // already-submitted Gradio job can hand off its eventId cleanly instead of aborting.
+  const attemptSoftCeiling =
+    typeof attemptStore?.deadlineAtMs === 'number'
+      ? attemptStore.deadlineAtMs - 900
+      : undefined;
+  const effectiveDeadline =
+    typeof attemptSoftCeiling === 'number'
+      ? Math.min(params.deadlineAtMs, attemptSoftCeiling)
+      : params.deadlineAtMs;
+  if (effectiveDeadline <= Date.now() + 250) {
+    return { status: 'timeout' };
+  }
+  const sseTimeoutMs = Math.max(250, effectiveDeadline - Date.now());
   const sseController = new AbortController();
   let timedOut = false;
   const sseTimer = setTimeout(() => {
@@ -2293,6 +2514,10 @@ async function readGradioSpaceSse(params: {
   }, sseTimeoutMs);
   const onExternalAbort = () => sseController.abort();
   params.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  attemptStore?.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  if (params.signal?.aborted || attemptStore?.signal?.aborted) {
+    sseController.abort();
+  }
 
   const authHeaders: Record<string, string> = { Accept: 'text/event-stream' };
   if (params.apiKey.trim()) authHeaders.Authorization = `Bearer ${params.apiKey.trim()}`;
@@ -2377,6 +2602,7 @@ async function readGradioSpaceSse(params: {
   } finally {
     clearTimeout(sseTimer);
     params.signal?.removeEventListener('abort', onExternalAbort);
+    attemptStore?.signal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -3823,64 +4049,22 @@ async function executeImageGenOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      const deadlineAtMs = createHfDeadline('sync');
-      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
-        preferredKind: 'image_generate',
-        deadlineAtMs,
-      });
-      let args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
-        aspectRatio: input.aspectRatio,
+      const outcome = await executeHfSpaceImageInternal(ctx, {
+        prompt: input.prompt,
         mode: 'generate',
+        aspectRatio: input.aspectRatio,
+        signal: input.signal,
+        allowPending: false,
       });
-      let callRes: { outputData: unknown[]; spaceHost: string; endpointPrefix: string };
-      try {
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
-      } catch (firstErr) {
-        const isSchemaErr =
-          firstErr instanceof AIProviderError &&
-          (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
-        if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
-        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
-          forceRefresh: true,
-          preferredKind: 'image_generate',
-          deadlineAtMs,
-        });
-        args = buildGradioInputPayload(resolvedCtx, input.prompt, undefined, undefined, undefined, {
-          aspectRatio: input.aspectRatio,
-          mode: 'generate',
-        });
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
-      }
-      const mediaUrl = extractGradioMediaUrl(
-        callRes.outputData,
-        callRes.spaceHost,
-        'image',
-        callRes.endpointPrefix,
-      );
-      if (!mediaUrl) {
-        throw new AIProviderError({
-          code: 'PROVIDER_ERROR',
-          message: 'Hugging Face Space returned no image output.',
-          userMessageFa: 'تصویری تولید نشد. لطفاً دوباره تلاش کنید.',
-        });
-      }
-      const dl = await downloadBinarySafe(
-        mediaUrl,
-        resolvedCtx.apiKey,
-        true,
-        getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
-        input.signal,
-      );
-      return {
-        images: [
-          {
-            buffer: dl.buffer,
-            mimeType: dl.mimeType,
-            extension: dl.mimeType.includes('jpeg') ? 'jpg' : dl.mimeType.includes('webp') ? 'webp' : 'png',
-          },
-        ],
-        costUsd: 0,
-      };
+      if (outcome.kind === 'complete') return outcome.output;
+      throw new AIProviderError({
+        code: 'TIMEOUT',
+        message: 'Hugging Face Space SSE queue timed out before completion.',
+        userMessageFa:
+          'زمان پاسخ‌گویی این مدل به پایان رسید (صف شلوغ است). اعتبار شما بازگردانده شد؛ لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+        retryable: true,
+        credentialFailureKind: 'transient',
+      });
     }
 
     throw new AIProviderError({
@@ -3893,12 +4077,255 @@ async function executeImageGenOnProvider(
   }
 }
 
+export type ImageJobOutcome =
+  | { kind: 'complete'; result: ImageOutput; usedFallback: boolean; providerId: string }
+  | {
+      kind: 'pending';
+      providerJobId: string;
+      progressPercent: number;
+      providerId: string;
+      usedFallback: boolean;
+      metadata: Record<string, unknown>;
+    };
+
+export interface MediaJobPollOutput {
+  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  progressPercent: number;
+  images?: ImageOutput['images'];
+  errorMessage?: string;
+  costUsd?: number;
+}
+
+type InternalHfImageOutcome =
+  | { kind: 'complete'; output: ImageOutput }
+  | {
+      kind: 'pending';
+      providerJobId: string;
+      progressPercent: number;
+      metadata: Record<string, unknown>;
+    };
+
+async function executeHfSpaceImageInternal(
+  ctx: ProviderExecutionContext,
+  params: {
+    prompt: string;
+    mode: 'generate' | 'edit' | 'variation';
+    sourceImageBuffer?: Buffer;
+    sourceMimeType?: string;
+    aspectRatio?: string;
+    signal?: AbortSignal;
+    allowPending: boolean;
+    syncWaitCapMs?: number;
+  },
+): Promise<InternalHfImageOutcome> {
+  const preferredKind: GradioPreferredKind = params.mode === 'generate' ? 'image_generate' : 'image_edit';
+  let deadlineAtMs = createHfDeadline('sync', ctx);
+  if (typeof params.syncWaitCapMs === 'number' && params.syncWaitCapMs > 0) {
+    deadlineAtMs = Math.min(deadlineAtMs, Date.now() + params.syncWaitCapMs);
+  }
+
+  let resolvedCtx = await resolveGradioContext(ctx, params.signal, {
+    preferredKind,
+    deadlineAtMs,
+  });
+
+  let uploadedImg: GradioFileData | undefined;
+  if (params.sourceImageBuffer) {
+    const srcMime = params.sourceMimeType || 'image/jpeg';
+    const ext = srcMime.includes('png') ? 'png' : srcMime.includes('webp') ? 'webp' : 'jpg';
+    uploadedImg = await uploadMediaToGradioSpace(
+      resolvedCtx,
+      params.sourceImageBuffer,
+      srcMime,
+      `source.${ext}`,
+      params.signal,
+      deadlineAtMs,
+    );
+  }
+
+  const promptText =
+    params.mode === 'variation'
+      ? `Create a stylized variation. ${params.prompt || ''}`.trim()
+      : params.prompt;
+
+  const buildArgs = (targetCtx: ProviderExecutionContext) =>
+    buildGradioInputPayload(targetCtx, promptText, undefined, undefined, uploadedImg, {
+      aspectRatio: params.aspectRatio,
+      mode: params.mode,
+      ...(params.mode !== 'generate' ? { mediaKind: 'image' as const } : {}),
+    });
+
+  let submitted: GradioSubmitResult;
+  try {
+    submitted = await submitGradioSpaceCall(resolvedCtx, buildArgs(resolvedCtx), params.signal, deadlineAtMs);
+  } catch (firstErr) {
+    const isSchemaErr =
+      firstErr instanceof AIProviderError &&
+      (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
+    if (!isSchemaErr || deadlineAtMs - Date.now() < 5000) throw firstErr;
+    resolvedCtx = await resolveGradioContext(ctx, params.signal, {
+      forceRefresh: true,
+      preferredKind,
+      deadlineAtMs,
+    });
+    submitted = await submitGradioSpaceCall(resolvedCtx, buildArgs(resolvedCtx), params.signal, deadlineAtMs);
+  }
+
+  const extractAndDownloadImage = async (
+    outputData: unknown[],
+    spaceHost: string,
+    endpointPrefix: string,
+  ): Promise<ImageOutput> => {
+    const mediaUrl = extractGradioMediaUrl(outputData, spaceHost, 'image', endpointPrefix);
+    if (!mediaUrl) {
+      throw new AIProviderError({
+        code: 'PROVIDER_ERROR',
+        message:
+          params.mode === 'generate'
+            ? 'Hugging Face Space returned no image output.'
+            : 'Hugging Face Space returned no edited image.',
+        userMessageFa:
+          params.mode === 'generate'
+            ? 'تصویری تولید نشد. لطفاً دوباره تلاش کنید.'
+            : 'ویرایش تصویر نتیجه‌ای برنگرداند. لطفاً دوباره تلاش کنید.',
+      });
+    }
+    const dl = await downloadBinarySafe(
+      mediaUrl,
+      resolvedCtx.apiKey,
+      true,
+      getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
+      params.signal,
+    );
+    return {
+      images: [
+        {
+          buffer: dl.buffer,
+          mimeType: dl.mimeType,
+          extension: dl.mimeType.includes('jpeg') ? 'jpg' : dl.mimeType.includes('webp') ? 'webp' : 'png',
+        },
+      ],
+      costUsd: 0,
+    };
+  };
+
+  if (submitted.kind === 'immediate') {
+    const output = await extractAndDownloadImage(
+      submitted.outputData,
+      submitted.spaceHost,
+      submitted.endpointPrefix,
+    );
+    return { kind: 'complete', output };
+  }
+
+  const hfMetadata: Record<string, unknown> = {
+    kind: 'hf_space_gradio_media',
+    expectedMedia: 'image',
+    callUrl: submitted.callUrl,
+    spaceHost: submitted.spaceHost,
+    endpointPrefix: submitted.endpointPrefix,
+    credentialId: ctx.credentialId ?? null,
+    aspectRatio: params.aspectRatio ?? '1:1',
+    modelName: ctx.modelName,
+  };
+
+  const attemptRemainingMs =
+    typeof attemptBudgetAls.getStore()?.deadlineAtMs === 'number'
+      ? attemptBudgetAls.getStore()!.deadlineAtMs! - Date.now()
+      : deadlineAtMs - Date.now();
+
+  if (params.allowPending && attemptRemainingMs < 1500) {
+    return {
+      kind: 'pending',
+      providerJobId: submitted.eventId,
+      progressPercent: 25,
+      metadata: hfMetadata,
+    };
+  }
+
+  // Check if we still have enough time to wait briefly on SSE for quick Spaces
+  const sseResult = await readGradioSpaceSse({
+    callUrl: submitted.callUrl,
+    eventId: submitted.eventId,
+    apiKey: resolvedCtx.apiKey,
+    additionalHeaders: resolvedCtx.additionalHeaders,
+    deadlineAtMs,
+    signal: params.signal,
+  });
+
+  if (sseResult.status === 'complete') {
+    const output = await extractAndDownloadImage(
+      sseResult.outputData,
+      submitted.spaceHost,
+      submitted.endpointPrefix,
+    );
+    return { kind: 'complete', output };
+  }
+
+  if (params.allowPending) {
+    return {
+      kind: 'pending',
+      providerJobId: submitted.eventId,
+      progressPercent: 25,
+      metadata: hfMetadata,
+    };
+  }
+
+  throw new AIProviderError({
+    code: 'TIMEOUT',
+    message: 'Hugging Face Space SSE queue timed out before completion.',
+    userMessageFa:
+      'زمان پاسخ‌گویی این مدل به پایان رسید (صف شلوغ است). اعتبار شما بازگردانده شد؛ لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+    retryable: true,
+    credentialFailureKind: 'transient',
+  });
+}
+
 export async function generateImageWithRoute(
   route: LoadedModelRoute,
   input: ImageGenerationInput,
 ): Promise<{ result: ImageOutput; usedFallback: boolean; providerId: string }> {
   assertCapabilitySupported(route.primary, 'image_generation');
   return runWithFailover(route, (ctx) => executeImageGenOnProvider(ctx, input));
+}
+
+export async function startImageGenerationWithRoute(
+  route: LoadedModelRoute,
+  input: ImageGenerationInput,
+  options?: { syncWaitCapMs?: number },
+): Promise<ImageJobOutcome> {
+  assertCapabilitySupported(route.primary, 'image_generation');
+  const wrapped = await runWithFailover(route, async (ctx): Promise<InternalHfImageOutcome> => {
+    if (!isAiMockModeEnabled() && isHuggingFaceSpaceContext(ctx)) {
+      return executeHfSpaceImageInternal(ctx, {
+        prompt: input.prompt,
+        mode: 'generate',
+        aspectRatio: input.aspectRatio,
+        signal: input.signal,
+        allowPending: true,
+        syncWaitCapMs: options?.syncWaitCapMs,
+      });
+    }
+    const output = await executeImageGenOnProvider(ctx, input);
+    return { kind: 'complete', output };
+  });
+
+  if (wrapped.result.kind === 'pending') {
+    return {
+      kind: 'pending',
+      providerJobId: wrapped.result.providerJobId,
+      progressPercent: wrapped.result.progressPercent,
+      providerId: wrapped.providerId,
+      usedFallback: wrapped.usedFallback,
+      metadata: wrapped.result.metadata,
+    };
+  }
+  return {
+    kind: 'complete',
+    result: wrapped.result.output,
+    usedFallback: wrapped.usedFallback,
+    providerId: wrapped.providerId,
+  };
 }
 
 async function executeImageEditOnProvider(
@@ -4131,83 +4558,24 @@ async function executeImageEditOnProvider(
     }
 
     if (isHuggingFaceSpaceContext(ctx)) {
-      const deadlineAtMs = createHfDeadline('sync');
-      let resolvedCtx = await resolveGradioContext(ctx, input.signal, {
-        preferredKind: 'image_edit',
-        deadlineAtMs,
-      });
-      const ext = input.sourceMimeType.includes('png')
-        ? 'png'
-        : input.sourceMimeType.includes('webp')
-          ? 'webp'
-          : 'jpg';
-      const uploadedImg = await uploadMediaToGradioSpace(
-        resolvedCtx,
-        input.sourceImageBuffer,
-        input.sourceMimeType,
-        `source.${ext}`,
-        input.signal,
-        deadlineAtMs,
-      );
-      const promptText =
-        input.mode === 'variation'
-          ? `Create a stylized variation. ${input.prompt || ''}`.trim()
-          : input.prompt;
-      let args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
-        aspectRatio: input.aspectRatio,
+      const outcome = await executeHfSpaceImageInternal(ctx, {
+        prompt: input.prompt,
         mode: input.mode,
-        mediaKind: 'image',
+        sourceImageBuffer: input.sourceImageBuffer,
+        sourceMimeType: input.sourceMimeType,
+        aspectRatio: input.aspectRatio,
+        signal: input.signal,
+        allowPending: false,
       });
-      let callRes: { outputData: unknown[]; spaceHost: string; endpointPrefix: string };
-      try {
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
-      } catch (firstErr) {
-        const isSchemaErr =
-          firstErr instanceof AIProviderError &&
-          (firstErr.httpStatus === 422 || firstErr.httpStatus === 400 || firstErr.httpStatus === 500);
-        if (!isSchemaErr || deadlineAtMs - Date.now() < 6000) throw firstErr;
-        resolvedCtx = await resolveGradioContext(ctx, input.signal, {
-          forceRefresh: true,
-          preferredKind: 'image_edit',
-          deadlineAtMs,
-        });
-        args = buildGradioInputPayload(resolvedCtx, promptText, undefined, undefined, uploadedImg, {
-          aspectRatio: input.aspectRatio,
-          mode: input.mode,
-          mediaKind: 'image',
-        });
-        callRes = await runGradioSpaceCall(resolvedCtx, args, input.signal, deadlineAtMs);
-      }
-      const mediaUrl = extractGradioMediaUrl(
-        callRes.outputData,
-        callRes.spaceHost,
-        'image',
-        callRes.endpointPrefix,
-      );
-      if (!mediaUrl) {
-        throw new AIProviderError({
-          code: 'PROVIDER_ERROR',
-          message: 'Hugging Face Space returned no edited image.',
-          userMessageFa: 'ویرایش تصویر نتیجه‌ای برنگرداند. لطفاً دوباره تلاش کنید.',
-        });
-      }
-      const dl = await downloadBinarySafe(
-        mediaUrl,
-        resolvedCtx.apiKey,
-        true,
-        getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
-        input.signal,
-      );
-      return {
-        images: [
-          {
-            buffer: dl.buffer,
-            mimeType: dl.mimeType,
-            extension: dl.mimeType.includes('jpeg') ? 'jpg' : dl.mimeType.includes('webp') ? 'webp' : 'png',
-          },
-        ],
-        costUsd: 0,
-      };
+      if (outcome.kind === 'complete') return outcome.output;
+      throw new AIProviderError({
+        code: 'TIMEOUT',
+        message: 'Hugging Face Space SSE queue timed out before completion.',
+        userMessageFa:
+          'زمان پاسخ‌گویی این مدل به پایان رسید (صف شلوغ است). اعتبار شما بازگردانده شد؛ لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+        retryable: true,
+        credentialFailureKind: 'transient',
+      });
     }
 
     throw new AIProviderError({
@@ -4230,6 +4598,50 @@ export async function editImageWithRoute(
     input.mode === 'variation' ? 'image_variation' : 'image_editing',
   );
   return runWithFailover(route, (ctx) => executeImageEditOnProvider(ctx, input));
+}
+
+export async function startImageEditWithRoute(
+  route: LoadedModelRoute,
+  input: ImageEditInput,
+  options?: { syncWaitCapMs?: number },
+): Promise<ImageJobOutcome> {
+  assertCapabilitySupported(
+    route.primary,
+    input.mode === 'variation' ? 'image_variation' : 'image_editing',
+  );
+  const wrapped = await runWithFailover(route, async (ctx): Promise<InternalHfImageOutcome> => {
+    if (!isAiMockModeEnabled() && isHuggingFaceSpaceContext(ctx)) {
+      return executeHfSpaceImageInternal(ctx, {
+        prompt: input.prompt,
+        mode: input.mode,
+        sourceImageBuffer: input.sourceImageBuffer,
+        sourceMimeType: input.sourceMimeType,
+        aspectRatio: input.aspectRatio,
+        signal: input.signal,
+        allowPending: true,
+        syncWaitCapMs: options?.syncWaitCapMs,
+      });
+    }
+    const output = await executeImageEditOnProvider(ctx, input);
+    return { kind: 'complete', output };
+  });
+
+  if (wrapped.result.kind === 'pending') {
+    return {
+      kind: 'pending',
+      providerJobId: wrapped.result.providerJobId,
+      progressPercent: wrapped.result.progressPercent,
+      providerId: wrapped.providerId,
+      usedFallback: wrapped.usedFallback,
+      metadata: wrapped.result.metadata,
+    };
+  }
+  return {
+    kind: 'complete',
+    result: wrapped.result.output,
+    usedFallback: wrapped.usedFallback,
+    providerId: wrapped.providerId,
+  };
 }
 
 // =============================================================================
@@ -5243,7 +5655,7 @@ export async function pollVideoGenerationJob(
     }
 
     if (isHuggingFaceSpaceContext(ctx) || metadata?.kind === 'hf_space_gradio') {
-      const deadlineAtMs = createHfDeadline('video_poll');
+      const deadlineAtMs = createHfDeadline('video_poll', ctx);
       const spaceHost =
         typeof metadata?.spaceHost === 'string' && metadata.spaceHost
           ? normalizeBaseUrl(metadata.spaceHost)
@@ -5331,6 +5743,126 @@ export async function pollVideoGenerationJob(
     }
 
     return { status: 'failed', progressPercent: 0, errorMessage: 'پشتیبانی از polling این ارائه‌دهنده تعریف نشده است.' };
+  } catch (err) {
+    throw wrapNetworkError(err, ctx.apiKey);
+  }
+}
+
+export async function pollMediaGenerationJob(
+  ctx: ProviderExecutionContext,
+  providerJobId: string,
+  metadata?: Record<string, unknown>,
+  options?: { maxWaitMs?: number },
+): Promise<MediaJobPollOutput> {
+  try {
+    if (
+      isHuggingFaceSpaceContext(ctx) ||
+      metadata?.kind === 'hf_space_gradio_media' ||
+      metadata?.kind === 'hf_space_gradio'
+    ) {
+      let deadlineAtMs = createHfDeadline('video_poll', ctx);
+      if (typeof options?.maxWaitMs === 'number' && options.maxWaitMs > 0) {
+        deadlineAtMs = Math.min(deadlineAtMs, Date.now() + options.maxWaitMs);
+      }
+
+      const spaceHost =
+        typeof metadata?.spaceHost === 'string' && metadata.spaceHost
+          ? normalizeBaseUrl(metadata.spaceHost)
+          : typeof ctx.modelParameters?.spaceHost === 'string' && ctx.modelParameters.spaceHost
+            ? normalizeBaseUrl(ctx.modelParameters.spaceHost)
+            : (await resolveHfSpaceRootUrl(ctx.baseUrl, ctx.apiKey, ctx.additionalHeaders)).resolvedRootUrl;
+
+      const endpointPrefix =
+        typeof metadata?.endpointPrefix === 'string'
+          ? metadata.endpointPrefix
+          : typeof ctx.modelParameters?.endpointPrefix === 'string'
+            ? ctx.modelParameters.endpointPrefix
+            : '/gradio_api';
+
+      const apiName = (
+        typeof ctx.modelParameters?.apiName === 'string'
+          ? ctx.modelParameters.apiName
+          : ctx.modelIdentifier.split('::')[1] || 'predict'
+      ).replace(/^\/+/, '');
+
+      const normalizedPrefix = endpointPrefix === '' ? '' : `/${endpointPrefix.replace(/^\/+|\/+$/g, '')}`;
+      const callUrl =
+        typeof metadata?.callUrl === 'string' && metadata.callUrl
+          ? metadata.callUrl
+          : `${spaceHost}${normalizedPrefix}/call/${apiName}`;
+
+      try {
+        const sseResult = await readGradioSpaceSse({
+          callUrl,
+          eventId: providerJobId,
+          apiKey: ctx.apiKey,
+          additionalHeaders: ctx.additionalHeaders,
+          deadlineAtMs,
+        });
+
+        if (sseResult.status === 'timeout') {
+          return { status: 'running', progressPercent: 60 };
+        }
+
+        const imageUrl = extractGradioMediaUrl(
+          sseResult.outputData,
+          spaceHost,
+          'image',
+          normalizedPrefix,
+        );
+        if (!imageUrl) {
+          return {
+            status: 'failed',
+            progressPercent: 0,
+            errorMessage: 'تصویری از سرور مدل دریافت نشد.',
+          };
+        }
+
+        const dl = await downloadBinarySafe(
+          imageUrl,
+          ctx.apiKey,
+          true,
+          getRemainingBudgetMs(deadlineAtMs, 20_000, 5000),
+        );
+        return {
+          status: 'succeeded',
+          progressPercent: 100,
+          images: [
+            {
+              buffer: dl.buffer,
+              mimeType: dl.mimeType,
+              extension: dl.mimeType.includes('jpeg') ? 'jpg' : dl.mimeType.includes('webp') ? 'webp' : 'png',
+            },
+          ],
+          costUsd: 0,
+        };
+      } catch (pollErr) {
+        if (pollErr instanceof AIProviderError) {
+          if (pollErr.httpStatus === 404) {
+            return {
+              status: 'failed',
+              progressPercent: 0,
+              errorMessage: 'شناسه پردازش تصویر در سرور منقضی شد. لطفاً دوباره تلاش کنید.',
+            };
+          }
+          if (pollErr.retryable && pollErr.code === 'TIMEOUT') {
+            return { status: 'running', progressPercent: 60 };
+          }
+          return {
+            status: 'failed',
+            progressPercent: 0,
+            errorMessage: redactSecrets(pollErr.message, ctx.apiKey ? [ctx.apiKey] : []),
+          };
+        }
+        throw pollErr;
+      }
+    }
+
+    return {
+      status: 'failed',
+      progressPercent: 0,
+      errorMessage: 'پشتیبانی از polling رسانه برای این ارائه‌دهنده تعریف نشده است.',
+    };
   } catch (err) {
     throw wrapNetworkError(err, ctx.apiKey);
   }

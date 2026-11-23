@@ -1,6 +1,8 @@
 import { Client, Receiver } from '@upstash/qstash';
 import { getQStashConfig, getEnvValidationSummary } from '../config/env.ts';
 import {
+  getCloudflareAiBinding,
+  getCloudflareJobQueue,
   getCloudflareRequestContext,
   getCloudflareWaitUntil,
   runWithCloudflareRequestContext,
@@ -11,7 +13,7 @@ import type { CloudflareBlobStore } from '../storage/storageAdapter.ts';
 import type { CloudflareSqlExecutor } from '../../db/index.ts';
 
 export interface QueuedJobPayload {
-  kind: 'telegram_update' | 'ai_generation_job' | 'video_poll_job';
+  kind: 'telegram_update' | 'ai_generation_job' | 'video_poll_job' | 'media_poll_job';
   idempotencyKey: string;
   jobId?: string;
   requestId?: string;
@@ -48,6 +50,8 @@ function captureRequestContext(): CloudflareRequestContext {
     sqlExecutor: active?.sqlExecutor ?? g._hooshnegarCfSqlExecutor,
     blobStore: active?.blobStore ?? g._hooshnegarCfBlobStore,
     r2Bucket: active?.r2Bucket ?? g._hooshnegarCfR2Bucket,
+    aiBinding: active?.aiBinding ?? getCloudflareAiBinding(),
+    jobQueue: active?.jobQueue ?? getCloudflareJobQueue(),
     waitUntil: active?.waitUntil ?? getCloudflareWaitUntil(),
   };
 }
@@ -84,15 +88,29 @@ export async function verifyQStashSignature(params: {
   }
 }
 
+export function hasDurableAsyncQueue(): boolean {
+  const cfg = getQStashConfig();
+  const baseUrl = getCallbackBaseUrl();
+  if (cfg.configured && baseUrl.startsWith('https://')) {
+    return true;
+  }
+  const cfQueue = getCloudflareJobQueue();
+  return Boolean(cfQueue && typeof cfQueue.send === 'function');
+}
+
 /**
  * Enqueues a durable background job via Upstash QStash when configured,
- * executes inside Cloudflare ctx.waitUntil() on Cloudflare Workers,
- * or executes asynchronously with bounded retries in local Node.js runtime.
+ * Cloudflare Queues when bound as `env.JOB_QUEUE`,
+ * Cloudflare `ctx.waitUntil()` on Cloudflare Workers,
+ * or asynchronous local execution with bounded retries in Node.js.
  */
 export async function enqueueBackgroundJob(
   payload: QueuedJobPayload,
   options?: { delaySeconds?: number; retries?: number },
-): Promise<{ mode: 'qstash' | 'cloudflare_waituntil' | 'local_async'; messageId: string }> {
+): Promise<{
+  mode: 'qstash' | 'cloudflare_queue' | 'cloudflare_waituntil' | 'local_async';
+  messageId: string;
+}> {
   const cfg = getQStashConfig();
   const baseUrl = getCallbackBaseUrl();
   const retries = Math.max(1, options?.retries ?? 3);
@@ -101,7 +119,9 @@ export async function enqueueBackgroundJob(
   if (cfg.configured && baseUrl.startsWith('https://')) {
     const client = new Client({ token: cfg.token });
     const targetPath =
-      payload.kind === 'video_poll_job' ? '/api/jobs/poll' : '/api/jobs/process';
+      payload.kind === 'video_poll_job' || payload.kind === 'media_poll_job'
+        ? '/api/jobs/poll'
+        : '/api/jobs/process';
     const result = await client.publishJSON({
       url: `${baseUrl}${targetPath}`,
       body: payload,
@@ -113,6 +133,18 @@ export async function enqueueBackgroundJob(
     return {
       mode: 'qstash',
       messageId: result.messageId,
+    };
+  }
+
+  const cfQueue = getCloudflareJobQueue();
+  if (cfQueue && typeof cfQueue.send === 'function') {
+    await cfQueue.send(
+      payload,
+      delaySeconds > 0 ? { delaySeconds: Math.min(43_200, Math.max(1, Math.round(delaySeconds))) } : undefined,
+    );
+    return {
+      mode: 'cloudflare_queue',
+      messageId: `cfq_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     };
   }
 

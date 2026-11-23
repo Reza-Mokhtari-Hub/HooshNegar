@@ -5,7 +5,9 @@ import {
   extractGradioMediaUrl,
   extractGradioOutputText,
   generateTextWithRoute,
+  pollMediaGenerationJob,
   pollVideoGenerationJob,
+  startImageGenerationWithRoute,
   startVideoGenerationWithRoute,
   type GradioFileData,
 } from './engine.ts';
@@ -564,4 +566,234 @@ describe('Universal Hugging Face Space Engine', () => {
     );
     expect(canvasParam?.isImageEditor).toBe(true);
   });
+
+  it('refreshes stale cached txt2img Gradio parameters when image editing requires an image slot', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let calledEndpoint = '';
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith('/gradio_api/info')) {
+          return new Response(
+            JSON.stringify({
+              named_endpoints: {
+                '/txt2img': {
+                  parameters: [{ parameter_name: 'prompt', label: 'Prompt', component: 'Textbox' }],
+                  returns: [{ label: 'Out', component: 'Image' }],
+                },
+                '/img_edit': {
+                  parameters: [
+                    { parameter_name: 'image', label: 'Source Image', component: 'Image' },
+                    { parameter_name: 'prompt', label: 'Edit Prompt', component: 'Textbox' },
+                  ],
+                  returns: [{ label: 'Out', component: 'Image' }],
+                },
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        if (url.endsWith('/gradio_api/upload')) {
+          return new Response(JSON.stringify(['/tmp/src_refresh.png']), { status: 200 });
+        }
+        if (url.includes('/gradio_api/call/') && init?.method === 'POST') {
+          calledEndpoint = url;
+          return new Response(JSON.stringify({ event_id: 'evt_refreshed_1' }), { status: 200 });
+        }
+        if (url.endsWith('/gradio_api/call/img_edit/evt_refreshed_1')) {
+          const sse = `event: complete\ndata: [{"url":"https://refresh-demo.hf.space/gradio_api/file=/tmp/edited_ok.png","path":"/tmp/edited_ok.png"}]\n\n`;
+          return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+        }
+        if (url.includes('/file=/tmp/edited_ok.png')) {
+          return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+            status: 200,
+            headers: { 'Content-Type': 'image/png' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      }) as typeof fetch;
+
+      const staleCtx = makeSpaceCtx({
+        baseUrl: 'https://refresh-demo.hf.space',
+        modelParameters: {
+          spaceHost: 'https://refresh-demo.hf.space',
+          apiName: 'txt2img',
+          endpointPrefix: '/gradio_api',
+          parameters: [{ index: 0, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false }],
+        },
+      });
+
+      const res = await editImageWithRoute(
+        { primary: staleCtx, fallback: null },
+        {
+          prompt: 'Add snow mountains',
+          sourceImageBuffer: Buffer.from([1, 2, 3, 4]),
+          sourceMimeType: 'image/png',
+          mode: 'edit',
+        },
+      );
+      expect(calledEndpoint.endsWith('/gradio_api/call/img_edit')).toBe(true);
+      expect(res.result.images.length).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('hands off slow HF Space image jobs to async pending and finishes via pollMediaGenerationJob', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let pollHit = false;
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith('/gradio_api/call/generate') && init?.method === 'POST') {
+          return new Response(JSON.stringify({ event_id: 'evt_slow_img_77' }), { status: 200 });
+        }
+        if (url.endsWith('/gradio_api/call/generate/evt_slow_img_77')) {
+          if (!pollHit) {
+            pollHit = true;
+            // Hold SSE open until abort signal fires from syncWaitCapMs
+            return new Promise<Response>((_, reject) => {
+              init?.signal?.addEventListener('abort', () => {
+                reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+              });
+            });
+          }
+          const sse = `event: complete\ndata: [{"url":"https://slow-img.hf.space/gradio_api/file=/tmp/final_img.png","path":"/tmp/final_img.png"}]\n\n`;
+          return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+        }
+        if (url.includes('/file=/tmp/final_img.png')) {
+          return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+            status: 200,
+            headers: { 'Content-Type': 'image/png' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      }) as typeof fetch;
+
+      const ctx = makeSpaceCtx({
+        baseUrl: 'https://slow-img.hf.space',
+        modelParameters: {
+          spaceHost: 'https://slow-img.hf.space',
+          apiName: 'generate',
+          endpointPrefix: '/gradio_api',
+          parameters: [{ index: 0, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false }],
+        },
+      });
+
+      const started = await startImageGenerationWithRoute(
+        { primary: ctx, fallback: null },
+        { prompt: 'Epic mountain sunset' },
+        { syncWaitCapMs: 500 },
+      );
+      expect(started.kind).toBe('pending');
+      if (started.kind !== 'pending') throw new Error('Expected pending');
+      expect(started.providerJobId).toBe('evt_slow_img_77');
+
+      const polled = await pollMediaGenerationJob(ctx, started.providerJobId, started.metadata);
+      expect(polled.status).toBe('succeeded');
+      expect(polled.images?.length).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('aborts hung first key, rotates to backup key in pool, and formats redacted multi-key traces', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      const secret1 = 'hf_secret_key_alpha_111111';
+      const secret2 = 'hf_secret_key_bravo_222222';
+      let sawAlpha = false;
+      let sawBravo = false;
+
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        const auth = new Headers(init?.headers).get('authorization') ?? '';
+        if (url === 'https://pool-test.hf.space/v1/chat/completions') {
+          if (auth.includes(secret1)) {
+            sawAlpha = true;
+            return new Promise<Response>((_, reject) => {
+              init?.signal?.addEventListener('abort', () => {
+                reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+              });
+            });
+          }
+          if (auth.includes(secret2)) {
+            sawBravo = true;
+            return new Response(
+              JSON.stringify({
+                choices: [{ message: { content: 'موفق با کلید دوم' }, finish_reason: 'stop' }],
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+        }
+        return new Response('not found', { status: 404 });
+      }) as typeof fetch;
+
+      const key1Ctx = makeSpaceCtx({
+        apiKey: secret1,
+        credentialLabel: 'Key-Alpha',
+        maskedPreview: 'hf_sec...1111',
+        baseUrl: 'https://pool-test.hf.space',
+        modelParameters: {
+          spaceHost: 'https://pool-test.hf.space',
+          openAiCompatible: true,
+          openAiModelId: 'qwen-7b',
+        },
+      });
+      const key2Ctx = makeSpaceCtx({
+        apiKey: secret2,
+        credentialLabel: 'Key-Bravo',
+        maskedPreview: 'hf_sec...2222',
+        baseUrl: 'https://pool-test.hf.space',
+        modelParameters: {
+          spaceHost: 'https://pool-test.hf.space',
+          openAiCompatible: true,
+          openAiModelId: 'qwen-7b',
+        },
+      });
+      const pooledPrimary: ProviderExecutionContext = {
+        ...key1Ctx,
+        credentialPool: [key1Ctx, key2Ctx],
+      };
+
+      const okRes = await runWithCloudflareRequestContext(
+        { waitUntil: () => {}, childWaitUntilTasks: [] },
+        () =>
+          generateTextWithRoute(
+            { primary: pooledPrimary, fallback: null },
+            { messages: [{ role: 'user', content: 'تست سویچ کلید' }] },
+          ),
+      );
+      expect(sawAlpha).toBe(true);
+      expect(sawBravo).toBe(true);
+      expect(okRes.result.text).toBe('موفق با کلید دوم');
+
+      // Now simulate BOTH keys failing -> verify full redacted multi-key diagnostic trace
+      globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        const auth = new Headers(init?.headers).get('authorization') ?? '';
+        if (auth.includes(secret1)) {
+          return new Response(`Invalid API key ${secret1}`, { status: 401 });
+        }
+        return new Response(`Rate limit exceeded for ${secret2}`, { status: 429 });
+      }) as typeof fetch;
+
+      let poolError: Error | null = null;
+      try {
+        await generateTextWithRoute(
+          { primary: pooledPrimary, fallback: null },
+          { messages: [{ role: 'user', content: 'تست لاگ خطا' }] },
+        );
+      } catch (err) {
+        poolError = err as Error;
+      }
+      expect(poolError).toBeTruthy();
+      expect(poolError!.message).toContain('#1 [HF Space Test · Key-Alpha (hf_sec...1111)');
+      expect(poolError!.message).toContain('#2 [HF Space Test · Key-Bravo (hf_sec...2222)');
+      expect(poolError!.message).not.toContain(secret1);
+      expect(poolError!.message).not.toContain(secret2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }, 15_000);
 });

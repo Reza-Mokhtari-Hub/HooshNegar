@@ -13,20 +13,22 @@ import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import {
   analyzeDocumentWithRoute,
   analyzeVisionWithRoute,
-  editImageWithRoute,
-  generateImageWithRoute,
   generateSpeechWithRoute,
   generateTextWithRoute,
   loadModelExecutionRoute,
+  pollMediaGenerationJob,
   pollVideoGenerationJob,
+  startImageEditWithRoute,
+  startImageGenerationWithRoute,
   startVideoGenerationWithRoute,
   transcribeAudioWithRoute,
+  type ImageJobOutcome,
 } from '../providers/engine.ts';
 import { AIProviderError, type ChatMessage } from '../providers/types.ts';
 import { reconcileRequestSuccess, refundFailedRequest } from '../services/usageService.ts';
 import { extractDocumentContent, validateAudioFile } from '../services/documentService.ts';
 import { getStorageAdapter } from '../storage/storageAdapter.ts';
-import { enqueueBackgroundJob } from '../queue/qstash.ts';
+import { enqueueBackgroundJob, hasDurableAsyncQueue } from '../queue/qstash.ts';
 import {
   createThrottledStreamEditor,
   sendFormattedTelegramResponse,
@@ -133,7 +135,45 @@ async function sendSafeErrorToChat(
   }
 }
 
-export async function executeQueuedGenerationJob(jobId: string): Promise<{
+async function deliverImageToTelegram(params: {
+  api: Api;
+  chatId: number;
+  buffer: Buffer;
+  fileName: string;
+  caption: string;
+}): Promise<void> {
+  if (!params.buffer || params.buffer.byteLength === 0) {
+    throw new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: 'Generated image buffer is empty.',
+      userMessageFa: 'فایل تصویر تولیدشده خالی بود. لطفاً دوباره تلاش کنید.',
+    });
+  }
+  const safeCaption = params.caption.slice(0, 1000);
+  const inputFile = new InputFile(new Uint8Array(params.buffer), params.fileName);
+  try {
+    await params.api.sendPhoto(params.chatId, inputFile, { caption: safeCaption });
+  } catch (photoErr) {
+    const errMsg = photoErr instanceof Error ? photoErr.message : String(photoErr ?? '');
+    const shouldFallbackToDocument =
+      /PHOTO_INVALID_DIMENSIONS|IMAGE_PROCESS_FAILED|PHOTO_EXT_INVALID|FILE_PARTS|wrong type of the web page content|Bad Request/i.test(
+        errMsg,
+      );
+    if (!shouldFallbackToDocument) {
+      throw photoErr;
+    }
+    await params.api.sendDocument(
+      params.chatId,
+      new InputFile(new Uint8Array(params.buffer), params.fileName),
+      { caption: safeCaption },
+    );
+  }
+}
+
+export async function executeQueuedGenerationJob(
+  jobId: string,
+  options?: { maxSyncWaitMs?: number },
+): Promise<{
   ok: boolean;
   status: string;
   responseText?: string;
@@ -405,19 +445,19 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
       const resolution = typeof payload.resolution === 'string' ? payload.resolution : '1K';
       const countNum = Number(payload.count ?? 1);
 
-      let outputRes: {
-        result: { images: Array<{ buffer: Buffer; mimeType: string; extension: string; revisedPrompt?: string }>; costUsd: number };
-        usedFallback: boolean;
-        providerId: string;
-      };
+      let outcome: ImageJobOutcome;
 
       if (job.capability === 'image_generation') {
-        outputRes = await generateImageWithRoute(route, {
-          prompt,
-          aspectRatio,
-          resolution,
-          count: countNum,
-        });
+        outcome = await startImageGenerationWithRoute(
+          route,
+          {
+            prompt,
+            aspectRatio,
+            resolution,
+            count: countNum,
+          },
+          { syncWaitCapMs: options?.maxSyncWaitMs },
+        );
       } else {
         let sourceBuffer: Buffer;
         const sourceMimeType =
@@ -441,22 +481,73 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
           });
         }
 
-        outputRes = await editImageWithRoute(route, {
-          prompt,
-          sourceImageBuffer: sourceBuffer,
-          sourceMimeType,
-          mode: job.capability === 'image_variation' ? 'variation' : 'edit',
-          aspectRatio,
-          resolution,
-        });
+        outcome = await startImageEditWithRoute(
+          route,
+          {
+            prompt,
+            sourceImageBuffer: sourceBuffer,
+            sourceMimeType,
+            mode: job.capability === 'image_variation' ? 'variation' : 'edit',
+            aspectRatio,
+            resolution,
+          },
+          { syncWaitCapMs: options?.maxSyncWaitMs },
+        );
+      }
+
+      if (outcome.kind === 'pending') {
+        const nextProgress = Math.max(25, outcome.progressPercent);
+        await db
+          .update(generationJobs)
+          .set({
+            providerJobId: outcome.providerJobId,
+            progressPercent: nextProgress,
+            resultMetadata: {
+              ...outcome.metadata,
+              pollCount: 0,
+              providerId: outcome.providerId,
+              usedFallback: outcome.usedFallback,
+              aspectRatio,
+              lastPolledAtMs: Date.now(),
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(generationJobs.id, job.id));
+
+        if (api && job.telegramChatId && job.statusMessageId) {
+          const verb = job.capability === 'image_generation' ? 'ساخت تصویر' : 'ویرایش تصویر';
+          try {
+            await api.editMessageText(
+              job.telegramChatId,
+              job.statusMessageId,
+              `🎨 درخواست ${verb} در صف پردازش قرار گرفت (${nextProgress}٪)...\nپس از آماده شدن به‌صورت خودکار ارسال می‌شود.`,
+            );
+          } catch {
+            // ignore
+          }
+        }
+
+        if (hasDurableAsyncQueue() || !silentDelivery) {
+          await enqueueBackgroundJob(
+            {
+              kind: 'media_poll_job',
+              idempotencyKey: `mediapoll:${job.id}:1`,
+              jobId: job.id,
+              requestId: reqRow.id,
+            },
+            { delaySeconds: hasDurableAsyncQueue() ? 5 : 2, retries: 3 },
+          );
+        }
+
+        return { ok: true, status: 'running' };
       }
 
       const storage = getStorageAdapter();
       let firstKey: string | null = null;
       const storedKeys: string[] = [];
 
-      for (let i = 0; i < outputRes.result.images.length; i++) {
-        const img = outputRes.result.images[i]!;
+      for (let i = 0; i < outcome.result.images.length; i++) {
+        const img = outcome.result.images[i]!;
         const canDeliverToTelegram = Boolean(api && job.telegramChatId);
 
         try {
@@ -483,11 +574,13 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
 
         if (api && job.telegramChatId) {
           const caption = `🎨 تصویر تولیدشده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`;
-          await api.sendPhoto(
-            job.telegramChatId,
-            new InputFile(new Uint8Array(img.buffer), `hooshnegar-${i + 1}.${img.extension}`),
-            { caption: caption.slice(0, 1000) },
-          );
+          await deliverImageToTelegram({
+            api,
+            chatId: job.telegramChatId,
+            buffer: img.buffer,
+            fileName: `hooshnegar-${i + 1}.${img.extension}`,
+            caption,
+          });
         }
       }
 
@@ -502,13 +595,13 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
       await reconcileRequestSuccess({
         requestId: reqRow.id,
         jobId: job.id,
-        providerId: outputRes.providerId,
-        costUsd: outputRes.result.costUsd,
+        providerId: outcome.providerId,
+        costUsd: outcome.result.costUsd,
         latencyMs: Date.now() - startedAt,
-        responsePreview: `تولید ${outputRes.result.images.length} تصویر با موفقیت انجام شد.`,
-        usedFallback: outputRes.usedFallback,
+        responsePreview: `تولید ${outcome.result.images.length} تصویر با موفقیت انجام شد.`,
+        usedFallback: outcome.usedFallback,
         storageObjectKey: firstKey,
-        resultMetadata: { imageCount: outputRes.result.images.length, objectKeys: storedKeys },
+        resultMetadata: { imageCount: outcome.result.images.length, objectKeys: storedKeys },
       });
 
       return { ok: true, status: 'succeeded', storageObjectKey: firstKey };
@@ -800,7 +893,13 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
         .set({
           providerJobId: result.providerJobId,
           progressPercent: Math.max(25, result.progressPercent),
-          resultMetadata: { ...(result.metadata ?? {}), pollCount: 0, providerId },
+          resultMetadata: {
+            ...(result.metadata ?? {}),
+            pollCount: 0,
+            providerId,
+            usedFallback,
+            lastPolledAtMs: Date.now(),
+          },
           updatedAt: new Date(),
         })
         .where(eq(generationJobs.id, job.id));
@@ -817,15 +916,17 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
         }
       }
 
-      await enqueueBackgroundJob(
-        {
-          kind: 'video_poll_job',
-          idempotencyKey: `vidpoll:${job.id}:1`,
-          jobId: job.id,
-          requestId: reqRow.id,
-        },
-        { delaySeconds: 8, retries: 3 },
-      );
+      if (hasDurableAsyncQueue() || !silentDelivery) {
+        await enqueueBackgroundJob(
+          {
+            kind: 'video_poll_job',
+            idempotencyKey: `vidpoll:${job.id}:1`,
+            jobId: job.id,
+            requestId: reqRow.id,
+          },
+          { delaySeconds: 8, retries: 3 },
+        );
+      }
 
       return { ok: true, status: 'running' };
     }
@@ -868,7 +969,211 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
   }
 }
 
-export async function executeVideoPollJob(jobId: string): Promise<{
+export async function executeMediaPollJob(
+  jobId: string,
+  options?: { maxWaitMs?: number; scheduleNextPoll?: boolean },
+): Promise<{
+  ok: boolean;
+  status: string;
+  storageObjectKey?: string | null;
+}> {
+  const db = getDb();
+  const [job] = await db
+    .select()
+    .from(generationJobs)
+    .where(eq(generationJobs.id, jobId))
+    .limit(1);
+
+  if (
+    !job ||
+    !job.providerJobId ||
+    job.status === 'succeeded' ||
+    job.status === 'failed' ||
+    job.status === 'canceled'
+  ) {
+    return { ok: false, status: job?.status ?? 'not_found' };
+  }
+
+  const [reqRow] = await db
+    .select()
+    .from(aiRequests)
+    .where(eq(aiRequests.id, job.requestId))
+    .limit(1);
+
+  if (!reqRow || !reqRow.modelId) {
+    return { ok: false, status: 'failed' };
+  }
+
+  const payload = (job.payload ?? {}) as Record<string, unknown>;
+  const silentDelivery = payload.silentDelivery === true;
+  const tgClient = !silentDelivery && job.telegramChatId ? await getConfiguredTelegramApi() : null;
+  const api = tgClient?.api ?? null;
+
+  try {
+    const route = await loadModelExecutionRoute(reqRow.modelId);
+    const meta = (job.resultMetadata ?? {}) as Record<string, unknown>;
+    const pollCount = Number(meta.pollCount ?? 0) + 1;
+
+    const targetCredentialId = typeof meta.credentialId === 'string' ? meta.credentialId : null;
+    const basePoolCtx =
+      route.fallback && meta.providerId === route.fallback.providerId
+        ? route.fallback
+        : route.primary;
+    const pollCtx =
+      (targetCredentialId &&
+        basePoolCtx.credentialPool?.find((c) => c.credentialId === targetCredentialId)) ||
+      basePoolCtx;
+
+    const pollRes = await pollMediaGenerationJob(pollCtx, job.providerJobId, meta, {
+      maxWaitMs: options?.maxWaitMs,
+    });
+
+    if (pollRes.status === 'succeeded' && pollRes.images && pollRes.images.length > 0) {
+      const storage = getStorageAdapter();
+      let firstKey: string | null = null;
+      const storedKeys: string[] = [];
+      const aspectRatio =
+        typeof meta.aspectRatio === 'string'
+          ? meta.aspectRatio
+          : typeof payload.aspectRatio === 'string'
+            ? payload.aspectRatio
+            : '1:1';
+
+      for (let i = 0; i < pollRes.images.length; i++) {
+        const img = pollRes.images[i]!;
+        const canDeliverToTelegram = Boolean(api && job.telegramChatId);
+        try {
+          const stored = await storage.putObject({
+            buffer: img.buffer,
+            mimeType: img.mimeType,
+            extension: img.extension,
+            prefix: 'generated-images',
+            userId: job.userId,
+            requestId: reqRow.id,
+            jobId: job.id,
+          });
+          if (!firstKey) firstKey = stored.objectKey;
+          storedKeys.push(stored.objectKey);
+        } catch (storageErr) {
+          if (!canDeliverToTelegram) throw storageErr;
+        }
+
+        if (api && job.telegramChatId) {
+          await deliverImageToTelegram({
+            api,
+            chatId: job.telegramChatId,
+            buffer: img.buffer,
+            fileName: `hooshnegar-${i + 1}.${img.extension}`,
+            caption: `🎨 تصویر تولیدشده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`,
+          });
+        }
+      }
+
+      if (api && job.telegramChatId && job.statusMessageId) {
+        try {
+          await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+        } catch {
+          // ignore
+        }
+      }
+
+      const latencyMs = job.startedAt ? Date.now() - job.startedAt.getTime() : 0;
+      await reconcileRequestSuccess({
+        requestId: reqRow.id,
+        jobId: job.id,
+        providerId: pollCtx.providerId,
+        costUsd: pollRes.costUsd ?? 0,
+        latencyMs,
+        responsePreview: `تولید ${pollRes.images.length} تصویر با موفقیت انجام شد.`,
+        usedFallback: meta.usedFallback === true,
+        storageObjectKey: firstKey,
+        resultMetadata: { imageCount: pollRes.images.length, objectKeys: storedKeys },
+      });
+
+      return { ok: true, status: 'succeeded', storageObjectKey: firstKey };
+    }
+
+    if (pollRes.status === 'failed' || pollCount >= 20) {
+      const reason =
+        pollRes.errorMessage ?? 'زمان پردازش تصویر در سرور مدل به پایان رسید (Timeout).';
+      await refundFailedRequest({
+        requestId: reqRow.id,
+        jobId: job.id,
+        errorCode: 'IMAGE_POLL_FAILED',
+        errorMessage: reason,
+      });
+      await sendSafeErrorToChat(
+        api,
+        job.telegramChatId,
+        job.statusMessageId,
+        'در حال حاضر امکان تکمیل تصویر با این مدل وجود نداشت. لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
+      );
+      return { ok: false, status: 'failed' };
+    }
+
+    const nextProgress = Math.min(95, Math.max(job.progressPercent + 12, pollRes.progressPercent));
+    await db
+      .update(generationJobs)
+      .set({
+        status: 'running',
+        progressPercent: nextProgress,
+        resultMetadata: { ...meta, pollCount, lastPolledAtMs: Date.now() },
+        updatedAt: new Date(),
+      })
+      .where(eq(generationJobs.id, job.id));
+
+    if (api && job.telegramChatId && job.statusMessageId) {
+      try {
+        await api.editMessageText(
+          job.telegramChatId,
+          job.statusMessageId,
+          `🎨 در حال پردازش تصویر (${nextProgress}٪)...\nلطفاً لحظاتی دیگر صبر کنید.`,
+        );
+      } catch {
+        // ignore
+      }
+    }
+
+    const shouldSchedule =
+      options?.scheduleNextPoll !== undefined
+        ? options.scheduleNextPoll
+        : hasDurableAsyncQueue() || !silentDelivery;
+
+    if (shouldSchedule) {
+      await enqueueBackgroundJob(
+        {
+          kind: 'media_poll_job',
+          idempotencyKey: `mediapoll:${job.id}:${pollCount + 1}`,
+          jobId: job.id,
+          requestId: reqRow.id,
+        },
+        { delaySeconds: hasDurableAsyncQueue() ? 6 : 2, retries: 3 },
+      );
+    }
+
+    return { ok: true, status: 'running' };
+  } catch (err) {
+    const msg = redactSecrets(err instanceof Error ? err.message : 'Media polling failed');
+    await refundFailedRequest({
+      requestId: reqRow.id,
+      jobId: job.id,
+      errorCode: 'MEDIA_POLL_ERROR',
+      errorMessage: msg,
+    });
+    await sendSafeErrorToChat(
+      api,
+      job.telegramChatId,
+      job.statusMessageId,
+      'خطا در بررسی وضعیت تولید تصویر. اعتبار شما بازگردانده شد.',
+    );
+    return { ok: false, status: 'failed' };
+  }
+}
+
+export async function executeVideoPollJob(
+  jobId: string,
+  options?: { scheduleNextPoll?: boolean },
+): Promise<{
   ok: boolean;
   status: string;
   storageObjectKey?: string | null;
@@ -905,10 +1210,14 @@ export async function executeVideoPollJob(jobId: string): Promise<{
     const pollCount = Number(meta.pollCount ?? 0) + 1;
 
     const targetCredentialId = typeof meta.credentialId === 'string' ? meta.credentialId : null;
+    const basePoolCtx =
+      route.fallback && meta.providerId === route.fallback.providerId
+        ? route.fallback
+        : route.primary;
     const pollCtx =
       (targetCredentialId &&
-        route.primary.credentialPool?.find((c) => c.credentialId === targetCredentialId)) ||
-      route.primary;
+        basePoolCtx.credentialPool?.find((c) => c.credentialId === targetCredentialId)) ||
+      basePoolCtx;
 
     const pollRes = await pollVideoGenerationJob(pollCtx, job.providerJobId, meta);
 
@@ -953,10 +1262,11 @@ export async function executeVideoPollJob(jobId: string): Promise<{
       await reconcileRequestSuccess({
         requestId: reqRow.id,
         jobId: job.id,
-        providerId: route.primary.providerId,
+        providerId: pollCtx.providerId,
         costUsd: pollRes.costUsd ?? 0.2,
         latencyMs,
         responsePreview: 'ویدیو با موفقیت تولید شد.',
+        usedFallback: meta.usedFallback === true,
         storageObjectKey: stored.objectKey,
       });
 
@@ -981,8 +1291,9 @@ export async function executeVideoPollJob(jobId: string): Promise<{
     await db
       .update(generationJobs)
       .set({
+        status: 'running',
         progressPercent: nextProgress,
-        resultMetadata: { ...meta, pollCount },
+        resultMetadata: { ...meta, pollCount, lastPolledAtMs: Date.now() },
         updatedAt: new Date(),
       })
       .where(eq(generationJobs.id, job.id));
@@ -999,15 +1310,22 @@ export async function executeVideoPollJob(jobId: string): Promise<{
       }
     }
 
-    await enqueueBackgroundJob(
-      {
-        kind: 'video_poll_job',
-        idempotencyKey: `vidpoll:${job.id}:${pollCount + 1}`,
-        jobId: job.id,
-        requestId: reqRow.id,
-      },
-      { delaySeconds: 10, retries: 3 },
-    );
+    const shouldSchedule =
+      options?.scheduleNextPoll !== undefined
+        ? options.scheduleNextPoll
+        : hasDurableAsyncQueue() || !silentDelivery;
+
+    if (shouldSchedule) {
+      await enqueueBackgroundJob(
+        {
+          kind: 'video_poll_job',
+          idempotencyKey: `vidpoll:${job.id}:${pollCount + 1}`,
+          jobId: job.id,
+          requestId: reqRow.id,
+        },
+        { delaySeconds: 10, retries: 3 },
+      );
+    }
 
     return { ok: true, status: 'running' };
   } catch (err) {
