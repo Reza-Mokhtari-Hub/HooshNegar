@@ -117,7 +117,10 @@ export async function enqueueBackgroundJob(
   const delaySeconds = options?.delaySeconds ?? 0;
 
   if (cfg.configured && baseUrl.startsWith('https://')) {
-    const client = new Client({ token: cfg.token });
+    const client = new Client({
+      token: cfg.token,
+      ...(cfg.baseUrl ? { baseUrl: cfg.baseUrl } : {}),
+    });
     const targetPath =
       payload.kind === 'video_poll_job' || payload.kind === 'media_poll_job'
         ? '/api/jobs/poll'

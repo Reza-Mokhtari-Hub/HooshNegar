@@ -117,17 +117,72 @@ export function isAiMockModeEnabled(): boolean {
   return process.env.AI_MOCK_MODE === 'true' || process.env.AI_MOCK_MODE === '1';
 }
 
+function normalizeQStashBaseUrl(rawUrl: string | undefined): string {
+  const trimmed = rawUrl?.trim() ?? '';
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.origin;
+    }
+  } catch {
+    // Ignore malformed URL and fall back to trimmed host without trailing slash
+  }
+  return trimmed.replace(/\/+$/, '');
+}
+
+function normalizeQStashTokenAndFallbackUrl(rawToken: string | undefined): {
+  token: string;
+  fallbackBaseUrl: string;
+} {
+  const trimmed = rawToken?.trim() ?? '';
+  if (!trimmed) {
+    return { token: '', fallbackBaseUrl: '' };
+  }
+
+  let candidate = trimmed;
+  let fallbackBaseUrl = '';
+
+  if (candidate.startsWith('http://') || candidate.startsWith('https://')) {
+    try {
+      const parsed = new URL(candidate);
+      fallbackBaseUrl = parsed.origin;
+      const fromParam = parsed.searchParams.get('qstash_token')?.trim();
+      if (fromParam) {
+        candidate = fromParam;
+      }
+    } catch {
+      // Keep original string if URL parsing fails
+    }
+  }
+
+  if (candidate.includes('%')) {
+    try {
+      candidate = decodeURIComponent(candidate);
+    } catch {
+      // Keep original token if percent-decoding fails
+    }
+  }
+
+  return { token: candidate.trim(), fallbackBaseUrl };
+}
+
 export function getQStashConfig(): {
   configured: boolean;
+  baseUrl: string;
   token: string;
   currentSigningKey: string;
   nextSigningKey: string;
 } {
-  const token = process.env.QSTASH_TOKEN?.trim() ?? '';
+  const explicitBaseUrl = normalizeQStashBaseUrl(process.env.QSTASH_URL);
+  const parsedToken = normalizeQStashTokenAndFallbackUrl(process.env.QSTASH_TOKEN);
+  const baseUrl = explicitBaseUrl || parsedToken.fallbackBaseUrl;
+  const token = parsedToken.token;
   const currentSigningKey = process.env.QSTASH_CURRENT_SIGNING_KEY?.trim() ?? '';
   const nextSigningKey = process.env.QSTASH_NEXT_SIGNING_KEY?.trim() ?? '';
   return {
     configured: Boolean(token && currentSigningKey),
+    baseUrl,
     token,
     currentSigningKey,
     nextSigningKey,

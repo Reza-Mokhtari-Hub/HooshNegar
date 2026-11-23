@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { buildRuntimeDiagnostics, classifyDatabaseError } from './diagnostics.ts';
+import { getQStashConfig } from './env.ts';
 
 describe('Runtime Self-Diagnostics', () => {
   it('detects Cloudflare Build-vs-Runtime misconfiguration when only ASSETS is bound', () => {
@@ -97,5 +98,48 @@ describe('Runtime Self-Diagnostics', () => {
     expect(report.databaseMode).toBe('cloudflare_durable_object');
     expect(report.missingRequiredVars).toEqual([]);
     expect(report.probableCause).toBeNull();
+  });
+});
+
+describe('QStash Configuration Normalization', () => {
+  const prevUrl = process.env.QSTASH_URL;
+  const prevToken = process.env.QSTASH_TOKEN;
+  const prevCurr = process.env.QSTASH_CURRENT_SIGNING_KEY;
+  const prevNext = process.env.QSTASH_NEXT_SIGNING_KEY;
+
+  afterEach(() => {
+    if (prevUrl === undefined) delete process.env.QSTASH_URL;
+    else process.env.QSTASH_URL = prevUrl;
+    if (prevToken === undefined) delete process.env.QSTASH_TOKEN;
+    else process.env.QSTASH_TOKEN = prevToken;
+    if (prevCurr === undefined) delete process.env.QSTASH_CURRENT_SIGNING_KEY;
+    else process.env.QSTASH_CURRENT_SIGNING_KEY = prevCurr;
+    if (prevNext === undefined) delete process.env.QSTASH_NEXT_SIGNING_KEY;
+    else process.env.QSTASH_NEXT_SIGNING_KEY = prevNext;
+  });
+
+  it('normalizes regional QSTASH_URL origin and decodes percent-encoded QSTASH_TOKEN', () => {
+    process.env.QSTASH_URL = 'https://qstash-eu-central-1.upstash.io/v2/publish/https://example.com';
+    process.env.QSTASH_TOKEN = 'dGVzdF90b2tlbl92YWx1ZQ%3D';
+    process.env.QSTASH_CURRENT_SIGNING_KEY = 'sig_current_test';
+    process.env.QSTASH_NEXT_SIGNING_KEY = 'sig_next_test';
+
+    const cfg = getQStashConfig();
+    expect(cfg.configured).toBe(true);
+    expect(cfg.baseUrl).toBe('https://qstash-eu-central-1.upstash.io');
+    expect(cfg.token).toBe('dGVzdF90b2tlbl92YWx1ZQ=');
+  });
+
+  it('extracts baseUrl and decoded token if a full publish URL was pasted into QSTASH_TOKEN', () => {
+    delete process.env.QSTASH_URL;
+    process.env.QSTASH_TOKEN =
+      'https://qstash-eu-central-1.upstash.io/v2/publish/https://example.com?qstash_token=abc123%3D';
+    process.env.QSTASH_CURRENT_SIGNING_KEY = 'sig_current_test';
+    delete process.env.QSTASH_NEXT_SIGNING_KEY;
+
+    const cfg = getQStashConfig();
+    expect(cfg.configured).toBe(true);
+    expect(cfg.baseUrl).toBe('https://qstash-eu-central-1.upstash.io');
+    expect(cfg.token).toBe('abc123=');
   });
 });
