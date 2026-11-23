@@ -818,7 +818,10 @@ export function createMiniAppRouter(): Router {
           responseText: reqRow?.responsePreview ?? null,
           storageObjectKey: job.storageObjectKey,
           mediaUrl: buildMediaUrl(job.storageObjectKey, auth.sessionToken),
-          errorMessage: job.errorMessage,
+          errorMessage:
+            job.status === 'failed'
+              ? 'امکان تکمیل این درخواست با مدل انتخابی وجود نداشت. لطفاً مدل دیگری انتخاب کنید یا دوباره تلاش نمایید.'
+              : null,
         },
         wallet: {
           balance: Number(freshWallet?.balance ?? auth.ensured.walletBalance),

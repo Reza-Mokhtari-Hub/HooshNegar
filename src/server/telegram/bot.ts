@@ -166,7 +166,7 @@ async function enqueueAiJobFromContext(params: {
   }
 
   const statusMsg = await params.ctx.reply(
-    `${params.statusText}\n🧠 مدل: ${model.name} (${model.providerName})`,
+    `${params.statusText}\n🧠 مدل: ${model.name}`,
     {
       reply_markup: buildStopGenerationKeyboard(reserved.requestId),
     },
@@ -822,7 +822,7 @@ export function createTelegramBotInstance(botToken: string): Bot {
         await updateTelegramUserState(ensured.telegramAccount.id, {}, updateCol);
         await safeAnswerCallback(ctx, `✅ مدل «${chosen.name}» انتخاب شد.`);
         await ctx.reply(
-          `✅ مدل فعال شما به <b>${escapeTelegramHtml(chosen.name)}</b> (${escapeTelegramHtml(chosen.providerName)}) تغییر یافت.\nهزینه هر درخواست: <b>${chosen.creditCost}</b> اعتبار`,
+          `✅ مدل فعال شما به <b>${escapeTelegramHtml(chosen.name)}</b> تغییر یافت.\nهزینه هر درخواست: <b>${chosen.creditCost}</b> اعتبار`,
           { parse_mode: 'HTML' },
         );
         return;
@@ -1661,7 +1661,7 @@ export function createTelegramBotInstance(botToken: string): Bot {
       if (chatId) {
         await err.ctx.api.sendMessage(
           chatId,
-          `❌ خطایی در پردازش پیام رخ داد.\n🔎 جزئیات فنی: ${safeMsg.slice(0, 160)}`,
+          '❌ خطایی در پردازش پیام رخ داد. لطفاً دوباره تلاش کنید.',
         );
       }
     } catch {

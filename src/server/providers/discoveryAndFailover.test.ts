@@ -21,7 +21,13 @@ import {
   normalizeGeminiRootBaseUrl,
   syncProviderModelsToDatabase,
 } from './discovery.ts';
-import { generateImageWithRoute, generateTextWithRoute, loadModelExecutionRoute } from './engine.ts';
+import {
+  generateImageWithRoute,
+  generateSpeechWithRoute,
+  generateTextWithRoute,
+  loadModelExecutionRoute,
+  transcribeAudioWithRoute,
+} from './engine.ts';
 import {
   ensureTelegramUser,
   getAvailableModelsForUser,
@@ -887,7 +893,8 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       generateImageWithRoute(imagenRoute, { prompt: 'sunset over Tehran' }),
     ).rejects.toMatchObject({
       code: 'PROVIDER_ERROR',
-      userMessageFa: expect.stringMatching(/Billing/i),
+      message: expect.stringMatching(/billed users/i),
+      userMessageFa: expect.stringMatching(/در حال حاضر در دسترس نیست/),
     });
 
     const [credAfter403] = await db
@@ -897,7 +904,8 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     expect(credAfter403?.status).toBe('active');
     expect(credAfter403?.cooldownUntil).toBeNull();
 
-    // 2. Gemini 429 with limit: 0 must NOT put credential into quota_exhausted cooldown
+    // 2. Gemini 429 with limit: 0 must NOT put credential into quota_exhausted cooldown,
+    //    keeps full diagnostics in err.message (for Admin) while err.userMessageFa stays clean for customers
     globalThis.fetch = (async () =>
       new Response(
         JSON.stringify({
@@ -912,13 +920,16 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       )) as unknown as typeof fetch;
 
     const flashRoute = await loadModelExecutionRoute(flashImgModel!.id);
-    await expect(
-      generateImageWithRoute(flashRoute, { prompt: 'neon cat' }),
-    ).rejects.toMatchObject({
-      code: 'RATE_LIMITED',
-      message: expect.stringMatching(/gemini-2\.5-flash-image.*limit: 0|Quota exceeded.*limit: 0/i),
-      userMessageFa: expect.stringMatching(/limit: 0.*Cloudflare Workers AI/s),
-    });
+    try {
+      await generateImageWithRoute(flashRoute, { prompt: 'neon cat' });
+      expect.unreachable('Should have thrown RATE_LIMITED');
+    } catch (err) {
+      const e = err as { code?: string; message?: string; userMessageFa?: string };
+      expect(e.code).toBe('RATE_LIMITED');
+      expect(e.message).toMatch(/gemini-2\.5-flash-image.*limit: 0|Quota exceeded.*limit: 0/i);
+      expect(e.userMessageFa).toMatch(/در حال حاضر در دسترس نیست/);
+      expect(e.userMessageFa).not.toMatch(/Google|Cloudflare|Billing|API|limit: 0|HTTP|کلودفلر|گوگل/i);
+    }
 
     const [credAfterLimitZero] = await db
       .select()
@@ -988,7 +999,8 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       .returning();
     await expect(loadModelExecutionRoute(disabledModel!.id)).rejects.toMatchObject({
       code: 'INVALID_API_KEY',
-      userMessageFa: expect.stringMatching(/غیرفعال شده است/),
+      message: expect.stringMatching(/disabled in admin panel/i),
+      userMessageFa: expect.stringMatching(/غیرفعال است/),
     });
 
     const [noKeyProv] = await db
@@ -1013,7 +1025,8 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       .returning();
     await expect(loadModelExecutionRoute(noKeyModel!.id)).rejects.toMatchObject({
       code: 'INVALID_API_KEY',
-      userMessageFa: expect.stringMatching(/هیچ کلید API/),
+      message: expect.stringMatching(/no API credentials registered/i),
+      userMessageFa: expect.stringMatching(/در حال حاضر در دسترس نیست/),
     });
 
     // 5. dall-e-3 maps 16:9 -> 1792x1024 and n: 1
@@ -1127,7 +1140,13 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
           });
         }
         if (model === '@cf/meta/llama-3.3-70b-instruct-fp8-fast') {
-          return { response: 'پاسخ رایگان از کلودفلر' };
+          return { response: 'پاسخ سریع از مدل لاما' };
+        }
+        if (model === '@cf/openai/whisper-large-v3-turbo') {
+          return { text: 'سلام دنیا از ویس' };
+        }
+        if (model === '@cf/deepgram/aura-1') {
+          return new Uint8Array([0x49, 0x44, 0x33, 0x03, 0x00]); // ID3 MP3 header bytes
         }
         throw new Error(`Unexpected model: ${model}`);
       },
@@ -1138,7 +1157,7 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     resetBootstrapCacheForTests();
     await ensureCloudflareWorkersAiSeeded();
 
-    // 1. Verify connection test and model discovery succeed natively with zero keys
+    // 1. Verify connection test and full 16-model catalog discovery succeed natively with zero keys
     const testRes = await testProviderConnection({
       providerType: 'cloudflare_workers_ai',
       baseUrl: 'https://api.cloudflare.com/client/v4',
@@ -1154,9 +1173,9 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       apiKey: '',
     });
     expect(discRes.ok).toBe(true);
-    expect(discRes.models.length).toBeGreaterThanOrEqual(4);
+    expect(discRes.models.length).toBeGreaterThanOrEqual(16);
 
-    // 2. Verify provider & 3 free image models were auto-seeded with FLUX.1 Schnell prioritized
+    // 2. Verify provider & all 16 Cloudflare models (Image, Chat, Multimodal, STT, TTS) were auto-seeded cleanly
     const [cfProvider] = await db
       .select()
       .from(aiProviders)
@@ -1169,14 +1188,26 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       .select()
       .from(aiModels)
       .where(eq(aiModels.providerId, cfProvider!.id));
+    expect(seededModels.length).toBeGreaterThanOrEqual(16);
+    expect(seededModels.every((m) => !m.name.includes('کلودفلر'))).toBe(true);
+
     const fluxModel = seededModels.find((m) => m.modelIdentifier === '@cf/black-forest-labs/flux-1-schnell');
     const sdxlModel = seededModels.find(
       (m) => m.modelIdentifier === '@cf/bytedance/stable-diffusion-xl-lightning',
     );
+    const llamaModel = seededModels.find(
+      (m) => m.modelIdentifier === '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    );
+    const whisperModel = seededModels.find((m) => m.modelIdentifier === '@cf/openai/whisper-large-v3-turbo');
+    const auraTtsModel = seededModels.find((m) => m.modelIdentifier === '@cf/deepgram/aura-1');
+
     expect(fluxModel).toBeTruthy();
     expect(fluxModel?.isDefault).toBe(true);
     expect(fluxModel?.priority).toBe(15);
     expect(sdxlModel).toBeTruthy();
+    expect(llamaModel).toBeTruthy();
+    expect(whisperModel).toBeTruthy();
+    expect(auraTtsModel).toBeTruthy();
 
     // 3. Execute FLUX.1 Schnell (JSON base64 JPEG output) with zero stored credentials
     const fluxRoute = await loadModelExecutionRoute(fluxModel!.id);
@@ -1206,29 +1237,69 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
       inputs: { prompt: 'غروب خلیج فارس', width: 1024, height: 576 },
     });
 
-    // 5. Execute Llama 3.3 70B text chat via native binding
-    const [llamaModel] = await db
-      .insert(aiModels)
-      .values({
-        providerId: cfProvider!.id,
-        name: 'Llama 3.3 70B',
-        modelIdentifier: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-        category: 'llm',
-        isActive: true,
-      })
-      .returning();
-    await db
-      .insert(modelCapabilities)
-      .values({ modelId: llamaModel!.id, capability: 'chat' });
-
+    // 5. Execute seeded Llama 3.3 70B text chat via native binding
     const llamaRoute = await loadModelExecutionRoute(llamaModel!.id);
     const llamaOut = await generateTextWithRoute(llamaRoute, {
       systemPrompt: 'به فارسی جواب بده',
       messages: [{ role: 'user', content: 'سلام' }],
     });
-    expect(llamaOut.result.text).toBe('پاسخ رایگان از کلودفلر');
+    expect(llamaOut.result.text).toBe('پاسخ سریع از مدل لاما');
 
-    // 6. Outside Worker without binding or Account ID+Token, testProviderConnection gives clear guidance
+    // 6. Execute seeded Whisper Large v3 Turbo STT & Deepgram Aura TTS via native binding
+    const whisperRoute = await loadModelExecutionRoute(whisperModel!.id);
+    const sttOut = await transcribeAudioWithRoute(whisperRoute, {
+      audioBuffer: Buffer.from('FAKE_OGG_AUDIO'),
+      mimeType: 'audio/ogg',
+      fileName: 'voice.ogg',
+      language: 'fa',
+    });
+    expect(sttOut.result.text).toBe('سلام دنیا از ویس');
+
+    const ttsRoute = await loadModelExecutionRoute(auraTtsModel!.id);
+    const ttsOut = await generateSpeechWithRoute(ttsRoute, {
+      text: 'Hello from HooshNegar',
+    });
+    expect(ttsOut.result.mimeType).toBe('audio/mpeg');
+    expect(ttsOut.result.audioBuffer.byteLength).toBe(5);
+
+    // 7. Live REST catalog discovery enumerates additional models from Cloudflare API when Account ID + Token exist
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('/accounts/acct-123/ai/models/search')) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            result: [
+              {
+                name: '@cf/meta/llama-3.2-3b-instruct',
+                description: 'Compact Llama 3.2 3B',
+                task: { name: 'Text Generation' },
+              },
+              {
+                name: '@cf/black-forest-labs/flux-1-schnell',
+                description: 'Already curated',
+                task: { name: 'Text-to-Image' },
+              },
+            ],
+            result_info: { page: 1, per_page: 100, count: 2, total_count: 2 },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const restDisc = await discoverProviderModels({
+      providerType: 'cloudflare_workers_ai',
+      baseUrl: 'https://api.cloudflare.com/client/v4',
+      apiKey: 'cf-api-token-test',
+      organizationId: 'acct-123',
+    });
+    expect(restDisc.ok).toBe(true);
+    expect(restDisc.models.some((m) => m.modelIdentifier === '@cf/meta/llama-3.2-3b-instruct')).toBe(true);
+    expect(restDisc.models.length).toBeGreaterThanOrEqual(17);
+
+    // 8. Outside Worker without binding or Account ID+Token, testProviderConnection gives clear guidance
     setGlobalCloudflareAiBinding(undefined);
     const noBindTest = await testProviderConnection({
       providerType: 'cloudflare_workers_ai',

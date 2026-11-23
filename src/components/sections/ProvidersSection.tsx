@@ -10,6 +10,8 @@ import {
   RotateCcw,
   ShieldAlert,
   Sparkles,
+  ExternalLink,
+  Gift,
 } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
 import { DICTIONARIES, formatDateTime, formatNumber, type Locale } from '../../i18n';
@@ -87,6 +89,166 @@ const DEFAULT_BASE_URLS: Record<ProviderType, string> = {
   cloudflare_workers_ai: 'https://api.cloudflare.com/client/v4',
   custom: 'https://api.example.com/v1',
 };
+
+interface FreeApiPreset {
+  id: string;
+  name: string;
+  providerType: ProviderType;
+  baseUrl: string;
+  signupUrl: string;
+  categories: Array<'text' | 'image' | 'audio'>;
+  freeQuotaFa: string;
+  freeQuotaEn: string;
+  noteFa: string;
+  noteEn: string;
+}
+
+const FREE_API_PROVIDERS: FreeApiPreset[] = [
+  {
+    id: 'cloudflare-workers-ai',
+    name: 'Cloudflare Workers AI',
+    providerType: 'cloudflare_workers_ai',
+    baseUrl: 'https://api.cloudflare.com/client/v4',
+    signupUrl: 'https://dash.cloudflare.com/',
+    categories: ['text', 'image', 'audio'],
+    freeQuotaFa: '۱۰,۰۰۰ Neuron رایگان روزانه (بدون کارت بانکی)',
+    freeQuotaEn: '10,000 free Neurons/day (no credit card required)',
+    noteFa: 'پشتیبانی از FLUX.1 Schnell، SDXL، Llama 3.3، Qwen 3، DeepSeek R1، Whisper و Deepgram TTS.',
+    noteEn: 'Includes FLUX.1 Schnell, SDXL, Llama 3.3, Qwen 3, DeepSeek R1, Whisper STT, and Deepgram TTS.',
+  },
+  {
+    id: 'google-ai-studio',
+    name: 'Google AI Studio',
+    providerType: 'google_gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com',
+    signupUrl: 'https://aistudio.google.com/apikey',
+    categories: ['text', 'audio'],
+    freeQuotaFa: 'سهمیه رایگان روزانه برای Gemini 2.5 Flash و 2.5 Pro',
+    freeQuotaEn: 'Daily free quota for Gemini 2.5 Flash & 2.5 Pro',
+    noteFa: 'عالی برای چت، تحلیل عکس و صوت؛ مدل‌های تصویری گوگل نیازمند فعال‌سازی Billing هستند.',
+    noteEn: 'Great for chat, vision, and audio; Google image models require Billing.',
+  },
+  {
+    id: 'groq-cloud',
+    name: 'GroqCloud',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    signupUrl: 'https://console.groq.com/keys',
+    categories: ['text', 'audio'],
+    freeQuotaFa: 'سهمیه رایگان روزانه با سرعت بسیار بالا (Llama 3.3 & Whisper)',
+    freeQuotaEn: 'Generous daily free tier with ultra-fast Llama 3.3 & Whisper',
+    noteFa: 'سازگار با OpenAI؛ یکی از سریع‌ترین سرویس‌ها برای چت و تبدیل ویس به متن.',
+    noteEn: 'OpenAI-compatible; one of the fastest free APIs for chat and Whisper STT.',
+  },
+  {
+    id: 'openrouter-free',
+    name: 'OpenRouter Free',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    signupUrl: 'https://openrouter.ai/keys',
+    categories: ['text'],
+    freeQuotaFa: 'ده‌ها مدل رایگان با پسوند :free (DeepSeek، Qwen، Llama، Gemma)',
+    freeQuotaEn: 'Dozens of :free models (DeepSeek, Qwen, Llama, Gemma)',
+    noteFa: 'با یک کلید به مدل‌های متعدد رایگان دسترسی می‌دهد؛ مدل‌های دارای :free را فعال نگه دارید.',
+    noteEn: 'Single API key for dozens of free LLMs; enable models ending in :free.',
+  },
+  {
+    id: 'cerebras-cloud',
+    name: 'Cerebras Inference',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://api.cerebras.ai/v1',
+    signupUrl: 'https://cloud.cerebras.ai/',
+    categories: ['text'],
+    freeQuotaFa: '۱ میلیون توکن رایگان روزانه با سرعت فوق‌العاده',
+    freeQuotaEn: '1M free tokens/day at extreme inference speed',
+    noteFa: 'ایده‌آل برای مدل‌های Llama 3.3 70B و Qwen با تاخیر بسیار کم.',
+    noteEn: 'Ideal for Llama 3.3 70B and Qwen with near-instant token streaming.',
+  },
+  {
+    id: 'hf-spaces-zerogpu',
+    name: 'Hugging Face Spaces (FLUX)',
+    providerType: 'huggingface_space',
+    baseUrl: 'https://huggingface.co/spaces/black-forest-labs/FLUX.1-schnell',
+    signupUrl: 'https://huggingface.co/settings/tokens',
+    categories: ['image', 'text', 'audio'],
+    freeQuotaFa: '۵ دقیقه ZeroGPU رایگان روزانه برای هر اکانت',
+    freeQuotaEn: '5 min/day free ZeroGPU per account',
+    noteFa: 'می‌توانید چندین توکن اکانت مختلف در استخر کلیدها وارد کنید تا هنگام اتمام سهمیه خودکار سوییچ شود.',
+    noteEn: 'Add multiple account tokens to the credential pool for automatic rotation when quota runs out.',
+  },
+  {
+    id: 'hf-inference-router',
+    name: 'Hugging Face Router',
+    providerType: 'huggingface',
+    baseUrl: 'https://router.huggingface.co',
+    signupUrl: 'https://huggingface.co/settings/tokens',
+    categories: ['text', 'image', 'audio'],
+    freeQuotaFa: 'اعتبار رایگان ماهانه روی روتر Inference هاگینگ‌فیس',
+    freeQuotaEn: 'Free monthly credits on Hugging Face Inference Router',
+    noteFa: 'هنگام ساخت توکن تیک «Make calls to Inference Providers» را فعال کنید.',
+    noteEn: 'Enable "Make calls to Inference Providers" permission when creating your token.',
+  },
+  {
+    id: 'mistral-experiment',
+    name: 'Mistral AI (Free Experiment)',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://api.mistral.ai/v1',
+    signupUrl: 'https://console.mistral.ai/api-keys',
+    categories: ['text'],
+    freeQuotaFa: 'پلن رایگان Experiment با سهمیه ماهانه بالا',
+    freeQuotaEn: 'Free Experiment tier with generous monthly quota',
+    noteFa: 'شامل مدل‌های Mistral Small، Pixtral و Codestral با پروتکل OpenAI.',
+    noteEn: 'Includes Mistral Small, Pixtral, and Codestral via OpenAI-compatible API.',
+  },
+  {
+    id: 'sambanova-cloud',
+    name: 'SambaNova Cloud',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://api.sambanova.ai/v1',
+    signupUrl: 'https://cloud.sambanova.ai/apis',
+    categories: ['text'],
+    freeQuotaFa: 'سهمیه رایگان توسعه‌دهندگان برای DeepSeek R1 و Llama 3.3',
+    freeQuotaEn: 'Free developer tier for DeepSeek R1 & Llama 3.3',
+    noteFa: 'سرعت بسیار بالا روی مدل‌های بزرگ DeepSeek و Meta Llama.',
+    noteEn: 'High-speed RDU inference for large DeepSeek and Meta Llama models.',
+  },
+  {
+    id: 'nvidia-nim',
+    name: 'NVIDIA NIM',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    signupUrl: 'https://build.nvidia.com/',
+    categories: ['text'],
+    freeQuotaFa: 'اعتبار رایگان اولیه ۱۰۰۰ تا ۵۰۰۰ درخواست روی build.nvidia.com',
+    freeQuotaEn: '1,000–5,000 free starter credits on build.nvidia.com',
+    noteFa: 'پشتیبانی از مدل‌های DeepSeek، Qwen، Llama و Nemotron.',
+    noteEn: 'Supports DeepSeek, Qwen, Llama, and Nemotron via OpenAI-compatible API.',
+  },
+  {
+    id: 'github-models',
+    name: 'GitHub Models',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://models.inference.ai.azure.com',
+    signupUrl: 'https://github.com/settings/tokens',
+    categories: ['text'],
+    freeQuotaFa: 'رایگان با اکانت GitHub (کلید PAT با دسترسی models:read)',
+    freeQuotaEn: 'Free with GitHub account (PAT with models:read)',
+    noteFa: 'دسترسی رایگان محدود روزانه به GPT-4o-mini، DeepSeek، Llama و Phi-4.',
+    noteEn: 'Daily free developer quota for GPT-4o-mini, DeepSeek, Llama, and Phi-4.',
+  },
+  {
+    id: 'cohere-trial',
+    name: 'Cohere Trial',
+    providerType: 'openai_compatible',
+    baseUrl: 'https://api.cohere.ai/compatibility/v1',
+    signupUrl: 'https://dashboard.cohere.com/api-keys',
+    categories: ['text'],
+    freeQuotaFa: 'کلید Trial رایگان تا ۱۰۰۰ درخواست در ماه (بسیار قوی در فارسی)',
+    freeQuotaEn: 'Free Trial key up to 1,000 calls/month (strong Persian support)',
+    noteFa: 'مدل‌های Command A و Command R+ پشتیبانی بسیار خوبی از زبان فارسی دارند.',
+    noteEn: 'Command A and Command R+ excel at Persian and multilingual tasks.',
+  },
+];
 
 function getUrlHint(providerType: ProviderType, locale: Locale): string {
   if (locale === 'en') {
@@ -168,6 +330,10 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
   const [rotateApiKey, setRotateApiKey] = useState('');
   const [poolBusy, setPoolBusy] = useState(false);
 
+  // Free API Directory modal state
+  const [freeGuideOpen, setFreeGuideOpen] = useState(false);
+  const [freeGuideCategory, setFreeGuideCategory] = useState<'all' | 'text' | 'image' | 'audio'>('all');
+
   const loadProviders = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -217,6 +383,22 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
     setName('');
     setProviderType('openai_compatible');
     setBaseUrl(DEFAULT_BASE_URLS.openai_compatible);
+    setApiKey('');
+    setBackupKeysText('');
+    setAutoSyncModels(true);
+    setOrganizationId('');
+    setHeadersJson('{}');
+    setPriority(100);
+    setIsActive(true);
+    setFormOpen(true);
+  };
+
+  const openCreateWithPreset = (preset: FreeApiPreset) => {
+    setFreeGuideOpen(false);
+    setEditing(null);
+    setName(preset.name);
+    setProviderType(preset.providerType);
+    setBaseUrl(preset.baseUrl);
     setApiKey('');
     setBackupKeysText('');
     setAutoSyncModels(true);
@@ -527,10 +709,16 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
               : 'Multi-provider adapters (Gemini, Hugging Face, Spaces, OpenAI) with multi-key failover pools and auto model sync.'}
           </p>
         </div>
-        <Button onClick={openCreateModal}>
-          <Plus className="w-4 h-4" />
-          <span>{locale === 'fa' ? 'افزودن ارائه‌دهنده جدید' : 'Add AI Provider'}</span>
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" onClick={() => setFreeGuideOpen(true)}>
+            <Gift className="w-4 h-4" />
+            <span>{locale === 'fa' ? 'منابع API رایگان' : 'Free API Sources'}</span>
+          </Button>
+          <Button onClick={openCreateModal}>
+            <Plus className="w-4 h-4" />
+            <span>{locale === 'fa' ? 'افزودن ارائه‌دهنده جدید' : 'Add AI Provider'}</span>
+          </Button>
+        </div>
       </div>
 
       {feedback && (
@@ -1219,6 +1407,108 @@ export function ProvidersSection({ locale }: { locale: Locale }) {
               </div>
             </form>
           )}
+        </div>
+      </Modal>
+
+      {/* Free AI API Directory Modal */}
+      <Modal
+        open={freeGuideOpen}
+        onClose={() => setFreeGuideOpen(false)}
+        title={
+          locale === 'fa'
+            ? 'لیست کامل سایت‌های دریافت API رایگان هوش مصنوعی'
+            : 'Complete Free AI API Providers Directory'
+        }
+        maxWidth="max-w-4xl"
+      >
+        <div className="space-y-4">
+          <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+            {locale === 'fa'
+              ? 'از هر یک از سایت‌های زیر می‌توانید API رایگان دریافت کنید و با یک کلیک فرم افزودن ارائه‌دهنده را با آدرس و پروتکل صحیح پر نمایید. برای افزایش سهمیه رایگان (مثلاً در Hugging Face Spaces) می‌توانید چندین کلید از اکانت‌های مختلف را هم‌زمان در استخر کلیدها وارد کنید تا سیستم به‌صورت خودکار سوییچ کند.'
+              : 'Get free API keys from any of the verified providers below and click Select to pre-fill the Add Provider form with the exact protocol and endpoint URL.'}
+          </p>
+
+          <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg w-fit">
+            {(
+              [
+                { id: 'all', labelFa: `همه (${FREE_API_PROVIDERS.length})`, labelEn: `All (${FREE_API_PROVIDERS.length})` },
+                { id: 'text', labelFa: 'متن و چت', labelEn: 'Text & Chat' },
+                { id: 'image', labelFa: 'تولید تصویر', labelEn: 'Image' },
+                { id: 'audio', labelFa: 'صوت و ویس', labelEn: 'Audio' },
+              ] as const
+            ).map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setFreeGuideCategory(tab.id)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                  freeGuideCategory === tab.id
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                }`}
+              >
+                {locale === 'fa' ? tab.labelFa : tab.labelEn}
+              </button>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-[60vh] overflow-y-auto pe-1">
+            {FREE_API_PROVIDERS.filter(
+              (item) => freeGuideCategory === 'all' || item.categories.includes(freeGuideCategory),
+            ).map((item) => (
+              <div
+                key={item.id}
+                className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 flex flex-col justify-between gap-3"
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                      {item.name}
+                    </div>
+                    <span className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-md bg-slate-200/70 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                      {t.providerTypes[item.providerType]}
+                    </span>
+                  </div>
+                  <div
+                    className="text-[11px] font-mono text-slate-500 dark:text-slate-400 truncate"
+                    dir="ltr"
+                    title={item.baseUrl}
+                  >
+                    {item.baseUrl}
+                  </div>
+
+                  <div className="text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                    {locale === 'fa' ? item.freeQuotaFa : item.freeQuotaEn}
+                  </div>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
+                    {locale === 'fa' ? item.noteFa : item.noteEn}
+                  </p>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-800">
+                  <a
+                    href={item.signupUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-xs font-medium text-sky-700 dark:text-sky-400 hover:underline"
+                  >
+                    <span>{locale === 'fa' ? 'دریافت کلید از سایت' : 'Get API Key'}</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                  <Button size="sm" onClick={() => openCreateWithPreset(item)}>
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>{locale === 'fa' ? 'انتخاب و پر کردن فرم' : 'Select & Pre-fill'}</span>
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex justify-end pt-2 border-t border-slate-200 dark:border-slate-800">
+            <Button variant="outline" onClick={() => setFreeGuideOpen(false)}>
+              {t.common.close}
+            </Button>
+          </div>
         </div>
       </Modal>
     </div>

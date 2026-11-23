@@ -7,12 +7,13 @@ import { SsrfProtectionError, validatePublicHttpsUrl } from '../security/ssrf.ts
 import { getCloudflareAiBinding } from '../cloudflare/requestContext.ts';
 
 export const CLOUDFLARE_WORKERS_AI_CURATED_MODELS: DiscoveredModelSpec[] = [
+  // Image Generation
   {
-    name: 'FLUX.1 Schnell (رایگان کلودفلر)',
+    name: 'FLUX.1 Schnell',
     modelIdentifier: '@cf/black-forest-labs/flux-1-schnell',
     category: 'image',
     capabilities: ['image_generation'],
-    description: 'تولید تصویر سریع و باکیفیت روی Cloudflare Workers AI (سهمیه رایگان روزانه بدون نیاز به Billing گوگل).',
+    description: 'تولید تصویر سریع با کیفیت بالا و جزئیات دقیق.',
     maxInputSize: 4096,
     maxOutputSize: 4096,
     creditCost: 2,
@@ -21,11 +22,11 @@ export const CLOUDFLARE_WORKERS_AI_CURATED_MODELS: DiscoveredModelSpec[] = [
     modelParameters: { steps: 4 },
   },
   {
-    name: 'SDXL Lightning (سریع و رایگان کلودفلر)',
+    name: 'SDXL Lightning',
     modelIdentifier: '@cf/bytedance/stable-diffusion-xl-lightning',
     category: 'image',
     capabilities: ['image_generation'],
-    description: 'مدل فوق‌سریع ساخت تصویر با کیفیت بالا روی Cloudflare Workers AI (سهمیه رایگان روزانه).',
+    description: 'تولید تصویر فوق‌سریع با پشتیبانی از نسبت‌های تصویر متنوع.',
     maxInputSize: 4096,
     maxOutputSize: 4096,
     creditCost: 1,
@@ -34,11 +35,11 @@ export const CLOUDFLARE_WORKERS_AI_CURATED_MODELS: DiscoveredModelSpec[] = [
     modelParameters: {},
   },
   {
-    name: 'Stable Diffusion XL (رایگان کلودفلر)',
+    name: 'Stable Diffusion XL',
     modelIdentifier: '@cf/stabilityai/stable-diffusion-xl-base-1.0',
     category: 'image',
     capabilities: ['image_generation'],
-    description: 'تولید تصویر SDXL با پشتیبانی از نسبت‌های تصویر مختلف روی Cloudflare Workers AI.',
+    description: 'تولید تصویر هنری و واقعی با کنترل ابعاد خروجی.',
     maxInputSize: 4096,
     maxOutputSize: 4096,
     creditCost: 2,
@@ -47,12 +48,171 @@ export const CLOUDFLARE_WORKERS_AI_CURATED_MODELS: DiscoveredModelSpec[] = [
     modelParameters: {},
   },
   {
-    name: 'Llama 3.3 70B Fast (رایگان کلودفلر)',
+    name: 'DreamShaper 8 LCM',
+    modelIdentifier: '@cf/lykon/dreamshaper-8-lcm',
+    category: 'image',
+    capabilities: ['image_generation'],
+    description: 'مدل سریع تصویرسازی فانتزی و انیمه‌ای.',
+    maxInputSize: 4096,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  // Text & Chat LLMs
+  {
+    name: 'Llama 3.3 70B Fast',
     modelIdentifier: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
     category: 'llm',
     capabilities: ['text_generation', 'chat'],
-    description: 'مدل متنی سریع Llama 3.3 70B اجراشده روی لبه Cloudflare Workers AI.',
+    description: 'مدل متنی قدرتمند و سریع برای گفتگو، نگارش و تحلیل.',
     maxInputSize: 32000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Llama 4 Scout 17B',
+    modelIdentifier: '@cf/meta/llama-4-scout-17b-16e-instruct',
+    category: 'multimodal',
+    capabilities: ['text_generation', 'chat', 'vision', 'document_analysis'],
+    description: 'مدل چندوجهی نسل جدید با درک متن، تصویر و اسناد.',
+    maxInputSize: 128000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Llama 3.1 8B Instruct',
+    modelIdentifier: '@cf/meta/llama-3.1-8b-instruct',
+    category: 'llm',
+    capabilities: ['text_generation', 'chat'],
+    description: 'مدل متنی سبک و بسیار سریع برای پاسخ‌گویی روزمره.',
+    maxInputSize: 32000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Qwen 3 30B',
+    modelIdentifier: '@cf/qwen/qwen3-30b-a3b-fp8',
+    category: 'llm',
+    capabilities: ['text_generation', 'chat'],
+    description: 'مدل چندزبانه قدرتمند با پشتیبانی قوی از زبان فارسی و کدنویسی.',
+    maxInputSize: 64000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'DeepSeek R1 32B',
+    modelIdentifier: '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
+    category: 'llm',
+    capabilities: ['text_generation', 'chat'],
+    description: 'مدل استدلالی تخصصی برای مسائل ریاضی، منطقی و برنامه‌نویسی.',
+    maxInputSize: 64000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Gemma 3 12B',
+    modelIdentifier: '@cf/google/gemma-3-12b-it',
+    category: 'llm',
+    capabilities: ['text_generation', 'chat'],
+    description: 'مدل متنی متعادل و روان برای تولید محتوا و ترجمه فارسی.',
+    maxInputSize: 64000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Mistral Small 3.1 24B',
+    modelIdentifier: '@cf/mistralai/mistral-small-3.1-24b-instruct',
+    category: 'llm',
+    capabilities: ['text_generation', 'chat'],
+    description: 'مدل متنی دقیق برای خلاصه‌سازی، کدنویسی و تحلیل متن.',
+    maxInputSize: 64000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  // Speech-to-Text (Audio Transcription)
+  {
+    name: 'Whisper Large v3 Turbo',
+    modelIdentifier: '@cf/openai/whisper-large-v3-turbo',
+    category: 'audio',
+    capabilities: ['audio_transcription'],
+    description: 'تبدیل سریع و دقیق گفتار و ویس فارسی و انگلیسی به متن.',
+    maxInputSize: 64000,
+    maxOutputSize: 8192,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Whisper Multilingual',
+    modelIdentifier: '@cf/openai/whisper',
+    category: 'audio',
+    capabilities: ['audio_transcription'],
+    description: 'تبدیل فایل صوتی چندزبانه به متن.',
+    maxInputSize: 64000,
+    maxOutputSize: 8192,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'Deepgram Nova 3',
+    modelIdentifier: '@cf/deepgram/nova-3',
+    category: 'audio',
+    capabilities: ['audio_transcription'],
+    description: 'تشخیص گفتار پرسرعت برای فایل‌های صوتی.',
+    maxInputSize: 64000,
+    maxOutputSize: 8192,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  // Text-to-Speech
+  {
+    name: 'Deepgram Aura TTS',
+    modelIdentifier: '@cf/deepgram/aura-1',
+    category: 'audio',
+    capabilities: ['speech_generation'],
+    description: 'تبدیل متن به گفتار طبیعی با صدای روان.',
+    maxInputSize: 16000,
+    maxOutputSize: 4096,
+    creditCost: 1,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
+  {
+    name: 'MeloTTS',
+    modelIdentifier: '@cf/myshell-ai/melotts',
+    category: 'audio',
+    capabilities: ['speech_generation'],
+    description: 'تولید گفتار چندزبانه با سرعت بالا.',
+    maxInputSize: 16000,
     maxOutputSize: 4096,
     creditCost: 1,
     inputPricePerMillion: 0,
@@ -489,16 +649,12 @@ function classifyModelMetadata(params: {
     const caps: CapabilityType[] = lower.includes('imagen')
       ? ['image_generation']
       : ['image_generation', 'image_editing', 'image_variation'];
-    const isGoogleImage = lower.includes('imagen') || lower.includes('gemini-') || lower.includes('nano-banana');
-    const imageDesc = isGoogleImage
-      ? `${description ? `${description} — ` : ''}توجه: مدل‌های تصویری گوگل در کلید رایگان AI Studio معمولاً سهمیه صفر (Billing لازم) دارند.`.slice(0, 600)
-      : description;
     return {
       name,
       modelIdentifier: cleanId,
       category: 'image',
       capabilities: caps,
-      description: imageDesc,
+      description,
       maxInputSize: Math.min(maxInputSize, 65536),
       maxOutputSize: Math.min(maxOutputSize, 8192),
       creditCost: 5,
@@ -1052,48 +1208,169 @@ export async function discoverProviderModels(
       };
     }
 
-    // 6. CLOUDFLARE WORKERS AI (Native env.AI binding or Cloudflare REST API)
+    // 6. CLOUDFLARE WORKERS AI (Native env.AI binding or live Cloudflare REST catalog)
     if (config.providerType === 'cloudflare_workers_ai') {
       const hasNativeBinding = Boolean(getCloudflareAiBinding());
+      const accountId = (config.organizationId ?? '').trim();
+
+      const mapCloudflareCatalogModel = (item: {
+        name?: string;
+        description?: string;
+        task?: { name?: string };
+      }): DiscoveredModelSpec | null => {
+        const id = (item.name ?? '').trim();
+        if (!id) return null;
+        const taskName = (item.task?.name ?? '').toLowerCase();
+        const prettyName = id
+          .split('/')
+          .pop()
+          ?.replace(/[-_]+/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase()) || id;
+
+        if (taskName === 'text-to-image') {
+          return {
+            name: prettyName,
+            modelIdentifier: id,
+            category: 'image',
+            capabilities: ['image_generation'],
+            description: (item.description ?? '').slice(0, 400),
+            maxInputSize: 4096,
+            maxOutputSize: 4096,
+            creditCost: 2,
+            inputPricePerMillion: 0,
+            outputPricePerMillion: 0,
+            modelParameters: id.includes('flux-1-schnell') ? { steps: 4 } : {},
+          };
+        }
+        if (taskName === 'text generation') {
+          const isVision = /llama-4|vision|vl|gemma-3/i.test(id);
+          return {
+            name: prettyName,
+            modelIdentifier: id,
+            category: isVision ? 'multimodal' : 'llm',
+            capabilities: isVision
+              ? ['text_generation', 'chat', 'vision', 'document_analysis']
+              : ['text_generation', 'chat'],
+            description: (item.description ?? '').slice(0, 400),
+            maxInputSize: 32000,
+            maxOutputSize: 4096,
+            creditCost: 1,
+            inputPricePerMillion: 0,
+            outputPricePerMillion: 0,
+            modelParameters: {},
+          };
+        }
+        if (taskName === 'automatic speech recognition') {
+          return {
+            name: prettyName,
+            modelIdentifier: id,
+            category: 'audio',
+            capabilities: ['audio_transcription'],
+            description: (item.description ?? '').slice(0, 400),
+            maxInputSize: 64000,
+            maxOutputSize: 8192,
+            creditCost: 1,
+            inputPricePerMillion: 0,
+            outputPricePerMillion: 0,
+            modelParameters: {},
+          };
+        }
+        if (taskName === 'text-to-speech') {
+          return {
+            name: prettyName,
+            modelIdentifier: id,
+            category: 'audio',
+            capabilities: ['speech_generation'],
+            description: (item.description ?? '').slice(0, 400),
+            maxInputSize: 16000,
+            maxOutputSize: 4096,
+            creditCost: 1,
+            inputPricePerMillion: 0,
+            outputPricePerMillion: 0,
+            modelParameters: {},
+          };
+        }
+        if (taskName === 'text embeddings') {
+          return {
+            name: prettyName,
+            modelIdentifier: id,
+            category: 'embedding',
+            capabilities: ['embeddings'],
+            description: (item.description ?? '').slice(0, 400),
+            maxInputSize: 8192,
+            maxOutputSize: 1024,
+            creditCost: 0.5,
+            inputPricePerMillion: 0,
+            outputPricePerMillion: 0,
+            modelParameters: {},
+          };
+        }
+        return null;
+      };
+
+      // If Account ID + API Token are supplied, enumerate the complete live Cloudflare catalog (paginated)
+      if (accountId && apiKey) {
+        const mergedMap = new Map<string, DiscoveredModelSpec>();
+        for (const curated of CLOUDFLARE_WORKERS_AI_CURATED_MODELS) {
+          mergedMap.set(curated.modelIdentifier.toLowerCase(), curated);
+        }
+
+        let gotAnyPage = false;
+        for (let page = 1; page <= 3; page++) {
+          const searchUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=100&page=${page}`;
+          const res = await fetchJsonSafe(
+            searchUrl,
+            mergeHeaders({ Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }, config.additionalHeaders),
+            apiKey,
+            fetchImpl,
+          );
+          if (!res.ok) {
+            if (!hasNativeBinding && !gotAnyPage) {
+              return {
+                ok: false,
+                models: [],
+                message: `خطای احراز هویت Cloudflare Workers AI (HTTP ${res.status}): ${res.rawText.slice(0, 200)}`,
+              };
+            }
+            break;
+          }
+          gotAnyPage = true;
+          const payload = res.data as {
+            result?: Array<{ name?: string; description?: string; task?: { name?: string } }>;
+          };
+          const batch = Array.isArray(payload?.result) ? payload.result : [];
+          for (const item of batch) {
+            const spec = mapCloudflareCatalogModel(item);
+            if (spec && !mergedMap.has(spec.modelIdentifier.toLowerCase())) {
+              mergedMap.set(spec.modelIdentifier.toLowerCase(), spec);
+            }
+          }
+          if (batch.length < 100) break;
+        }
+
+        const allModels = Array.from(mergedMap.values());
+        return {
+          ok: true,
+          resolvedBaseUrl: 'https://api.cloudflare.com/client/v4',
+          models: allModels,
+          message: `${allModels.length} مدل Cloudflare Workers AI شناسایی شد.`,
+        };
+      }
+
       if (hasNativeBinding) {
         return {
           ok: true,
           resolvedBaseUrl: 'https://api.cloudflare.com/client/v4',
           models: CLOUDFLARE_WORKERS_AI_CURATED_MODELS,
-          message: `${CLOUDFLARE_WORKERS_AI_CURATED_MODELS.length} مدل رایگان Cloudflare Workers AI (تصویری و متنی) با اتصال بومی شناسایی شد.`,
-        };
-      }
-
-      const accountId = (config.organizationId ?? '').trim();
-      if (!accountId || !apiKey) {
-        return {
-          ok: false,
-          models: [],
-          message:
-            'خارج از محیط Cloudflare Worker، برای همگام‌سازی REST باید شناسه اکانت (Account ID در فیلد شناسه سازمان) و API Token وارد شود؛ پس از دیپلوی روی Cloudflare بدون کلید کار می‌کند.',
-        };
-      }
-
-      const verifyUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=1`;
-      const res = await fetchJsonSafe(
-        verifyUrl,
-        mergeHeaders({ Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }, config.additionalHeaders),
-        apiKey,
-        fetchImpl,
-      );
-      if (!res.ok) {
-        return {
-          ok: false,
-          models: [],
-          message: `خطای احراز هویت Cloudflare Workers AI (HTTP ${res.status}): ${res.rawText.slice(0, 200)}`,
+          message: `${CLOUDFLARE_WORKERS_AI_CURATED_MODELS.length} مدل Cloudflare Workers AI (تصویری، متنی، صوتی و تبدیل گفتار) با اتصال بومی شناسایی شد.`,
         };
       }
 
       return {
-        ok: true,
-        resolvedBaseUrl: 'https://api.cloudflare.com/client/v4',
-        models: CLOUDFLARE_WORKERS_AI_CURATED_MODELS,
-        message: `${CLOUDFLARE_WORKERS_AI_CURATED_MODELS.length} مدل رایگان Cloudflare Workers AI شناسایی شد.`,
+        ok: false,
+        models: [],
+        message:
+          'خارج از محیط Cloudflare Worker، برای همگام‌سازی REST باید شناسه اکانت (Account ID در فیلد شناسه سازمان) و API Token وارد شود؛ پس از دیپلوی روی Cloudflare بدون کلید کار می‌کند.',
       };
     }
 

@@ -115,12 +115,9 @@ async function sendSafeErrorToChat(
   chatId: number | null,
   statusMessageId: number | null,
   messageFa: string,
-  diagnosticHint?: string,
 ): Promise<void> {
   if (!api || !chatId) return;
-  const safeHint = diagnosticHint ? redactSecrets(diagnosticHint).slice(0, 180) : '';
-  const hintLine = safeHint ? `\n🔎 جزئیات فنی: ${safeHint}` : '';
-  const fullText = `❌ ${messageFa}${hintLine}\n\n💡 اعتبار رزروشده برای این درخواست به‌صورت خودکار به کیف‌پول شما بازگردانده شد.`;
+  const fullText = `❌ ${messageFa}\n\n💡 اعتبار رزروشده به‌صورت خودکار به کیف‌پول شما بازگردانده شد.`;
   if (statusMessageId) {
     try {
       await api.editMessageText(chatId, statusMessageId, fullText);
@@ -845,24 +842,16 @@ export async function executeQueuedGenerationJob(jobId: string): Promise<{
       latencyMs: Date.now() - startedAt,
     });
 
-    const diagParts = [
-      aiErr.code,
-      aiErr.httpStatus ? `HTTP ${aiErr.httpStatus}` : '',
-      aiErr.message,
-    ].filter(Boolean);
-    const diagnosticHint = redactSecrets(diagParts.join(' • ')).slice(0, 280);
-
     await sendSafeErrorToChat(
       api,
       job.telegramChatId,
       job.statusMessageId,
       aiErr.userMessageFa,
-      diagnosticHint,
     );
     return {
       ok: false,
       status: 'failed',
-      error: `${aiErr.userMessageFa} (${diagnosticHint})`,
+      error: aiErr.userMessageFa,
     };
   }
 }

@@ -172,15 +172,33 @@ export async function ensureCloudflareWorkersAiSeeded(): Promise<void> {
     }
 
     if (providerId) {
-      const freeImageModels = CLOUDFLARE_WORKERS_AI_CURATED_MODELS.filter((m) => m.category === 'image');
       await syncProviderModelsToDatabase({
         providerId,
         providerType: 'cloudflare_workers_ai',
-        discoveredModels: freeImageModels,
+        discoveredModels: CLOUDFLARE_WORKERS_AI_CURATED_MODELS,
         activateAll: true,
       });
 
-      // Elevate FLUX.1 Schnell so free image generation appears first in Telegram & Mini App
+      // Clean legacy provider suffixes on previously auto-seeded Cloudflare models so customers only see clean model names
+      const legacyRenameMap: Array<{ modelIdentifier: string; cleanName: string }> = [
+        { modelIdentifier: '@cf/black-forest-labs/flux-1-schnell', cleanName: 'FLUX.1 Schnell' },
+        { modelIdentifier: '@cf/bytedance/stable-diffusion-xl-lightning', cleanName: 'SDXL Lightning' },
+        { modelIdentifier: '@cf/stabilityai/stable-diffusion-xl-base-1.0', cleanName: 'Stable Diffusion XL' },
+        { modelIdentifier: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', cleanName: 'Llama 3.3 70B Fast' },
+      ];
+      for (const item of legacyRenameMap) {
+        await db
+          .update(aiModels)
+          .set({ name: item.cleanName, updatedAt: now })
+          .where(
+            and(
+              eq(aiModels.providerId, providerId),
+              eq(aiModels.modelIdentifier, item.modelIdentifier),
+            ),
+          );
+      }
+
+      // Elevate FLUX.1 Schnell so fast image generation appears first in Telegram & Mini App
       const existingDefaultImage = await db
         .select({ id: aiModels.id })
         .from(aiModels)

@@ -131,7 +131,7 @@ function classifyHttpError(
     return new AIProviderError({
       code: 'RATE_LIMITED',
       message: `Provider quota exhausted (${status}): ${safeMsg}`,
-      userMessageFa: 'سهمیه یا اعتبار حساب کاربری این کلید API به پایان رسیده است.',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: true,
       httpStatus: status,
       credentialFailureKind: 'quota_exhausted',
@@ -142,7 +142,7 @@ function classifyHttpError(
     return new AIProviderError({
       code: 'INVALID_API_KEY',
       message: `Provider auth failed (${status}): ${safeMsg}`,
-      userMessageFa: 'کلید API ارائه‌دهنده نامعتبر یا منقضی است. لطفاً کلید را در پنل مدیریت بررسی کنید.',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
       httpStatus: status,
       credentialFailureKind: 'invalid',
@@ -151,16 +151,10 @@ function classifyHttpError(
 
   if (status === 403) {
     // 403 without an invalid-key signal is usually billing, region, gated model, or token scope—never brick other models on this key
-    const isBilling = /billed users|billing|paid tier/i.test(bodyText);
-    const isPermissionOrGated = /sufficient permissions|inference providers|gated|access to model/i.test(bodyText);
     return new AIProviderError({
       code: 'PROVIDER_ERROR',
       message: `Provider access restricted (403): ${safeMsg}`,
-      userMessageFa: isBilling
-        ? 'این مدل فقط برای حساب‌های دارای Billing فعال (یا سطح پولی) در دسترس است.'
-        : isPermissionOrGated
-          ? 'کلید API فعلی مجوز دسترسی به این مدل یا Inference Providers را ندارد.'
-          : 'دسترسی به این مدل از سمت ارائه‌دهنده محدود شده است (خطای 403).',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
       httpStatus: 403,
       credentialFailureKind: 'transient',
@@ -169,15 +163,10 @@ function classifyHttpError(
 
   if (status === 429) {
     if (isModelQuotaZeroSignal(bodyText)) {
-      const isGoogleFreeTier =
-        /generate_content_free_tier|generativelanguage\.googleapis\.com|ai\.google\.dev|free_tier/i.test(bodyText);
-      const modelDisplay = modelLabel ? ` «${modelLabel}»` : '';
       return new AIProviderError({
         code: 'RATE_LIMITED',
         message: `Model${modelLabel ? ` "${modelLabel}"` : ''} free-tier quota is zero (429): ${safeMsg}`,
-        userMessageFa: isGoogleFreeTier
-          ? `گوگل برای مدل${modelDisplay} در کلیدهای رایگان Google AI Studio سهمیه پیش‌فرض صفر (limit: 0) تعیین کرده است (حتی بدون هیچ استفاده‌ای). برای ساخت تصویر رایگان از مدل‌های «Cloudflare Workers AI (رایگان)» مانند FLUX.1 Schnell استفاده کنید یا در Google AI Studio بخش Billing را فعال نمایید.`
-          : `سهمیه رایگان مدل${modelDisplay} در حساب API شما صفر است (limit: 0) یا نیازمند فعال‌سازی Billing است.`,
+        userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
         retryable: false,
         httpStatus: 429,
         credentialFailureKind: 'transient',
@@ -187,7 +176,7 @@ function classifyHttpError(
       return new AIProviderError({
         code: 'RATE_LIMITED',
         message: `Provider quota exhausted (429): ${safeMsg}`,
-        userMessageFa: 'سهمیه کلید API این ارائه‌دهنده موقتاً به پایان رسیده است.',
+        userMessageFa: 'سرویس این مدل موقتاً در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
         retryable: true,
         httpStatus: 429,
         credentialFailureKind: 'quota_exhausted',
@@ -196,7 +185,7 @@ function classifyHttpError(
     return new AIProviderError({
       code: 'RATE_LIMITED',
       message: `Provider rate limited (429): ${safeMsg}`,
-      userMessageFa: 'سرویس هوش مصنوعی موقتاً شلوغ است (محدودیت نرخ). لطفاً لحظاتی بعد دوباره تلاش کنید.',
+      userMessageFa: 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید.',
       retryable: true,
       httpStatus: 429,
       credentialFailureKind: 'rate_limited',
@@ -208,7 +197,7 @@ function classifyHttpError(
       return new AIProviderError({
         code: 'PROVIDER_ERROR',
         message: `Provider billing required (${status}): ${safeMsg}`,
-        userMessageFa: 'این مدل (مانند Imagen) فقط برای کلیدهای دارای Billing فعال در دسترس است.',
+        userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
         retryable: false,
         httpStatus: status,
         credentialFailureKind: 'prompt_error',
@@ -218,7 +207,7 @@ function classifyHttpError(
       return new AIProviderError({
         code: 'RATE_LIMITED',
         message: `Provider quota exhausted (${status}): ${safeMsg}`,
-        userMessageFa: 'سهمیه یا اعتبار حساب این کلید API به پایان رسیده است.',
+        userMessageFa: 'سرویس این مدل موقتاً در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
         retryable: true,
         httpStatus: status,
         credentialFailureKind: 'quota_exhausted',
@@ -227,7 +216,7 @@ function classifyHttpError(
     return new AIProviderError({
       code: 'INVALID_PROMPT',
       message: `Provider rejected input (${status}): ${safeMsg}`,
-      userMessageFa: 'درخواست یا ورودی ارسال‌شده توسط مدل هوش مصنوعی پذیرفته نشد. لطفاً متن یا تنظیمات را بررسی کنید.',
+      userMessageFa: 'درخواست ارسال‌شده توسط این مدل پذیرفته نشد. لطفاً متن خود را اصلاح کرده و دوباره تلاش کنید.',
       retryable: false,
       httpStatus: status,
       credentialFailureKind: 'prompt_error',
@@ -237,7 +226,7 @@ function classifyHttpError(
   return new AIProviderError({
     code: 'PROVIDER_ERROR',
     message: `Provider HTTP ${status}: ${safeMsg}`,
-    userMessageFa: 'خطایی از سمت سرویس هوش مصنوعی رخ داد. اعتبار شما کسر نشد.',
+    userMessageFa: 'خطایی در پردازش درخواست رخ داد. اعتبار شما کسر نشد؛ لطفاً دوباره تلاش کنید.',
     retryable: status >= 500 || status === 408,
     httpStatus: status,
     credentialFailureKind: 'transient',
@@ -257,7 +246,7 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
     return new AIProviderError({
       code: 'SSRF_BLOCKED',
       message: err.message,
-      userMessageFa: 'آدرس ارائه‌دهنده به دلیل قوانین امنیتی مسدود شده است.',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
       credentialFailureKind: 'prompt_error',
     });
@@ -286,7 +275,7 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
     return new AIProviderError({
       code: 'INVALID_API_KEY',
       message: msg,
-      userMessageFa: 'کلید API ارائه‌دهنده نامعتبر یا منقضی است.',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
       credentialFailureKind: 'invalid',
     });
@@ -296,7 +285,7 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
     return new AIProviderError({
       code: 'RATE_LIMITED',
       message: msg,
-      userMessageFa: 'سهمیه کلید API این ارائه‌دهنده به پایان رسیده است.',
+      userMessageFa: 'سرویس این مدل موقتاً در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
       retryable: true,
       httpStatus: 429,
       credentialFailureKind: 'quota_exhausted',
@@ -307,7 +296,7 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
     return new AIProviderError({
       code: 'RATE_LIMITED',
       message: msg,
-      userMessageFa: 'سرویس هوش مصنوعی موقتاً شلوغ است (محدودیت نرخ).',
+      userMessageFa: 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید.',
       retryable: true,
       httpStatus: 429,
       credentialFailureKind: 'rate_limited',
@@ -318,7 +307,7 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
     return new AIProviderError({
       code: 'TIMEOUT',
       message: `Request aborted or timed out: ${msg}`,
-      userMessageFa: 'زمان پاسخ‌گویی مدل هوش مصنوعی به پایان رسید یا عملیات متوقف شد.',
+      userMessageFa: 'زمان پاسخ‌گویی به پایان رسید. لطفاً دوباره تلاش کنید.',
       retryable: true,
       credentialFailureKind: 'transient',
     });
@@ -327,7 +316,7 @@ function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
   return new AIProviderError({
     code: 'NETWORK_ERROR',
     message: msg,
-    userMessageFa: 'خطای شبکه در ارتباط با سرویس هوش مصنوعی رخ داد. اعتبار شما بازگردانده شد.',
+    userMessageFa: 'خطایی در ارتباط با سرور رخ داد. اعتبار شما بازگردانده شد؛ لطفاً دوباره تلاش کنید.',
     retryable: true,
     credentialFailureKind: 'transient',
   });
@@ -511,7 +500,7 @@ async function loadProviderContextForId(params: {
     return failOrNull({
       code: 'PROVIDER_ERROR',
       message: `Provider ${params.providerId} not found in database.`,
-      userMessageFa: 'ارائه‌دهنده این مدل در پایگاه‌داده یافت نشد.',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
     });
   }
@@ -520,7 +509,7 @@ async function loadProviderContextForId(params: {
     return failOrNull({
       code: 'INVALID_API_KEY',
       message: `Provider "${provider.name}" is disabled in admin panel.`,
-      userMessageFa: `ارائه‌دهنده «${provider.name}» در پنل مدیریت غیرفعال شده است. لطفاً آن را فعال کنید.`,
+      userMessageFa: 'این مدل در حال حاضر غیرفعال است. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
     });
   }
@@ -600,10 +589,7 @@ async function loadProviderContextForId(params: {
           creds.length === 0
             ? `Provider "${provider.name}" has no API credentials registered.`
             : `All API credentials for provider "${provider.name}" are disabled.`,
-        userMessageFa:
-          creds.length === 0
-            ? `هیچ کلید API برای ارائه‌دهنده «${provider.name}» ثبت نشده است. در پنل مدیریت کلید اضافه کنید.`
-            : `تمام کلیدهای API ارائه‌دهنده «${provider.name}» غیرفعال (Revoked) شده‌اند.`,
+        userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
         retryable: false,
       });
     }
@@ -643,7 +629,7 @@ async function loadProviderContextForId(params: {
         message: latestErr
           ? `All credentials for "${provider.name}" failed: ${latestErr}`
           : `All API credentials for "${provider.name}" are invalid.`,
-        userMessageFa: `کلید API ارائه‌دهنده «${provider.name}» نامعتبر تشخیص داده شده است. لطفاً کلید را در پنل مدیریت بررسی یا جایگزین کنید.`,
+        userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
         retryable: false,
       });
     }
@@ -680,7 +666,7 @@ async function loadProviderContextForId(params: {
     return failOrNull({
       code: 'INVALID_API_KEY',
       message: `Failed to decrypt API credentials for provider "${provider.name}".`,
-      userMessageFa: `خطا در رمزگشایی کلید API ارائه‌دهنده «${provider.name}». لطفاً کلید را مجدداً در پنل مدیریت ذخیره کنید.`,
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
     });
   }
@@ -749,7 +735,7 @@ export async function loadModelExecutionRoute(
     throw new AIProviderError({
       code: 'INVALID_API_KEY',
       message: 'Primary provider is inactive or missing active API credentials.',
-      userMessageFa: 'ارائه‌دهنده این مدل در حال حاضر غیرفعال یا فاقد کلید API معتبر است.',
+      userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
       retryable: false,
     });
   }
@@ -939,7 +925,7 @@ async function tryExecutionPool<T>(
     new AIProviderError({
       code: 'PROVIDER_ERROR',
       message: 'All active credentials for provider failed.',
-      userMessageFa: 'همه کلیدهای فعال این ارائه‌دهنده با خطا مواجه شدند یا سهمیه آن‌ها تمام شده است.',
+      userMessageFa: 'سرویس این مدل موقتاً در دسترس نیست. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
     })
   );
 }
@@ -1249,7 +1235,7 @@ async function runGradioSpaceCall(
     throw new AIProviderError({
       code: 'PROVIDER_ERROR',
       message: 'Hugging Face Space did not return an event_id.',
-      userMessageFa: 'پاسخی از صف پردازش Hugging Face Space دریافت نشد.',
+      userMessageFa: 'پاسخی از سرور پردازش دریافت نشد. لطفاً دوباره تلاش کنید.',
     });
   }
 
@@ -1280,8 +1266,8 @@ async function runGradioSpaceCall(
         code: isQuota ? 'RATE_LIMITED' : 'PROVIDER_ERROR',
         message: `HF Space error: ${redactSecrets(payloadRaw, ctx.apiKey ? [ctx.apiKey] : [])}`,
         userMessageFa: isQuota
-          ? 'سهمیه ZeroGPU توکن فعلی به پایان رسیده است.'
-          : 'اجرای پردازش در Hugging Face Space با خطا مواجه شد.',
+          ? 'سرویس این مدل موقتاً شلوغ است. لطفاً لحظاتی دیگر دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.'
+          : 'پردازش درخواست با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
         retryable: true,
         credentialFailureKind: isQuota ? 'quota_exhausted' : 'transient',
       });
@@ -1298,7 +1284,7 @@ async function runGradioSpaceCall(
   throw new AIProviderError({
     code: 'PROVIDER_ERROR',
     message: 'Hugging Face Space stream ended without complete event.',
-    userMessageFa: 'خروجی کاملی از Hugging Face Space دریافت نشد.',
+    userMessageFa: 'خروجی کاملی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
   });
 }
 
@@ -1819,8 +1805,7 @@ async function executeTextOnProvider(
           throw new AIProviderError({
             code: 'INVALID_API_KEY',
             message: 'Cloudflare Workers AI requires native Worker binding or Account ID + API Token.',
-            userMessageFa:
-              'برای اجرای Cloudflare Workers AI خارج از Worker، شناسه اکانت (Account ID) و API Token را ثبت کنید.',
+            userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
             retryable: false,
           });
         }
@@ -1852,7 +1837,7 @@ async function executeTextOnProvider(
         await input.onChunk(text);
       }
       return {
-        text: text || 'پاسخی از Cloudflare Workers AI دریافت نشد.',
+        text: text || 'پاسخی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
         inputTokens: inTok,
         outputTokens: outTok,
         costUsd: 0,
@@ -1862,7 +1847,7 @@ async function executeTextOnProvider(
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider type ${ctx.providerType} does not support text/chat completion.`,
-      userMessageFa: 'این ارائه‌دهنده از گفتگوی متنی پشتیبانی نمی‌کند.',
+      userMessageFa: 'این مدل از گفتگوی متنی پشتیبانی نمی‌کند. لطفاً مدل دیگری انتخاب کنید.',
     });
   } catch (err) {
     throw wrapNetworkError(err, ctx.apiKey);
@@ -2047,8 +2032,8 @@ async function executeImageGenOnProvider(
               ? `Imagen blocked prompt: ${filterReason}`
               : 'Imagen returned no generated image bytes.',
             userMessageFa: filterReason
-              ? 'درخواست تولید تصویر توسط فیلتر ایمنی Imagen مسدود شد. لطفاً پرامپت را تغییر دهید.'
-              : 'مدل Imagen خروجی تصویر برنگرداند. لطفاً پرامپت را تغییر دهید.',
+              ? 'درخواست تولید تصویر با قوانین ایمنی مدل سازگار نبود. لطفاً متن دیگری بنویسید.'
+              : 'تصویری تولید نشد. لطفاً متن خود را تغییر داده و دوباره تلاش کنید.',
           });
         }
         return { images, costUsd: 0.04 * images.length };
@@ -2245,7 +2230,7 @@ async function executeImageGenOnProvider(
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
           message: `Replicate failed: ${pred.error ?? pred.status}`,
-          userMessageFa: 'تولید تصویر در Replicate با خطا مواجه شد.',
+          userMessageFa: 'تولید تصویر با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
         });
       }
       const urls = Array.isArray(pred.output)
@@ -2454,7 +2439,7 @@ async function executeImageGenOnProvider(
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
           message: 'Cloudflare Workers AI returned no recognizable image output.',
-          userMessageFa: 'خروجی تصویر معتبری از Cloudflare Workers AI دریافت نشد.',
+          userMessageFa: 'خروجی تصویر معتبری دریافت نشد. لطفاً دوباره تلاش کنید.',
         });
       };
 
@@ -2466,7 +2451,7 @@ async function executeImageGenOnProvider(
           throw new AIProviderError({
             code: 'PROVIDER_ERROR',
             message: 'Cloudflare Workers AI returned empty image buffer.',
-            userMessageFa: 'تصویر خروجی Cloudflare Workers AI خالی بود. لطفاً دوباره تلاش کنید.',
+            userMessageFa: 'تصویر خروجی خالی بود. لطفاً دوباره تلاش کنید.',
           });
         }
         return {
@@ -2480,8 +2465,7 @@ async function executeImageGenOnProvider(
         throw new AIProviderError({
           code: 'INVALID_API_KEY',
           message: 'Cloudflare Workers AI requires native Worker binding or Account ID + API Token.',
-          userMessageFa:
-            'برای اجرای Cloudflare Workers AI خارج از Worker، شناسه اکانت (Account ID) و API Token را ثبت کنید یا نسخه جدید را روی Cloudflare دیپلوی نمایید.',
+          userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
           retryable: false,
         });
       }
@@ -2528,7 +2512,7 @@ async function executeImageGenOnProvider(
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
           message: 'Hugging Face Space returned no image output.',
-          userMessageFa: 'تصویری از خروجی Hugging Face Space دریافت نشد.',
+          userMessageFa: 'تصویری تولید نشد. لطفاً دوباره تلاش کنید.',
         });
       }
       const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
@@ -2547,7 +2531,7 @@ async function executeImageGenOnProvider(
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider ${ctx.providerType} does not support image generation.`,
-      userMessageFa: 'این ارائه‌دهنده از تولید تصویر پشتیبانی نمی‌کند.',
+      userMessageFa: 'این مدل از تولید تصویر پشتیبانی نمی‌کند. لطفاً مدل دیگری انتخاب کنید.',
     });
   } catch (err) {
     throw wrapNetworkError(err, ctx.apiKey);
@@ -2731,7 +2715,7 @@ async function executeImageEditOnProvider(
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
           message: `Replicate image edit failed: ${pred.error ?? pred.status}`,
-          userMessageFa: 'ویرایش تصویر در Replicate با خطا مواجه شد.',
+          userMessageFa: 'ویرایش تصویر با خطا مواجه شد. لطفاً دوباره تلاش کنید.',
         });
       }
       const urls = Array.isArray(pred.output)
@@ -2805,7 +2789,7 @@ async function executeImageEditOnProvider(
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
           message: 'Hugging Face Space returned no edited image.',
-          userMessageFa: 'ویرایش تصویر در Hugging Face Space نتیجه‌ای برنگرداند.',
+          userMessageFa: 'ویرایش تصویر نتیجه‌ای برنگرداند. لطفاً دوباره تلاش کنید.',
         });
       }
       const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
@@ -2824,7 +2808,7 @@ async function executeImageEditOnProvider(
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider ${ctx.providerType} does not support image editing.`,
-      userMessageFa: 'این ارائه‌دهنده از ویرایش تصویر پشتیبانی نمی‌کند.',
+      userMessageFa: 'این مدل از ویرایش تصویر پشتیبانی نمی‌کند. لطفاً مدل دیگری انتخاب کنید.',
     });
   } catch (err) {
     throw wrapNetworkError(err, ctx.apiKey);
@@ -2945,6 +2929,106 @@ async function executeTranscribeOnProvider(
       return { text: json.text?.trim() ?? '', language: input.language, costUsd: 0.003 };
     }
 
+    if (ctx.providerType === 'cloudflare_workers_ai') {
+      const modelId = ctx.modelIdentifier.trim();
+      const lowerModel = modelId.toLowerCase();
+      const extractCfSttText = (raw: unknown): string => {
+        if (!raw || typeof raw !== 'object') return '';
+        const obj = raw as {
+          text?: unknown;
+          result?: {
+            text?: unknown;
+            results?: { channels?: Array<{ alternatives?: Array<{ transcript?: unknown }> }> };
+          };
+          results?: { channels?: Array<{ alternatives?: Array<{ transcript?: unknown }> }> };
+        };
+        if (typeof obj.text === 'string') return obj.text.trim();
+        if (typeof obj.result?.text === 'string') return obj.result.text.trim();
+        const directTranscript = obj.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+        if (typeof directTranscript === 'string') return directTranscript.trim();
+        const nestedTranscript = obj.result?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+        if (typeof nestedTranscript === 'string') return nestedTranscript.trim();
+        return '';
+      };
+
+      const isWhisperTurbo = lowerModel.includes('whisper-large-v3-turbo');
+      const isDeepgramNova = lowerModel.includes('deepgram/nova');
+      const aiBinding = getCloudflareAiBinding();
+
+      if (aiBinding) {
+        let payload: Record<string, unknown>;
+        if (isDeepgramNova) {
+          payload = {
+            audio: {
+              body: new Uint8Array(input.audioBuffer),
+              contentType: input.mimeType || 'audio/ogg',
+            },
+            ...(input.language ? { language: input.language } : {}),
+          };
+        } else if (isWhisperTurbo) {
+          payload = {
+            audio: input.audioBuffer.toString('base64'),
+            ...(input.language ? { language: input.language } : {}),
+          };
+        } else {
+          payload = {
+            audio: Array.from(input.audioBuffer),
+          };
+        }
+        const rawOut = await aiBinding.run(modelId, payload);
+        return {
+          text: extractCfSttText(rawOut),
+          language: input.language,
+          costUsd: 0,
+        };
+      }
+
+      const accountId = (ctx.organizationId ?? '').trim();
+      if (!accountId || !ctx.apiKey.trim()) {
+        throw new AIProviderError({
+          code: 'INVALID_API_KEY',
+          message: 'Cloudflare Workers AI STT requires native Worker binding or Account ID + API Token.',
+          userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
+          retryable: false,
+        });
+      }
+
+      const restBase = normalizeBaseUrl(ctx.baseUrl || 'https://api.cloudflare.com/client/v4').replace(/\/accounts\/.+$/i, '');
+      const restUrl = `${restBase}/accounts/${encodeURIComponent(accountId)}/ai/run/${modelId}`;
+      const res = await fetchWithTimeout(
+        restUrl,
+        isWhisperTurbo
+          ? {
+              method: 'POST',
+              headers: mergeHeaders(
+                { 'Content-Type': 'application/json', Authorization: `Bearer ${ctx.apiKey}` },
+                ctx.additionalHeaders,
+              ),
+              body: JSON.stringify({
+                audio: input.audioBuffer.toString('base64'),
+                ...(input.language ? { language: input.language } : {}),
+              }),
+            }
+          : {
+              method: 'POST',
+              headers: mergeHeaders(
+                { 'Content-Type': input.mimeType || 'audio/ogg', Authorization: `Bearer ${ctx.apiKey}` },
+                ctx.additionalHeaders,
+              ),
+              body: new Uint8Array(input.audioBuffer),
+            },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey, modelId);
+      const json = await res.json();
+      return {
+        text: extractCfSttText(json),
+        language: input.language,
+        costUsd: 0,
+      };
+    }
+
     if (ctx.providerType === 'huggingface_space') {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const dataUri = `data:${input.mimeType};base64,${input.audioBuffer.toString('base64')}`;
@@ -2960,7 +3044,7 @@ async function executeTranscribeOnProvider(
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider ${ctx.providerType} does not support audio transcription.`,
-      userMessageFa: 'این ارائه‌دهنده از تبدیل گفتار به متن پشتیبانی نمی‌کند.',
+      userMessageFa: 'این مدل از تبدیل گفتار به متن پشتیبانی نمی‌کند. لطفاً مدل دیگری انتخاب کنید.',
     });
   } catch (err) {
     throw wrapNetworkError(err, ctx.apiKey);
@@ -3092,6 +3176,98 @@ async function executeSpeechOnProvider(
       };
     }
 
+    if (ctx.providerType === 'cloudflare_workers_ai') {
+      const modelId = ctx.modelIdentifier.trim();
+      const lowerModel = modelId.toLowerCase();
+      const isMelo = lowerModel.includes('melotts');
+      const payload = isMelo
+        ? { prompt: input.text, lang: 'en' }
+        : { text: input.text, ...(input.voice ? { speaker: input.voice } : {}) };
+
+      const decodeCfAudio = async (raw: unknown): Promise<{ audioBuffer: Buffer; mimeType: string; extension: string }> => {
+        if (raw instanceof Uint8Array) {
+          return { audioBuffer: Buffer.from(raw), mimeType: 'audio/mpeg', extension: 'mp3' };
+        }
+        if (raw instanceof ArrayBuffer) {
+          return { audioBuffer: Buffer.from(raw), mimeType: 'audio/mpeg', extension: 'mp3' };
+        }
+        if (raw && typeof raw === 'object' && 'arrayBuffer' in raw && typeof (raw as Response).arrayBuffer === 'function') {
+          return { audioBuffer: Buffer.from(await (raw as Response).arrayBuffer()), mimeType: 'audio/mpeg', extension: 'mp3' };
+        }
+        if (raw && typeof raw === 'object' && 'getReader' in raw && typeof (raw as ReadableStream).getReader === 'function') {
+          const reader = (raw as ReadableStream<Uint8Array>).getReader();
+          const chunks: Uint8Array[] = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) chunks.push(value);
+          }
+          return {
+            audioBuffer: Buffer.concat(chunks.map((c) => Buffer.from(c))),
+            mimeType: 'audio/mpeg',
+            extension: 'mp3',
+          };
+        }
+        if (raw && typeof raw === 'object') {
+          const obj = raw as { audio?: unknown; result?: { audio?: unknown } };
+          const b64 = typeof obj.audio === 'string' ? obj.audio : typeof obj.result?.audio === 'string' ? obj.result.audio : null;
+          if (b64) {
+            return { audioBuffer: Buffer.from(b64, 'base64'), mimeType: 'audio/mpeg', extension: 'mp3' };
+          }
+        }
+        throw new AIProviderError({
+          code: 'PROVIDER_ERROR',
+          message: 'Cloudflare Workers AI TTS returned no recognizable audio output.',
+          userMessageFa: 'خروجی صوتی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
+        });
+      };
+
+      const aiBinding = getCloudflareAiBinding();
+      if (aiBinding) {
+        const rawOut = await aiBinding.run(modelId, payload);
+        const decoded = await decodeCfAudio(rawOut);
+        return { ...decoded, costUsd: 0 };
+      }
+
+      const accountId = (ctx.organizationId ?? '').trim();
+      if (!accountId || !ctx.apiKey.trim()) {
+        throw new AIProviderError({
+          code: 'INVALID_API_KEY',
+          message: 'Cloudflare Workers AI TTS requires native Worker binding or Account ID + API Token.',
+          userMessageFa: 'این مدل در حال حاضر در دسترس نیست. لطفاً مدل دیگری انتخاب کنید.',
+          retryable: false,
+        });
+      }
+
+      const restBase = normalizeBaseUrl(ctx.baseUrl || 'https://api.cloudflare.com/client/v4').replace(/\/accounts\/.+$/i, '');
+      const restUrl = `${restBase}/accounts/${encodeURIComponent(accountId)}/ai/run/${modelId}`;
+      const res = await fetchWithTimeout(
+        restUrl,
+        {
+          method: 'POST',
+          headers: mergeHeaders(
+            { 'Content-Type': 'application/json', Authorization: `Bearer ${ctx.apiKey}` },
+            ctx.additionalHeaders,
+          ),
+          body: JSON.stringify(payload),
+        },
+        60000,
+        input.signal,
+      );
+      if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey, modelId);
+      const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || '';
+      if (contentType.includes('application/json')) {
+        const decoded = await decodeCfAudio(await res.json());
+        return { ...decoded, costUsd: 0 };
+      }
+      return {
+        audioBuffer: Buffer.from(await res.arrayBuffer()),
+        mimeType: contentType.startsWith('audio/') ? contentType : 'audio/mpeg',
+        extension: contentType.includes('wav') ? 'wav' : 'mp3',
+        costUsd: 0,
+      };
+    }
+
     if (ctx.providerType === 'huggingface_space') {
       const resolvedCtx = await resolveGradioContext(ctx, input.signal);
       const args = buildGradioInputPayload(resolvedCtx, input.text);
@@ -3101,7 +3277,7 @@ async function executeSpeechOnProvider(
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
           message: 'Hugging Face Space returned no audio output.',
-          userMessageFa: 'خروجی صوتی از Hugging Face Space دریافت نشد.',
+          userMessageFa: 'خروجی صوتی از مدل دریافت نشد. لطفاً دوباره تلاش کنید.',
         });
       }
       const dl = await downloadBinarySafe(mediaUrl, resolvedCtx.apiKey, true);
@@ -3117,7 +3293,7 @@ async function executeSpeechOnProvider(
     throw new AIProviderError({
       code: 'UNSUPPORTED_CAPABILITY',
       message: `Provider ${ctx.providerType} does not support text-to-speech.`,
-      userMessageFa: 'این ارائه‌دهنده از تبدیل متن به گفتار پشتیبانی نمی‌کند.',
+      userMessageFa: 'این مدل از تبدیل متن به گفتار پشتیبانی نمی‌کند. لطفاً مدل دیگری انتخاب کنید.',
     });
   } catch (err) {
     throw wrapNetworkError(err, ctx.apiKey);
@@ -3267,7 +3443,7 @@ export async function startVideoGenerationWithRoute(
       throw new AIProviderError({
         code: 'UNSUPPORTED_CAPABILITY',
         message: `Provider ${ctx.providerType} does not support video generation.`,
-        userMessageFa: 'ارائه‌دهنده انتخاب‌شده از تولید ویدیو پشتیبانی نمی‌کند.',
+        userMessageFa: 'این مدل از تولید ویدیو پشتیبانی نمی‌کند. لطفاً مدل دیگری انتخاب کنید.',
       });
     } catch (err) {
       throw wrapNetworkError(err, ctx.apiKey);

@@ -277,7 +277,7 @@ export function MiniAppStudioTab({
               ) : (
                 modeModels.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.name} ({m.providerName}) — {m.creditCost} اعتبار
+                    {m.name} — {m.creditCost} اعتبار
                   </option>
                 ))
               )}
@@ -428,7 +428,7 @@ export function MiniAppStudioTab({
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                 <span className="leading-relaxed">{error}</span>
               </div>
-              {suggestedAltModel && /limit:\s*0|billing|سهمیه|429|403/i.test(error) && (
+              {suggestedAltModel && (
                 <button
                   type="button"
                   onClick={() => {
@@ -438,7 +438,7 @@ export function MiniAppStudioTab({
                   }}
                   className="min-h-[36px] px-3 rounded-lg bg-white dark:bg-slate-900 border border-rose-300 dark:border-rose-800 text-rose-900 dark:text-rose-100 font-medium hover:bg-rose-100 dark:hover:bg-rose-900/50 cursor-pointer transition-colors"
                 >
-                  تغییر مدل به: {suggestedAltModel.name} ({suggestedAltModel.providerName})
+                  تغییر مدل به: {suggestedAltModel.name}
                 </button>
               )}
             </div>

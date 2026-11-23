@@ -66,10 +66,9 @@ export function buildDynamicModelsKeyboard(
   for (const m of slice) {
     const isSelected = m.id === selectedModelId;
     const prefix = isSelected ? '✅ ' : '';
-    const shortName = m.name.length > 26 ? `${m.name.slice(0, 24)}…` : m.name;
-    const shortProv = m.providerName.length > 14 ? `${m.providerName.slice(0, 12)}…` : m.providerName;
+    const shortName = m.name.length > 34 ? `${m.name.slice(0, 32)}…` : m.name;
     const costLabel = m.creditCost > 0 ? ` (${m.creditCost}💎)` : ' (رایگان)';
-    kb.text(`${prefix}${shortName} · ${shortProv}${costLabel}`, `msel:${safeCatKey}:${m.id}`).row();
+    kb.text(`${prefix}${shortName}${costLabel}`, `msel:${safeCatKey}:${m.id}`).row();
   }
 
   if (totalPages > 1) {
