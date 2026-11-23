@@ -6,6 +6,7 @@ import { isAiMockModeEnabled } from '../config/env.ts';
 import { decryptSecret, redactSecrets } from '../security/crypto.ts';
 import { assertSafeOutboundUrl, SsrfProtectionError } from '../security/ssrf.ts';
 import {
+  extractHuggingFaceRepoFromUrl,
   normalizeBaseUrl,
   normalizeGeminiModelId,
   normalizeGeminiRootBaseUrl,
@@ -62,14 +63,19 @@ function mergeHeaders(
   return out;
 }
 
+function isModelQuotaZeroSignal(text: string): boolean {
+  return /\blimit\s*:\s*0\b/i.test(text);
+}
+
 function isQuotaExhaustedSignal(text: string): boolean {
-  return /insufficient_quota|quota[_\s-]?exceeded|exceeded your current quota|resource_exhausted|credit balance is too low|billing|payment required|zerogpu.*quota|daily.*limit/i.test(
+  if (isModelQuotaZeroSignal(text)) return false;
+  return /insufficient_quota|credit balance is too low|exceeded your monthly included credits|payment required|zerogpu.*quota|daily.*limit|exceeded your current quota/i.test(
     text,
   );
 }
 
 function isInvalidKeySignal(text: string): boolean {
-  return /api_key_invalid|invalid[_\s-]?api[_\s-]?key|incorrect api key|invalid token|unauthorized|authentication failed|permission_denied/i.test(
+  return /api_key_invalid|api key not valid|invalid[_\s-]?api[_\s-]?key|incorrect api key|invalid[_\s-]?x-api-key|invalid[_\s-]?token|token is invalid|authentication_error|unauthenticated|revoked api key/i.test(
     text,
   );
 }
@@ -78,29 +84,67 @@ function classifyHttpError(status: number, bodyText: string, apiKey: string): AI
   const secrets = apiKey ? [apiKey] : [];
   const safeMsg = redactSecrets(bodyText.slice(0, 300), secrets);
 
-  if (status === 402 || (status === 429 && isQuotaExhaustedSignal(bodyText))) {
+  if (status === 402) {
     return new AIProviderError({
       code: 'RATE_LIMITED',
       message: `Provider quota exhausted (${status}): ${safeMsg}`,
-      userMessageFa: 'سهمیه کلید API این ارائه‌دهنده به پایان رسیده است.',
+      userMessageFa: 'سهمیه یا اعتبار حساب کاربری این کلید API به پایان رسیده است.',
       retryable: true,
       httpStatus: status,
       credentialFailureKind: 'quota_exhausted',
     });
   }
 
-  if (status === 401 || status === 403 || isInvalidKeySignal(bodyText)) {
+  if (status === 401 || isInvalidKeySignal(bodyText)) {
     return new AIProviderError({
       code: 'INVALID_API_KEY',
       message: `Provider auth failed (${status}): ${safeMsg}`,
-      userMessageFa: 'کلید API ارائه‌دهنده نامعتبر یا منقضی است. لطفاً به پشتیبانی اطلاع دهید.',
+      userMessageFa: 'کلید API ارائه‌دهنده نامعتبر یا منقضی است. لطفاً کلید را در پنل مدیریت بررسی کنید.',
       retryable: false,
       httpStatus: status,
       credentialFailureKind: 'invalid',
     });
   }
 
+  if (status === 403) {
+    // 403 without an invalid-key signal is usually billing, region, gated model, or token scope—never brick other models on this key
+    const isBilling = /billed users|billing|paid tier/i.test(bodyText);
+    const isPermissionOrGated = /sufficient permissions|inference providers|gated|access to model/i.test(bodyText);
+    return new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: `Provider access restricted (403): ${safeMsg}`,
+      userMessageFa: isBilling
+        ? 'این مدل فقط برای حساب‌های دارای Billing فعال (یا سطح پولی) در دسترس است.'
+        : isPermissionOrGated
+          ? 'کلید API فعلی مجوز دسترسی به این مدل یا Inference Providers را ندارد.'
+          : 'دسترسی به این مدل از سمت ارائه‌دهنده محدود شده است (خطای 403).',
+      retryable: false,
+      httpStatus: 403,
+      credentialFailureKind: 'transient',
+    });
+  }
+
   if (status === 429) {
+    if (isModelQuotaZeroSignal(bodyText)) {
+      return new AIProviderError({
+        code: 'RATE_LIMITED',
+        message: `Provider model quota is zero (429): ${safeMsg}`,
+        userMessageFa: 'سهمیه رایگان این مدل در حساب API شما صفر است یا نیازمند فعال‌سازی Billing است.',
+        retryable: false,
+        httpStatus: 429,
+        credentialFailureKind: 'transient',
+      });
+    }
+    if (isQuotaExhaustedSignal(bodyText)) {
+      return new AIProviderError({
+        code: 'RATE_LIMITED',
+        message: `Provider quota exhausted (429): ${safeMsg}`,
+        userMessageFa: 'سهمیه کلید API این ارائه‌دهنده موقتاً به پایان رسیده است.',
+        retryable: true,
+        httpStatus: 429,
+        credentialFailureKind: 'quota_exhausted',
+      });
+    }
     return new AIProviderError({
       code: 'RATE_LIMITED',
       message: `Provider rate limited (429): ${safeMsg}`,
@@ -112,11 +156,21 @@ function classifyHttpError(status: number, bodyText: string, apiKey: string): AI
   }
 
   if (status === 400 || status === 422) {
-    if (isQuotaExhaustedSignal(bodyText)) {
+    if (/billed users|only accessible to billed/i.test(bodyText)) {
+      return new AIProviderError({
+        code: 'PROVIDER_ERROR',
+        message: `Provider billing required (${status}): ${safeMsg}`,
+        userMessageFa: 'این مدل (مانند Imagen) فقط برای کلیدهای دارای Billing فعال در دسترس است.',
+        retryable: false,
+        httpStatus: status,
+        credentialFailureKind: 'prompt_error',
+      });
+    }
+    if (isAccountQuotaExhaustedSafe(bodyText)) {
       return new AIProviderError({
         code: 'RATE_LIMITED',
         message: `Provider quota exhausted (${status}): ${safeMsg}`,
-        userMessageFa: 'سهمیه کلید API این ارائه‌دهنده به پایان رسیده است.',
+        userMessageFa: 'سهمیه یا اعتبار حساب این کلید API به پایان رسیده است.',
         retryable: true,
         httpStatus: status,
         credentialFailureKind: 'quota_exhausted',
@@ -125,7 +179,7 @@ function classifyHttpError(status: number, bodyText: string, apiKey: string): AI
     return new AIProviderError({
       code: 'INVALID_PROMPT',
       message: `Provider rejected input (${status}): ${safeMsg}`,
-      userMessageFa: 'درخواست یا ورودی ارسال‌شده توسط مدل هوش مصنوعی پذیرفته نشد. لطفاً متن یا فایل را اصلاح کنید.',
+      userMessageFa: 'درخواست یا ورودی ارسال‌شده توسط مدل هوش مصنوعی پذیرفته نشد. لطفاً متن یا تنظیمات را بررسی کنید.',
       retryable: false,
       httpStatus: status,
       credentialFailureKind: 'prompt_error',
@@ -140,6 +194,12 @@ function classifyHttpError(status: number, bodyText: string, apiKey: string): AI
     httpStatus: status,
     credentialFailureKind: 'transient',
   });
+}
+
+function isAccountQuotaExhaustedSafe(text: string): boolean {
+  return /insufficient_quota|credit balance is too low|exceeded your monthly included credits|payment required/i.test(
+    text,
+  );
 }
 
 function wrapNetworkError(err: unknown, apiKey: string): AIProviderError {
@@ -383,15 +443,39 @@ async function loadProviderContextForId(params: {
   outputPricePerMillion: number;
   maxInputSize: number;
   maxOutputSize: number;
+  throwDetailedOnMissing?: boolean;
 }): Promise<ProviderExecutionContext | null> {
+  const failOrNull = (errParams: ConstructorParameters<typeof AIProviderError>[0]): null => {
+    if (params.throwDetailedOnMissing) {
+      throw new AIProviderError(errParams);
+    }
+    return null;
+  };
+
   const db = getDb();
   const [provider] = await db
     .select()
     .from(aiProviders)
-    .where(and(eq(aiProviders.id, params.providerId), eq(aiProviders.isActive, true)))
+    .where(eq(aiProviders.id, params.providerId))
     .limit(1);
 
-  if (!provider) return null;
+  if (!provider) {
+    return failOrNull({
+      code: 'PROVIDER_ERROR',
+      message: `Provider ${params.providerId} not found in database.`,
+      userMessageFa: 'ارائه‌دهنده این مدل در پایگاه‌داده یافت نشد.',
+      retryable: false,
+    });
+  }
+
+  if (!provider.isActive) {
+    return failOrNull({
+      code: 'INVALID_API_KEY',
+      message: `Provider "${provider.name}" is disabled in admin panel.`,
+      userMessageFa: `ارائه‌دهنده «${provider.name}» در پنل مدیریت غیرفعال شده است. لطفاً آن را فعال کنید.`,
+      retryable: false,
+    });
+  }
 
   const creds = await db
     .select()
@@ -399,14 +483,15 @@ async function loadProviderContextForId(params: {
     .where(and(eq(providerCredentials.providerId, provider.id), eq(providerCredentials.isActive, true)))
     .orderBy(asc(providerCredentials.priority), asc(providerCredentials.failureCount), desc(providerCredentials.keyVersion));
 
+  const nonDisabledCreds = creds.filter((c) => c.status !== 'disabled');
   const nowMs = Date.now();
-  const usableCreds = creds.filter((c) => {
-    if (c.status === 'invalid' || c.status === 'disabled') return false;
+  const usableCreds = nonDisabledCreds.filter((c) => {
+    if (c.status === 'invalid') return false;
     if (c.cooldownUntil && new Date(c.cooldownUntil).getTime() > nowMs) return false;
     return true;
   });
 
-  // Order healthy 'active' keys ahead of cooled-down/expired-cooldown keys
+  // Order healthy 'active' keys ahead of expired-cooldown keys
   usableCreds.sort((a, b) => {
     const aHealthy = a.status === 'active' ? 0 : 1;
     const bHealthy = b.status === 'active' ? 0 : 1;
@@ -433,9 +518,95 @@ async function loadProviderContextForId(params: {
     maxOutputSize: params.maxOutputSize,
   };
 
-  if (usableCreds.length === 0) {
-    // Public Hugging Face Spaces can operate without an API token if no credentials were attached
-    if (provider.providerType === 'huggingface_space' && creds.length === 0) {
+  let candidateCreds = usableCreds;
+
+  // Recover automatically if active keys exist in DB but were previously poisoned by 403/cooldown
+  if (candidateCreds.length === 0) {
+    if (nonDisabledCreds.length === 0) {
+      if (provider.providerType === 'huggingface_space') {
+        const anonCtx: ProviderExecutionContext = {
+          ...baseMeta,
+          apiKey: '',
+          credentialId: null,
+        };
+        anonCtx.credentialPool = [anonCtx];
+        return anonCtx;
+      }
+      return failOrNull({
+        code: 'INVALID_API_KEY',
+        message:
+          creds.length === 0
+            ? `Provider "${provider.name}" has no API credentials registered.`
+            : `All API credentials for provider "${provider.name}" are disabled.`,
+        userMessageFa:
+          creds.length === 0
+            ? `هیچ کلید API برای ارائه‌دهنده «${provider.name}» ثبت نشده است. در پنل مدیریت کلید اضافه کنید.`
+            : `تمام کلیدهای API ارائه‌دهنده «${provider.name}» غیرفعال (Revoked) شده‌اند.`,
+        retryable: false,
+      });
+    }
+
+    // All non-disabled keys are either in cooldown or marked 'invalid' from an earlier error.
+    // Allow probing cooldown keys or non-fresh/403-poisoned invalid keys instead of silently deadlocking.
+    const recoverableCreds = nonDisabledCreds.filter((c) => {
+      if (c.status !== 'invalid') return true;
+      const msg = c.lastErrorMessage ?? '';
+      const wasFalse403OrModelPoison = /\b403\b|permission_denied|billed users|sufficient permissions|gated/i.test(msg);
+      const ageMs = nowMs - new Date(c.updatedAt).getTime();
+      return wasFalse403OrModelPoison || ageMs > 90_000;
+    });
+
+    if (recoverableCreds.length > 0) {
+      recoverableCreds.sort((a, b) => {
+        const aInv = a.status === 'invalid' ? 1 : 0;
+        const bInv = b.status === 'invalid' ? 1 : 0;
+        if (aInv !== bInv) return aInv - bInv;
+        const aCool = a.cooldownUntil ? new Date(a.cooldownUntil).getTime() : 0;
+        const bCool = b.cooldownUntil ? new Date(b.cooldownUntil).getTime() : 0;
+        return aCool - bCool;
+      });
+      candidateCreds = recoverableCreds;
+    } else if (provider.providerType === 'huggingface_space') {
+      const anonCtx: ProviderExecutionContext = {
+        ...baseMeta,
+        apiKey: '',
+        credentialId: null,
+      };
+      anonCtx.credentialPool = [anonCtx];
+      return anonCtx;
+    } else {
+      const latestErr = nonDisabledCreds[0]?.lastErrorMessage;
+      return failOrNull({
+        code: 'INVALID_API_KEY',
+        message: latestErr
+          ? `All credentials for "${provider.name}" failed: ${latestErr}`
+          : `All API credentials for "${provider.name}" are invalid.`,
+        userMessageFa: `کلید API ارائه‌دهنده «${provider.name}» نامعتبر تشخیص داده شده است. لطفاً کلید را در پنل مدیریت بررسی یا جایگزین کنید.`,
+        retryable: false,
+      });
+    }
+  }
+
+  const contexts: ProviderExecutionContext[] = [];
+  for (const c of candidateCreds) {
+    try {
+      const apiKey = decryptSecret({
+        ciphertext: c.encryptedApiKey,
+        iv: c.iv,
+        authTag: c.authTag,
+      });
+      contexts.push({
+        ...baseMeta,
+        credentialId: c.id,
+        apiKey,
+      });
+    } catch {
+      // Skip malformed credential if another valid key exists; otherwise report decryption failure clearly
+    }
+  }
+
+  if (contexts.length === 0) {
+    if (provider.providerType === 'huggingface_space') {
       const anonCtx: ProviderExecutionContext = {
         ...baseMeta,
         apiKey: '',
@@ -444,18 +615,21 @@ async function loadProviderContextForId(params: {
       anonCtx.credentialPool = [anonCtx];
       return anonCtx;
     }
-    return null;
+    return failOrNull({
+      code: 'INVALID_API_KEY',
+      message: `Failed to decrypt API credentials for provider "${provider.name}".`,
+      userMessageFa: `خطا در رمزگشایی کلید API ارائه‌دهنده «${provider.name}». لطفاً کلید را مجدداً در پنل مدیریت ذخیره کنید.`,
+      retryable: false,
+    });
   }
 
-  const contexts: ProviderExecutionContext[] = usableCreds.map((c) => ({
-    ...baseMeta,
-    credentialId: c.id,
-    apiKey: decryptSecret({
-      ciphertext: c.encryptedApiKey,
-      iv: c.iv,
-      authTag: c.authTag,
-    }),
-  }));
+  if (provider.providerType === 'huggingface_space') {
+    contexts.push({
+      ...baseMeta,
+      apiKey: '',
+      credentialId: null,
+    });
+  }
 
   const primary = { ...contexts[0]!, credentialPool: contexts };
   return primary;
@@ -506,6 +680,7 @@ export async function loadModelExecutionRoute(
     outputPricePerMillion: Number(model.outputPricePerMillion),
     maxInputSize: model.maxInputSize,
     maxOutputSize: model.maxOutputSize,
+    throwDetailedOnMissing: true,
   });
 
   if (!primary) {
@@ -646,10 +821,10 @@ async function markCredentialFailure(credentialId: string | null | undefined, er
       nextStatus = 'invalid';
     } else if (kind === 'quota_exhausted') {
       nextStatus = 'quota_exhausted';
-      cooldownUntil = new Date(Date.now() + 6 * 60 * 60 * 1000); // 6 hours
+      cooldownUntil = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
     } else if (kind === 'rate_limited') {
       nextStatus = 'rate_limited';
-      cooldownUntil = new Date(Date.now() + 90 * 1000); // 90 seconds
+      cooldownUntil = new Date(Date.now() + 45 * 1000); // 45 seconds
     }
 
     await db
@@ -1795,10 +1970,13 @@ async function executeImageGenOnProvider(
       assertGeminiNotBlocked(json, true);
       const images = extractGeminiCandidateImages(json.candidates);
       if (images.length === 0) {
+        const textHint = extractGeminiCandidateText(json.candidates).trim();
         throw new AIProviderError({
           code: 'PROVIDER_ERROR',
-          message: 'Gemini returned no image parts.',
-          userMessageFa: 'مدل تصویری خروجی تولید نکرد. لطفاً پرامپت را تغییر دهید.',
+          message: textHint
+            ? `Gemini returned text instead of image: ${textHint.slice(0, 180)}`
+            : 'Gemini returned no image parts.',
+          userMessageFa: 'مدل تصویری خروجی تصویر تولید نکرد. لطفاً پرامپت را تغییر دهید.',
         });
       }
       return { images, costUsd: 0.03 * images.length };
@@ -1806,13 +1984,32 @@ async function executeImageGenOnProvider(
 
     if (ctx.providerType === 'openai_compatible' || ctx.providerType === 'custom') {
       const url = `${normalizeOpenAiRootBaseUrl(ctx.baseUrl)}/images/generations`;
-      const sizeMap: Record<string, string> = {
-        '1:1': '1024x1024',
-        '16:9': '1536x1024',
-        '9:16': '1024x1536',
-        '4:3': '1024x1024',
-        '3:4': '1024x1536',
-      };
+      const lowerModel = ctx.modelIdentifier.toLowerCase();
+      const isDalle3 = lowerModel.includes('dall-e-3');
+      const isDalle2 = lowerModel.includes('dall-e-2');
+      const sizeMap: Record<string, string> = isDalle2
+        ? {
+            '1:1': '1024x1024',
+            '16:9': '1024x1024',
+            '9:16': '1024x1024',
+            '4:3': '1024x1024',
+            '3:4': '1024x1024',
+          }
+        : isDalle3
+          ? {
+              '1:1': '1024x1024',
+              '16:9': '1792x1024',
+              '9:16': '1024x1792',
+              '4:3': '1024x1024',
+              '3:4': '1024x1792',
+            }
+          : {
+              '1:1': '1024x1024',
+              '16:9': '1536x1024',
+              '9:16': '1024x1536',
+              '4:3': '1024x1024',
+              '3:4': '1024x1536',
+            };
       const size =
         input.resolution && /^\d+x\d+$/.test(input.resolution)
           ? input.resolution
@@ -1829,7 +2026,7 @@ async function executeImageGenOnProvider(
           body: JSON.stringify({
             model: ctx.modelIdentifier,
             prompt: input.prompt,
-            n: Math.min(Math.max(input.count ?? 1, 1), 4),
+            n: isDalle3 ? 1 : Math.min(Math.max(input.count ?? 1, 1), 4),
             size,
           }),
         },
@@ -1967,7 +2164,8 @@ async function executeImageGenOnProvider(
 
     if (ctx.providerType === 'huggingface') {
       const routerRoot = resolveHuggingFaceRouterRoot(ctx.baseUrl);
-      const url = `${routerRoot}/hf-inference/models/${ctx.modelIdentifier.replace(/^\/+/, '')}`;
+      const hfRepoId = extractHuggingFaceRepoFromUrl(ctx.modelIdentifier) ?? ctx.modelIdentifier.replace(/^\/+/, '');
+      const url = `${routerRoot}/hf-inference/models/${hfRepoId}`;
       const res = await fetchWithTimeout(
         url,
         {
@@ -1991,7 +2189,12 @@ async function executeImageGenOnProvider(
       if (!res.ok) throw classifyHttpError(res.status, await res.text(), ctx.apiKey);
       const contentType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
       if (contentType.includes('application/json')) {
-        const jsonBody = (await res.json()) as { error?: string; image?: string; url?: string };
+        const jsonBody = (await res.json()) as {
+          error?: string;
+          image?: string;
+          url?: string;
+          data?: Array<{ b64_json?: string; url?: string }>;
+        };
         if (jsonBody.error) {
           throw classifyHttpError(502, jsonBody.error, ctx.apiKey);
         }
@@ -2003,6 +2206,20 @@ async function executeImageGenOnProvider(
         }
         if (jsonBody.url) {
           const dl = await downloadBinarySafe(jsonBody.url, ctx.apiKey, true);
+          return {
+            images: [{ buffer: dl.buffer, mimeType: dl.mimeType, extension: dl.mimeType.includes('jpeg') ? 'jpg' : 'png' }],
+            costUsd: 0.02,
+          };
+        }
+        const firstData = jsonBody.data?.[0];
+        if (firstData?.b64_json) {
+          return {
+            images: [{ buffer: Buffer.from(firstData.b64_json, 'base64'), mimeType: 'image/png', extension: 'png' }],
+            costUsd: 0.02,
+          };
+        }
+        if (firstData?.url) {
+          const dl = await downloadBinarySafe(firstData.url, ctx.apiKey, true);
           return {
             images: [{ buffer: dl.buffer, mimeType: dl.mimeType, extension: dl.mimeType.includes('jpeg') ? 'jpg' : 'png' }],
             costUsd: 0.02,

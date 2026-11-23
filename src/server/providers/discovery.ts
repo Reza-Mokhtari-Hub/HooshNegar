@@ -121,6 +121,10 @@ export function normalizeModelIdentifierForProvider(
   if (providerType === 'google_gemini') {
     return normalizeGeminiModelId(trimmed);
   }
+  if (providerType === 'huggingface') {
+    const repo = extractHuggingFaceRepoFromUrl(trimmed);
+    if (repo) return repo;
+  }
   return trimmed;
 }
 

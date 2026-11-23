@@ -761,6 +761,20 @@ export function createProviderRouter(): Router {
               updatedAt: now,
             })
             .where(eq(aiProviders.id, providerId));
+
+          if (bestCred) {
+            await db
+              .update(providerCredentials)
+              .set({
+                status: 'active',
+                cooldownUntil: null,
+                failureCount: 0,
+                lastErrorCode: null,
+                lastErrorMessage: null,
+                updatedAt: now,
+              })
+              .where(eq(providerCredentials.id, bestCred.id));
+          }
         }
 
         if (!discoverRes.ok) {
@@ -1008,6 +1022,20 @@ export function createProviderRouter(): Router {
             updatedAt: now,
           })
           .where(eq(aiProviders.id, providerId));
+
+        if (testResult.ok && cred) {
+          await db
+            .update(providerCredentials)
+            .set({
+              status: 'active',
+              cooldownUntil: null,
+              failureCount: 0,
+              lastErrorCode: null,
+              lastErrorMessage: null,
+              updatedAt: now,
+            })
+            .where(eq(providerCredentials.id, cred.id));
+        }
 
         await recordAuditLog({
           adminUserId: req.admin!.id,

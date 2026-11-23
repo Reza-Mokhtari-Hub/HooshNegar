@@ -795,4 +795,273 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     expect(capturedHfImgUrl).toBe('https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev');
     expect(fluxRes.result.images[0]?.buffer.byteLength).toBe(4);
   });
+
+  it('prevents cross-model key poisoning on 403/limit:0, self-heals poisoned keys, and handles dall-e-3 + HF Hub URLs', async () => {
+    const { normalizeModelIdentifierForProvider } = await import('./discovery.ts');
+    const { generateImageWithRoute } = await import('./engine.ts');
+
+    expect(
+      normalizeModelIdentifierForProvider(
+        'huggingface',
+        'https://huggingface.co/black-forest-labs/FLUX.1-dev',
+      ),
+    ).toBe('black-forest-labs/FLUX.1-dev');
+
+    const db = getDb();
+    process.env.AI_MOCK_MODE = 'false';
+
+    // A. Gemini provider with one valid key
+    const [gemProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'Gemini Self-Heal Provider',
+        slug: `gem-heal-${Date.now()}`,
+        providerType: 'google_gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        isActive: true,
+      })
+      .returning();
+
+    const gemSecret = 'AIzaHealKey123456789';
+    const encGem = encryptSecret(gemSecret);
+    const [gemCred] = await db
+      .insert(providerCredentials)
+      .values({
+        providerId: gemProv!.id,
+        label: 'primary',
+        encryptedApiKey: encGem.ciphertext,
+        iv: encGem.iv,
+        authTag: encGem.authTag,
+        maskedPreview: maskSecret(gemSecret),
+        status: 'active',
+        isActive: true,
+      })
+      .returning();
+
+    const [imagenModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: gemProv!.id,
+        name: 'Imagen 3 Fast',
+        modelIdentifier: 'imagen-3.0-fast-generate-001',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: imagenModel!.id, capability: 'image_generation' });
+
+    const [flashImgModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: gemProv!.id,
+        name: 'Gemini 2.5 Flash Image',
+        modelIdentifier: 'gemini-2.5-flash-image',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: flashImgModel!.id, capability: 'image_generation' });
+
+    // 1. Imagen 403 billed-users error must NOT poison the credential
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 403,
+            message: 'Imagen API is only accessible to billed users at this time.',
+            status: 'PERMISSION_DENIED',
+          },
+        }),
+        { status: 403 },
+      )) as unknown as typeof fetch;
+
+    const imagenRoute = await loadModelExecutionRoute(imagenModel!.id);
+    await expect(
+      generateImageWithRoute(imagenRoute, { prompt: 'sunset over Tehran' }),
+    ).rejects.toMatchObject({
+      code: 'PROVIDER_ERROR',
+      userMessageFa: expect.stringMatching(/Billing/i),
+    });
+
+    const [credAfter403] = await db
+      .select()
+      .from(providerCredentials)
+      .where(eq(providerCredentials.id, gemCred!.id));
+    expect(credAfter403?.status).toBe('active');
+    expect(credAfter403?.cooldownUntil).toBeNull();
+
+    // 2. Gemini 429 with limit: 0 must NOT put credential into quota_exhausted cooldown
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 429,
+            message:
+              'Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-2.5-flash-image',
+            status: 'RESOURCE_EXHAUSTED',
+          },
+        }),
+        { status: 429 },
+      )) as unknown as typeof fetch;
+
+    const flashRoute = await loadModelExecutionRoute(flashImgModel!.id);
+    await expect(
+      generateImageWithRoute(flashRoute, { prompt: 'neon cat' }),
+    ).rejects.toMatchObject({
+      code: 'RATE_LIMITED',
+      userMessageFa: expect.stringMatching(/سهمیه رایگان این مدل در حساب API شما صفر است/),
+    });
+
+    const [credAfterLimitZero] = await db
+      .select()
+      .from(providerCredentials)
+      .where(eq(providerCredentials.id, gemCred!.id));
+    expect(credAfterLimitZero?.status).toBe('active');
+    expect(credAfterLimitZero?.cooldownUntil).toBeNull();
+
+    // 3. Legacy poisoned credential in DB (status: 'invalid' from 403) auto-recovers on next working call
+    await db
+      .update(providerCredentials)
+      .set({
+        status: 'invalid',
+        failureCount: 3,
+        lastErrorCode: 'INVALID_API_KEY',
+        lastErrorMessage: 'Provider auth failed (403): PERMISSION_DENIED',
+      })
+      .where(eq(providerCredentials.id, gemCred!.id));
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { inlineData: { mimeType: 'image/png', data: Buffer.from('HEALEDPNG').toString('base64') } },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+
+    const healedRoute = await loadModelExecutionRoute(flashImgModel!.id);
+    const healedRes = await generateImageWithRoute(healedRoute, { prompt: 'healed lotus' });
+    expect(healedRes.result.images[0]?.buffer.toString()).toBe('HEALEDPNG');
+
+    const [credHealed] = await db
+      .select()
+      .from(providerCredentials)
+      .where(eq(providerCredentials.id, gemCred!.id));
+    expect(credHealed?.status).toBe('active');
+    expect(credHealed?.failureCount).toBe(0);
+
+    // 4. Disabled provider and zero-credential provider surface specific diagnostics
+    const [disabledProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'Disabled Image Prov',
+        slug: `disabled-prov-${Date.now()}`,
+        providerType: 'google_gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com',
+        isActive: false,
+      })
+      .returning();
+    const [disabledModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: disabledProv!.id,
+        name: 'Disabled Img',
+        modelIdentifier: 'gemini-2.5-flash-image',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await expect(loadModelExecutionRoute(disabledModel!.id)).rejects.toMatchObject({
+      code: 'INVALID_API_KEY',
+      userMessageFa: expect.stringMatching(/غیرفعال شده است/),
+    });
+
+    const [noKeyProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'Keyless Image Prov',
+        slug: `nokey-prov-${Date.now()}`,
+        providerType: 'openai_compatible',
+        baseUrl: 'https://api.openai.com/v1',
+        isActive: true,
+      })
+      .returning();
+    const [noKeyModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: noKeyProv!.id,
+        name: 'Keyless Dall-E',
+        modelIdentifier: 'dall-e-3',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await expect(loadModelExecutionRoute(noKeyModel!.id)).rejects.toMatchObject({
+      code: 'INVALID_API_KEY',
+      userMessageFa: expect.stringMatching(/هیچ کلید API/),
+    });
+
+    // 5. dall-e-3 maps 16:9 -> 1792x1024 and n: 1
+    const [oaDalleProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'OpenAI DALL-E 3 Prov',
+        slug: `oa-dalle3-${Date.now()}`,
+        providerType: 'openai_compatible',
+        baseUrl: 'https://api.openai.com',
+        isActive: true,
+      })
+      .returning();
+    const oaDalleEnc = encryptSecret('sk-dalle3-test');
+    await db.insert(providerCredentials).values({
+      providerId: oaDalleProv!.id,
+      label: 'main',
+      encryptedApiKey: oaDalleEnc.ciphertext,
+      iv: oaDalleEnc.iv,
+      authTag: oaDalleEnc.authTag,
+      maskedPreview: 'sk-d***test',
+      status: 'active',
+      isActive: true,
+    });
+    const [dalle3Model] = await db
+      .insert(aiModels)
+      .values({
+        providerId: oaDalleProv!.id,
+        name: 'DALL-E 3',
+        modelIdentifier: 'dall-e-3',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: dalle3Model!.id, capability: 'image_generation' });
+
+    let capturedDalleBody: Record<string, unknown> | null = null;
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedDalleBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({ data: [{ b64_json: Buffer.from('DALLE3PNG').toString('base64') }] }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const dalleRoute = await loadModelExecutionRoute(dalle3Model!.id);
+    const dalleRes = await generateImageWithRoute(dalleRoute, {
+      prompt: 'architecture in isfahan',
+      aspectRatio: '16:9',
+    });
+    expect(dalleRes.result.images[0]?.buffer.toString()).toBe('DALLE3PNG');
+    expect(capturedDalleBody).toMatchObject({
+      model: 'dall-e-3',
+      size: '1792x1024',
+      n: 1,
+    });
+  });
 });
+
