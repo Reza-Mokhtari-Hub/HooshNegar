@@ -335,6 +335,7 @@ export type ModelCategoryGroup = 'text' | 'image' | 'video' | 'audio' | 'multimo
 
 function capabilityMatches(modelCaps: CapabilityType[], target: CapabilityType): boolean {
   if (modelCaps.includes(target)) return true;
+  if (target === 'image_variation') return modelCaps.includes('image_editing');
   if (target === 'chat') return modelCaps.includes('text_generation');
   if (target === 'text_generation') return modelCaps.includes('chat');
   if (target === 'document_analysis') {

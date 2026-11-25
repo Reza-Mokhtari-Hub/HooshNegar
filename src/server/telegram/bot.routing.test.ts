@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import type { Update } from 'grammy/types';
@@ -5,6 +6,7 @@ import { getDb } from '../../db/index.ts';
 import {
   aiModels,
   aiProviders,
+  aiRequests,
   generationJobs,
   modelCapabilities,
   providerCredentials,
@@ -14,6 +16,7 @@ import {
 import { ensurePlatformReady } from '../services/bootstrap.ts';
 import { encryptSecret, maskSecret } from '../security/crypto.ts';
 import { createTelegramBotInstance } from './bot.ts';
+import { executeMediaPollJob, executeVideoPollJob } from './jobRunner.ts';
 import { ensureTelegramUser, updateTelegramUserState } from './userService.ts';
 
 const TEST_BOT_TOKEN = '123456789:AAH_bot_routing_test_token_000111';
@@ -320,4 +323,412 @@ describe('Telegram Bot Photo & Document Image Routing', () => {
     expect(acc?.botState?.videoParams?.sourceImageMimeType).toBe('image/webp');
     expect(sentMessages.some((m) => m.text?.includes('صحنه ویدیو'))).toBe(true);
   });
+
+  it('auto-resubmits Telegram image_variation job using sourceFileId when HF Space poll session expires (404)', async () => {
+    const db = getDb();
+    const ensured = await ensureTelegramUser({
+      telegramUserId: 771004,
+      telegramChatId: 771004,
+      username: 'tg_variation_resubmit',
+      firstName: 'تست ری‌سابمیت',
+      languageCode: 'fa',
+    });
+
+    const slug = `hf-resubmit-test-${randomUUID().slice(0, 8)}`;
+    const encKey = encryptSecret('hf_resubmit_test_token_123');
+    const [hfProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'HF Resubmit Test Provider',
+        slug,
+        providerType: 'huggingface',
+        baseUrl: 'https://test-edit-space.hf.space',
+        isActive: true,
+        priority: 1,
+      })
+      .returning();
+
+    const [cred] = await db
+      .insert(providerCredentials)
+      .values({
+        providerId: hfProv!.id,
+        label: 'hf-primary',
+        encryptedApiKey: encKey.ciphertext,
+        iv: encKey.iv,
+        authTag: encKey.authTag,
+        keyVersion: 1,
+        maskedPreview: maskSecret('hf_resubmit_test_token_123'),
+        isActive: true,
+      })
+      .returning();
+
+    const [hfModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: hfProv!.id,
+        name: 'HF Resubmit Edit Space',
+        modelIdentifier: 'owner/edit-space::generate',
+        category: 'image',
+        creditCost: '5',
+        isDefault: false,
+        isActive: true,
+        modelParameters: {
+          hfKind: 'space_gradio',
+          spaceHost: 'https://test-edit-space.hf.space',
+          endpointPrefix: '/gradio_api',
+          apiName: 'generate',
+        },
+      })
+      .returning();
+
+    await db.insert(modelCapabilities).values([
+      { modelId: hfModel!.id, capability: 'image_generation' },
+      { modelId: hfModel!.id, capability: 'image_editing' },
+      { modelId: hfModel!.id, capability: 'image_variation' },
+    ]);
+
+    const [reqRow] = await db
+      .insert(aiRequests)
+      .values({
+        userId: ensured.user.id,
+        modelId: hfModel!.id,
+        providerId: hfProv!.id,
+        capability: 'image_variation',
+        status: 'running',
+        idempotencyKey: `test-resubmit-${randomUUID()}`,
+        creditsCharged: '0',
+        promptPreview: '',
+      })
+      .returning();
+
+    const [jobRow] = await db
+      .insert(generationJobs)
+      .values({
+        requestId: reqRow!.id,
+        userId: ensured.user.id,
+        telegramChatId: 771004,
+        capability: 'image_variation',
+        status: 'running',
+        progressPercent: 20,
+        providerJobId: 'expired-event-1',
+        startedAt: new Date(),
+        payload: {
+          prompt: '',
+          sourceFileId: 'tg_variation_file_1',
+          sourceMimeType: 'image/png',
+          aspectRatio: '1:1',
+          resolution: '1K',
+          silentDelivery: false,
+        },
+        resultMetadata: {
+          kind: 'hf_space_gradio_media',
+          spaceHost: 'https://test-edit-space.hf.space',
+          endpointPrefix: '/gradio_api',
+          callUrl: 'https://test-edit-space.hf.space/gradio_api/call/generate',
+          providerId: hfProv!.id,
+          credentialId: cred!.id,
+          pollCount: 1,
+          hfResubmitCount: 0,
+        },
+      })
+      .returning();
+
+    let downloadedSourceFromTelegram = false;
+    let resubmittedGradioCall = false;
+    const prevMock = process.env.AI_MOCK_MODE;
+    process.env.AI_MOCK_MODE = 'false';
+
+    globalThis.fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes('api.telegram.org/bot') && url.includes('/getFile')) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: {
+              file_id: 'tg_variation_file_1',
+              file_unique_id: 'uniq_var_1',
+              file_path: 'photos/source_var.png',
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('api.telegram.org/file/')) {
+        downloadedSourceFromTelegram = true;
+        return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+          status: 200,
+          headers: { 'Content-Type': 'image/png' },
+        });
+      }
+
+      if (url.includes('/gradio_api/call/generate/expired-event-1')) {
+        return new Response('Session not found', { status: 404 });
+      }
+
+      if (url.endsWith('/gradio_api/info')) {
+        return new Response(
+          JSON.stringify({
+            named_endpoints: {
+              '/generate': {
+                parameters: [
+                  {
+                    parameter_name: 'image',
+                    component: 'Image',
+                    type: { type: 'object' },
+                  },
+                  {
+                    parameter_name: 'prompt',
+                    component: 'Textbox',
+                    type: { type: 'string' },
+                  },
+                ],
+                returns: [{ component: 'Image', type: { type: 'object' } }],
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      if (url.endsWith('/gradio_api/upload')) {
+        return new Response(JSON.stringify(['/tmp/gradio/uploaded_var.png']), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (url.endsWith('/gradio_api/call/generate')) {
+        resubmittedGradioCall = true;
+        return new Response(JSON.stringify({ event_id: 'resubmitted-event-2' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (url.includes('/gradio_api/call/generate/resubmitted-event-2')) {
+        return new Response('event: heartbeat\ndata: {}\n\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+
+      return new Response('Not Found', { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const outcome = await executeMediaPollJob(jobRow!.id, {
+        maxWaitMs: 500,
+        scheduleNextPoll: false,
+      });
+
+      expect(outcome.ok).toBe(true);
+      expect(outcome.status).toBe('running');
+      expect(downloadedSourceFromTelegram).toBe(true);
+      expect(resubmittedGradioCall).toBe(true);
+
+      const [updatedJob] = await db
+        .select()
+        .from(generationJobs)
+        .where(eq(generationJobs.id, jobRow!.id))
+        .limit(1);
+
+      expect(updatedJob?.status).toBe('running');
+      expect(updatedJob?.providerJobId).toBe('resubmitted-event-2');
+      expect((updatedJob?.resultMetadata as Record<string, unknown>)?.hfResubmitCount).toBe(1);
+    } finally {
+      process.env.AI_MOCK_MODE = prevMock;
+    }
+  });
+
+  it('auto-resubmits HF Space video job in executeVideoPollJob when Gradio session expires with 404', async () => {
+    const db = getDb();
+    const ensured = await ensureTelegramUser({
+      telegramUserId: 882005,
+      telegramChatId: 882005,
+      username: 'tg_video_poll_resubmit',
+      firstName: 'VideoPollUser',
+      languageCode: 'fa',
+    });
+
+    const encKey = encryptSecret('hf_video_poll_test_token');
+    const [hfProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'HF Video Poll Test Provider',
+        slug: `hf-vid-poll-test-${randomUUID().slice(0, 8)}`,
+        providerType: 'huggingface',
+        baseUrl: 'https://test-wan-poll-space.hf.space',
+        isActive: true,
+        priority: 1,
+      })
+      .returning();
+
+    const [cred] = await db
+      .insert(providerCredentials)
+      .values({
+        providerId: hfProv!.id,
+        label: 'primary',
+        encryptedApiKey: encKey.ciphertext,
+        iv: encKey.iv,
+        authTag: encKey.authTag,
+        keyVersion: 1,
+        maskedPreview: maskSecret('hf_video_poll_test_token'),
+        isActive: true,
+      })
+      .returning();
+
+    const [vidModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: hfProv!.id,
+        name: 'Wan 2.2 Test Model',
+        modelIdentifier: 'owner/wan22-poll::generate_video',
+        category: 'video',
+        description: 'Test HF video space',
+        creditCost: '10',
+        isDefault: false,
+        isActive: true,
+        modelParameters: {
+          hfKind: 'space_gradio',
+          spaceHost: 'https://test-wan-poll-space.hf.space',
+          apiName: 'generate_video',
+          endpointPrefix: '/gradio_api',
+          parameters: [
+            { index: 0, name: 'input_image', label: 'Input Image', component: 'image', hasDefault: false },
+            { index: 1, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false },
+          ],
+        },
+      })
+      .returning();
+
+    await db.insert(modelCapabilities).values({
+      modelId: vidModel!.id,
+      capability: 'video_generation',
+    });
+
+    const [reqRow] = await db
+      .insert(aiRequests)
+      .values({
+        userId: ensured.user.id,
+        modelId: vidModel!.id,
+        providerId: hfProv!.id,
+        capability: 'video_generation',
+        status: 'running',
+        idempotencyKey: `test-vid-resubmit-${randomUUID()}`,
+        creditsCharged: '0',
+        promptPreview: 'camera pan around lantern',
+      })
+      .returning();
+
+    const [jobRow] = await db
+      .insert(generationJobs)
+      .values({
+        requestId: reqRow!.id,
+        userId: ensured.user.id,
+        telegramChatId: 882005,
+        capability: 'video_generation',
+        status: 'running',
+        progressPercent: 25,
+        providerJobId: 'expired-vid-event-1',
+        startedAt: new Date(),
+        payload: {
+          prompt: 'camera pan around lantern',
+          sourceFileId: 'tg_vid_src_1',
+          sourceMimeType: 'image/jpeg',
+          aspectRatio: '16:9',
+          durationSeconds: 5,
+          silentDelivery: false,
+        },
+        resultMetadata: {
+          kind: 'hf_space_gradio',
+          spaceHost: 'https://test-wan-poll-space.hf.space',
+          endpointPrefix: '/gradio_api',
+          callUrl: 'https://test-wan-poll-space.hf.space/gradio_api/call/generate_video',
+          providerId: hfProv!.id,
+          credentialId: cred!.id,
+          pollCount: 1,
+          hfResubmitCount: 0,
+        },
+      })
+      .returning();
+
+    let downloadedTgSource = false;
+    let resubmittedVidCall = false;
+    const prevMock = process.env.AI_MOCK_MODE;
+    process.env.AI_MOCK_MODE = 'false';
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes('api.telegram.org/bot') && url.includes('/getFile')) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: { file_id: 'tg_vid_src_1', file_unique_id: 'u_vid_1', file_path: 'photos/vid_src.jpg' },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('api.telegram.org/file/')) {
+        downloadedTgSource = true;
+        return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), {
+          status: 200,
+          headers: { 'Content-Type': 'image/jpeg' },
+        });
+      }
+      if (url.includes('/gradio_api/call/generate_video/expired-vid-event-1')) {
+        return new Response('event: error\ndata: "404: Not Found"\n\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      if (url.endsWith('/gradio_api/upload')) {
+        return new Response(JSON.stringify(['/tmp/gradio/vid_src.jpg']), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/gradio_api/call/generate_video')) {
+        resubmittedVidCall = true;
+        return new Response(JSON.stringify({ event_id: 'resubmitted-vid-event-2' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/gradio_api/call/generate_video/resubmitted-vid-event-2')) {
+        return new Response('event: heartbeat\ndata: {}\n\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      return new Response('Not Found', { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const outcome = await executeVideoPollJob(jobRow!.id, {
+        maxWaitMs: 500,
+        scheduleNextPoll: false,
+      });
+
+      expect(outcome.ok).toBe(true);
+      expect(outcome.status).toBe('running');
+      expect(downloadedTgSource).toBe(true);
+      expect(resubmittedVidCall).toBe(true);
+
+      const [updatedJob] = await db
+        .select()
+        .from(generationJobs)
+        .where(eq(generationJobs.id, jobRow!.id))
+        .limit(1);
+
+      expect(updatedJob?.status).toBe('running');
+      expect(updatedJob?.providerJobId).toBe('resubmitted-vid-event-2');
+      expect((updatedJob?.resultMetadata as Record<string, unknown>)?.hfResubmitCount).toBe(1);
+    } finally {
+      process.env.AI_MOCK_MODE = prevMock;
+    }
+  });
 });
+

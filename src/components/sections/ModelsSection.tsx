@@ -71,7 +71,7 @@ interface DiscoveredModelItem {
 const DEFAULT_CAPS_BY_CATEGORY: Record<ModelCategory, CapabilityType[]> = {
   llm: ['text_generation', 'chat'],
   multimodal: ['text_generation', 'chat', 'vision', 'document_analysis'],
-  image: ['image_generation', 'image_editing'],
+  image: ['image_generation', 'image_editing', 'image_variation'],
   audio: ['speech_generation', 'audio_transcription'],
   video: ['video_generation'],
   embedding: ['embeddings'],

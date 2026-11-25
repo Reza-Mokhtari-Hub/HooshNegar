@@ -893,4 +893,578 @@ describe('Universal Hugging Face Space Engine', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('rotates HF keys on Gradio /upload 401 and ZeroGPU proxy token errors without masking via data URI, and re-uploads if forceRefresh changes host', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      const seenAuthTokens: string[] = [];
+      let uploadCount = 0;
+      let forceRefreshAttempted = false;
+
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        const headers = new Headers(init?.headers);
+        const auth = headers.get('Authorization') ?? '';
+
+        if (url.includes('/gradio_api/upload')) {
+          uploadCount++;
+          seenAuthTokens.push(auth);
+          if (auth.includes('bad_hf_key')) {
+            return new Response(JSON.stringify({ error: 'Invalid credentials' }), { status: 401 });
+          }
+          return new Response(JSON.stringify(['/tmp/uploaded_on_host.jpg']), { status: 200 });
+        }
+        if (url.endsWith('/gradio_api/info')) {
+          return new Response(
+            JSON.stringify({
+              named_endpoints: {
+                '/generate': {
+                  parameters: [
+                    { parameter_name: 'image', label: 'Image', component: 'Image' },
+                    { parameter_name: 'prompt', label: 'Prompt', component: 'Textbox' },
+                  ],
+                  returns: [{ label: 'Out', component: 'Image' }],
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes('/gradio_api/call/generate') && init?.method === 'POST') {
+          if (url.startsWith('https://old-host-space.hf.space') && !forceRefreshAttempted) {
+            forceRefreshAttempted = true;
+            return new Response(JSON.stringify({ error: 'Schema mismatch' }), { status: 422 });
+          }
+          const body = JSON.parse(String(init?.body ?? '{}')) as { data?: Array<{ path?: string }> };
+          expect(body.data?.[0]?.path).toBe('/tmp/uploaded_on_host.jpg');
+          return new Response(JSON.stringify({ event_id: 'evt_ok_edit_2' }), { status: 200 });
+        }
+        if (url.endsWith('/gradio_api/call/generate/evt_ok_edit_2')) {
+          if (auth.includes('zerogpu_expired_key')) {
+            return new Response(
+              'event: error\ndata: {"error":"Expired ZeroGPU proxy token","title":"ZeroGPU client error"}\n\n',
+              { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+            );
+          }
+          return new Response(
+            'event: complete\ndata: [{"url":"https://new-host-space.hf.space/gradio_api/file=/tmp/final_edit.png","path":"/tmp/final_edit.png"}]\n\n',
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          );
+        }
+        if (url.includes('/file=/tmp/final_edit.png')) {
+          return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+            status: 200,
+            headers: { 'Content-Type': 'image/png' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      }) as typeof fetch;
+
+      const badCtx = makeSpaceCtx({
+        baseUrl: 'https://new-host-space.hf.space',
+        apiKey: 'hf_bad_hf_key',
+        credentialId: 'cred-1',
+        credentialLabel: 'key1',
+        modelParameters: {
+          spaceHost: 'https://new-host-space.hf.space',
+          apiName: 'generate',
+          endpointPrefix: '/gradio_api',
+          parameters: [
+            { index: 0, name: 'image', label: 'Image', component: 'image', hasDefault: false },
+            { index: 1, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false },
+          ],
+        },
+      });
+      const zeroGpuCtx = makeSpaceCtx({
+        baseUrl: 'https://new-host-space.hf.space',
+        apiKey: 'hf_zerogpu_expired_key',
+        credentialId: 'cred-2',
+        credentialLabel: 'key2',
+        modelParameters: badCtx.modelParameters,
+      });
+      const goodCtx = makeSpaceCtx({
+        baseUrl: 'https://new-host-space.hf.space',
+        apiKey: 'hf_good_key',
+        credentialId: 'cred-3',
+        credentialLabel: 'key3',
+        modelParameters: badCtx.modelParameters,
+      });
+      badCtx.credentialPool = [badCtx, zeroGpuCtx, goodCtx];
+
+      const out = await editImageWithRoute(
+        { primary: badCtx, fallback: null },
+        {
+          prompt: 'Turn into oil painting',
+          sourceImageBuffer: Buffer.from([1, 2, 3, 4]),
+          sourceMimeType: 'image/jpeg',
+          mode: 'edit',
+        },
+      );
+
+      expect(seenAuthTokens.some((t) => t.includes('bad_hf_key'))).toBe(true);
+      expect(seenAuthTokens.some((t) => t.includes('good_key'))).toBe(true);
+      expect(uploadCount).toBe(3);
+      expect(out.result.images[0]?.buffer.byteLength).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fixes OpenAI variation/mime filename, Gemini aspectRatio edit retry, HF Router JSON decode, and Cloudflare img2img editing', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let openAiEndpoint = '';
+      let openAiUploadFilename = '';
+      let geminiBodyCount = 0;
+
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes('api.openai.com/v1/images/')) {
+          openAiEndpoint = url;
+          const form = init?.body as FormData;
+          const imgFile = form?.get?.('image') as File | null;
+          openAiUploadFilename = imgFile?.name ?? '';
+          return new Response(
+            JSON.stringify({
+              data: [{ b64_json: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64') }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        if (url.includes('generativelanguage.googleapis.com')) {
+          geminiBodyCount++;
+          if (geminiBodyCount === 1) {
+            return new Response(
+              JSON.stringify({ error: { message: 'Unknown name "imageConfig" in generation_config' } }),
+              { status: 400, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: 'image/png',
+                          data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        if (url.includes('router.huggingface.co/hf-inference/models/')) {
+          return new Response(
+            JSON.stringify({
+              image: Buffer.from([0xff, 0xd8, 0xff, 0xe0]).toString('base64'),
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return new Response('not found', { status: 404 });
+      }) as typeof fetch;
+
+      // 1. gpt-image-1 variation routes to /images/edits with source.jpg
+      const oaRes = await editImageWithRoute(
+        {
+          primary: {
+            providerId: 'oa-1',
+            providerName: 'OpenAI',
+            providerType: 'openai_compatible',
+            baseUrl: 'https://api.openai.com/v1',
+            apiKey: 'sk-test',
+            modelId: 'm-oa',
+            modelName: 'GPT Image 1',
+            modelIdentifier: 'gpt-image-1',
+            supportedCapabilities: ['image_generation', 'image_editing'],
+          },
+          fallback: null,
+        },
+        {
+          prompt: '',
+          sourceImageBuffer: Buffer.from([0xff, 0xd8, 0xff]),
+          sourceMimeType: 'image/jpeg',
+          mode: 'variation',
+        },
+      );
+      expect(openAiEndpoint.endsWith('/images/edits')).toBe(true);
+      expect(openAiUploadFilename).toBe('source.jpg');
+      expect(oaRes.result.images[0]?.mimeType).toBe('image/png');
+
+      // 2. Gemini image edit retries cleanly when imageConfig rejected
+      const gemRes = await editImageWithRoute(
+        {
+          primary: {
+            providerId: 'gem-1',
+            providerName: 'Gemini',
+            providerType: 'google_gemini',
+            baseUrl: 'https://generativelanguage.googleapis.com',
+            apiKey: 'AIzaTest',
+            modelId: 'm-gem',
+            modelName: 'Gemini Flash Image',
+            modelIdentifier: 'gemini-2.5-flash-image',
+            supportedCapabilities: ['image_editing'],
+          },
+          fallback: null,
+        },
+        {
+          prompt: 'Make sky golden',
+          sourceImageBuffer: Buffer.from([0xff, 0xd8, 0xff]),
+          sourceMimeType: 'image/jpeg',
+          mode: 'edit',
+          aspectRatio: '16:9',
+        },
+      );
+      expect(geminiBodyCount).toBe(2);
+      expect(gemRes.result.images.length).toBe(1);
+
+      // 3. HF Inference Router JSON { image } decodes JPEG cleanly instead of corrupt JSON bytes
+      const hfRes = await editImageWithRoute(
+        {
+          primary: {
+            providerId: 'hf-1',
+            providerName: 'HF',
+            providerType: 'huggingface',
+            baseUrl: 'https://router.huggingface.co',
+            apiKey: 'hf_test',
+            modelId: 'm-hf',
+            modelName: 'Qwen Image Edit',
+            modelIdentifier: 'Qwen/Qwen-Image-Edit',
+            supportedCapabilities: ['image_editing'],
+          },
+          fallback: null,
+        },
+        {
+          prompt: 'Add snow',
+          sourceImageBuffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+          sourceMimeType: 'image/png',
+          mode: 'edit',
+        },
+      );
+      expect(hfRes.result.images[0]?.mimeType).toBe('image/jpeg');
+      expect(hfRes.result.images[0]?.extension).toBe('jpg');
+
+      // 4. Cloudflare Workers AI img2img executes via native binding
+      const cfEditRes = await runWithCloudflareRequestContext(
+        {
+          aiBinding: {
+            run: async (_model, inputs) => {
+              const inp = inputs as { prompt?: string; image?: number[] };
+              expect(inp.prompt).toContain('watercolor');
+              expect(Array.isArray(inp.image)).toBe(true);
+              return new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+            },
+          },
+        },
+        () =>
+          editImageWithRoute(
+            {
+              primary: {
+                providerId: 'cf-1',
+                providerName: 'CF',
+                providerType: 'cloudflare_workers_ai',
+                baseUrl: 'https://api.cloudflare.com/client/v4',
+                apiKey: '',
+                modelId: 'm-cf-img2img',
+                modelName: 'SD v1.5 Img2Img',
+                modelIdentifier: '@cf/runwayml/stable-diffusion-v1-5-img2img',
+                supportedCapabilities: ['image_editing', 'image_variation'],
+              },
+              fallback: null,
+            },
+            {
+              prompt: 'watercolor style',
+              sourceImageBuffer: Buffer.from([1, 2, 3, 4]),
+              sourceMimeType: 'image/png',
+              mode: 'edit',
+            },
+          ),
+      );
+      expect(cfEditRes.result.images[0]?.mimeType).toBe('image/png');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('filters Wan 2.2 UI helper endpoints in discovery and builds valid Api-component video payloads', async () => {
+    const mockFetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/gradio_api/info')) {
+        return new Response(
+          JSON.stringify({
+            named_endpoints: {
+              '/extract_frame': {
+                parameters: [{ parameter_name: 'video', component: 'Video', type: { type: 'object' } }],
+                returns: [{ component: 'Image', type: { type: 'object' } }],
+              },
+              '/save_profile': {
+                parameters: [{ parameter_name: 'name', component: 'Textbox', type: { type: 'string' } }],
+                returns: [{ component: 'Textbox', type: { type: 'string' } }],
+              },
+              '/add_to_queue': {
+                parameters: [{ parameter_name: 'prompt', component: 'Textbox', type: { type: 'string' } }],
+                returns: [{ component: 'Textbox', type: { type: 'string' } }],
+              },
+              '/infer': {
+                parameters: [
+                  {
+                    parameter_name: 'image_b64',
+                    label: 'image_b64',
+                    component: 'Api',
+                    type: { type: 'string' },
+                    parameter_has_default: false,
+                  },
+                  {
+                    parameter_name: 'prompt',
+                    label: 'prompt',
+                    component: 'Api',
+                    type: { type: 'string' },
+                    parameter_has_default: false,
+                  },
+                  {
+                    parameter_name: 'steps',
+                    label: 'steps',
+                    component: 'Api',
+                    type: { type: 'integer' },
+                    parameter_has_default: false,
+                  },
+                  {
+                    parameter_name: 'guidance_scale',
+                    label: 'guidance_scale',
+                    component: 'Api',
+                    type: { type: 'number' },
+                    parameter_has_default: false,
+                  },
+                  {
+                    parameter_name: 'duration_seconds',
+                    label: 'duration_seconds',
+                    component: 'Api',
+                    type: { type: 'number' },
+                    parameter_has_default: false,
+                  },
+                  {
+                    parameter_name: 'randomize_seed',
+                    label: 'randomize_seed',
+                    component: 'Api',
+                    type: { type: 'boolean' },
+                    parameter_has_default: false,
+                  },
+                ],
+                returns: [{ label: 'video', component: 'Api', type: { type: 'object' } }],
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+
+    const discovered = await discoverProviderModels(
+      {
+        providerType: 'huggingface_space',
+        baseUrl: 'https://wan-api-demo.hf.space',
+        apiKey: 'hf_test',
+      },
+      mockFetch,
+    );
+
+    expect(discovered.ok).toBe(true);
+    expect(discovered.models).toHaveLength(1);
+    expect(discovered.models[0]?.modelParameters?.apiName).toBe('infer');
+    expect(discovered.models[0]?.capabilities).toEqual(['video_generation']);
+
+    const ctx = makeSpaceCtx({
+      baseUrl: 'https://wan-api-demo.hf.space',
+      modelParameters: discovered.models[0]?.modelParameters as Record<string, unknown>,
+    });
+
+    const args = buildGradioInputPayload(ctx, 'A neon wave crashing', undefined, undefined, undefined, {
+      mode: 'i2v',
+      mediaKind: 'image',
+      durationSeconds: 4,
+      rawMediaBase64: 'QUJDRA==',
+    });
+
+    expect(args).toEqual(['QUJDRA==', 'A neon wave crashing', 6, 1, 4, true]);
+
+    // Compact 480p dimensions for video width/height sliders
+    const sliderCtx = makeSpaceCtx({
+      modelParameters: {
+        spaceHost: 'https://wan-api-demo.hf.space',
+        apiName: 'generate_video',
+        parameters: [
+          { index: 0, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false },
+          { index: 1, name: 'width', label: 'Width', component: 'slider', min: 256, max: 1280, hasDefault: true, defaultValue: 832 },
+          { index: 2, name: 'height', label: 'Height', component: 'slider', min: 256, max: 1280, hasDefault: true, defaultValue: 480 },
+        ],
+      },
+    });
+    const vidDims = buildGradioInputPayload(sliderCtx, 'ocean storm', undefined, undefined, undefined, {
+      mode: 't2v',
+      aspectRatio: '16:9',
+    });
+    expect(vidDims).toEqual(['ocean storm', 832, 480]);
+  });
+
+  it('recovers from multi-replica Gradio SSE 404 and SSE null schema drift, and rejects I2V-only video Spaces without source image', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let postCallCount = 0;
+      let sseAttempt = 0;
+
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+        if (url.endsWith('/gradio_api/info')) {
+          return new Response(
+            JSON.stringify({
+              named_endpoints: {
+                '/generate_video': {
+                  parameters: [
+                    { parameter_name: 'prompt', label: 'Prompt', component: 'Textbox', parameter_has_default: false },
+                    { parameter_name: 'duration', label: 'Duration', component: 'Slider', parameter_has_default: true, parameter_default: 5 },
+                  ],
+                  returns: [{ label: 'Video', component: 'Video' }],
+                },
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+
+        if (url.endsWith('/gradio_api/call/generate_video') && init?.method === 'POST') {
+          postCallCount += 1;
+          const body = JSON.parse(String(init.body ?? '{}')) as { data?: unknown[] };
+          const eventId = `vid_evt_${postCallCount}`;
+          // First attempt uses stale 1-param schema -> server emits `event: error\ndata: null`
+          if ((body.data?.length ?? 0) === 1) {
+            return new Response(JSON.stringify({ event_id: 'stale_null_evt' }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          return new Response(JSON.stringify({ event_id: eventId }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'replica_stick=pod2; Path=/' },
+          });
+        }
+
+        if (url.includes('/gradio_api/call/generate_video/stale_null_evt')) {
+          return new Response('event: error\ndata: null\n\n', {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          });
+        }
+
+        if (url.includes('/gradio_api/call/generate_video/vid_evt_')) {
+          sseAttempt += 1;
+          if (sseAttempt === 1) {
+            // Simulate multi-replica miss returning SSE "404: Not Found"
+            return new Response('event: error\ndata: "404: Not Found"\n\n', {
+              status: 200,
+              headers: { 'Content-Type': 'text/event-stream' },
+            });
+          }
+          const cookieHdr = new Headers(init?.headers).get('Cookie') ?? '';
+          expect(cookieHdr).toContain('replica_stick=pod2');
+          return new Response(
+            'event: complete\ndata: [{"video":{"url":"https://wan-multi-replica.hf.space/gradio_api/file=/tmp/out.mp4","path":"/tmp/out.mp4"}}]\n\n',
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          );
+        }
+
+        if (url.includes('/file=/tmp/out.mp4')) {
+          return new Response(new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]), {
+            status: 200,
+            headers: { 'Content-Type': 'video/mp4' },
+          });
+        }
+
+        return new Response('Not Found', { status: 404 });
+      }) as typeof fetch;
+
+      const staleSchemaCtx = makeSpaceCtx({
+        baseUrl: 'https://wan-multi-replica.hf.space',
+        modelIdentifier: 'owner/wan-multi::generate_video',
+        modelParameters: {
+          spaceHost: 'https://wan-multi-replica.hf.space',
+          apiName: 'generate_video',
+          endpointPrefix: '/gradio_api',
+          // Stale cached 1-param schema triggers `data: null` -> forceRefresh -> 2-param schema -> SSE 404 -> retry -> success
+          parameters: [{ index: 0, name: 'prompt', label: 'Prompt', component: 'textbox', hasDefault: false }],
+        },
+      });
+
+      const vidOut = await startVideoGenerationWithRoute(
+        { primary: staleSchemaCtx, fallback: null },
+        { prompt: 'drone shot over snowy mountains', durationSeconds: 5, aspectRatio: '16:9' },
+      );
+
+      expect(vidOut.result.status).toBe('succeeded');
+      expect(vidOut.result.videoBuffer?.byteLength).toBeGreaterThan(0);
+      expect(postCallCount).toBe(3);
+
+      // Now verify I2V-only Space called without source image fails cleanly with INVALID_PROMPT (no wasted POST /call)
+      let i2vPosted = false;
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith('/gradio_api/info')) {
+          return new Response(
+            JSON.stringify({
+              named_endpoints: {
+                '/generate_video': {
+                  parameters: [
+                    { parameter_name: 'input_image', label: 'Input Image', component: 'Image', parameter_has_default: false, parameter_default: null },
+                    { parameter_name: 'prompt', label: 'Prompt', component: 'Textbox', parameter_has_default: false },
+                  ],
+                  returns: [{ label: 'Video', component: 'Video' }],
+                },
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        if (url.includes('/gradio_api/call/') && init?.method === 'POST') {
+          i2vPosted = true;
+        }
+        return new Response('Not Found', { status: 404 });
+      }) as typeof fetch;
+
+      const i2vOnlyCtx = makeSpaceCtx({
+        baseUrl: 'https://wan-i2v-only.hf.space',
+        modelIdentifier: 'owner/wan-i2v::generate_video',
+        modelParameters: {
+          spaceHost: 'https://wan-i2v-only.hf.space',
+          apiName: 'generate_video',
+          endpointPrefix: '/gradio_api',
+        },
+      });
+
+      let i2vErr: unknown = null;
+      try {
+        await startVideoGenerationWithRoute(
+          { primary: i2vOnlyCtx, fallback: null },
+          { prompt: 'animate portrait without image' },
+        );
+      } catch (err) {
+        i2vErr = err;
+      }
+
+      expect(i2vPosted).toBe(false);
+      expect(i2vErr).toBeInstanceOf(AIProviderError);
+      expect((i2vErr as AIProviderError).code).toBe('INVALID_PROMPT');
+      expect((i2vErr as AIProviderError).credentialFailureKind).toBe('prompt_error');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
+
+

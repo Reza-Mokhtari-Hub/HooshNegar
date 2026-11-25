@@ -14,6 +14,12 @@ import {
 } from 'lucide-react';
 import { miniAppRequest, type MiniAppModel } from './miniAppApi';
 import { triggerMiniAppHaptic } from './telegramSdk';
+import {
+  MAX_UPLOAD_IMAGE_BYTES,
+  formatImageSizeLabel,
+  isAllowedImageFile,
+  prepareImageForUpload,
+} from './imagePrep';
 
 type StudioTabMode =
   | 'image_generation'
@@ -35,6 +41,8 @@ interface UploadedImageState {
   mimeType: string;
   base64: string;
   previewUrl: string;
+  sizeBytes: number;
+  wasCompressed: boolean;
 }
 
 interface MiniAppStudioTabProps {
@@ -87,6 +95,7 @@ export function MiniAppStudioTab({
   const [voice, setVoice] = useState('Kore');
   const [durationSeconds, setDurationSeconds] = useState(5);
   const [sourceImage, setSourceImage] = useState<UploadedImageState | null>(null);
+  const [preparingImage, setPreparingImage] = useState(false);
   const [audioFile, setAudioFile] = useState<{
     name: string;
     mimeType: string;
@@ -113,7 +122,11 @@ export function MiniAppStudioTab({
         : 'image_editing'
       : mode;
 
-  const modeModels = models.filter((m) => m.capabilities.includes(effectiveCapability));
+  const modeModels = models.filter(
+    (m) =>
+      m.capabilities.includes(effectiveCapability) ||
+      (effectiveCapability === 'image_variation' && m.capabilities.includes('image_editing')),
+  );
   const preferredId = selectedModelByMode[effectiveCapability];
   const currentModelId =
     (preferredId && modeModels.some((m) => m.id === preferredId)
@@ -189,32 +202,26 @@ export function MiniAppStudioTab({
     };
   }, [pollingJobId, onWalletUpdated]);
 
-  const handleImageUpload = (file: File | undefined) => {
+  const handleImageUpload = async (file: File | undefined) => {
     if (!file) return;
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
-    const isAllowed =
-      allowedTypes.includes(file.type) || /\.(jpe?g|png|webp)$/i.test(file.name);
-    if (!isAllowed) {
+    if (!isAllowedImageFile(file)) {
       setError('فرمت تصویر باید JPG، PNG یا WebP باشد.');
       return;
     }
-    if (file.size > 8 * 1024 * 1024) {
+    if (file.size > MAX_UPLOAD_IMAGE_BYTES) {
       setError('حجم تصویر نباید بیشتر از ۸ مگابایت باشد.');
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
-      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] ?? '' : dataUrl;
-      setSourceImage({
-        name: file.name,
-        mimeType: file.type || 'image/jpeg',
-        base64,
-        previewUrl: dataUrl,
-      });
-      setError('');
-    };
-    reader.readAsDataURL(file);
+    setPreparingImage(true);
+    setError('');
+    try {
+      const prepared = await prepareImageForUpload(file);
+      setSourceImage(prepared);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'خطا در آماده‌سازی تصویر.');
+    } finally {
+      setPreparingImage(false);
+    }
   };
 
   const handleAudioUpload = (file: File | undefined) => {
@@ -461,6 +468,11 @@ export function MiniAppStudioTab({
                 ))
               )}
             </select>
+            {mode === 'image_editing' && modeModels.length === 0 && (
+              <p className="mt-1.5 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 rounded-xl p-2.5">
+                هیچ مدل فعالی با قابلیت «ویرایش تصویر» در دسترس نیست. برای فعال‌سازی، در پنل مدیریت یک مدل ویرایش تصویر (مانند Gemini Image، GPT Image یا Hugging Face Space) را همگام‌سازی و فعال کنید.
+              </p>
+            )}
           </div>
 
           {(mode === 'image_editing' || mode === 'video_generation') && (
@@ -485,7 +497,11 @@ export function MiniAppStudioTab({
                     <div className="text-xs font-medium text-slate-800 dark:text-slate-200 truncate">
                       {sourceImage.name}
                     </div>
-                    <div className="text-[11px] text-slate-500 mt-0.5">آماده ارسال به مدل</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      {sourceImage.wasCompressed
+                        ? `بهینه‌سازی‌شده (${formatImageSizeLabel(sourceImage.sizeBytes)}) · آماده ارسال`
+                        : `${formatImageSizeLabel(sourceImage.sizeBytes)} · آماده ارسال`}
+                    </div>
                   </div>
                   <button
                     type="button"
@@ -502,15 +518,24 @@ export function MiniAppStudioTab({
                   htmlFor="studio-source-image"
                   className="min-h-[84px] px-4 py-3 rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 hover:border-blue-500 flex flex-col items-center justify-center gap-1.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer"
                 >
-                  <Upload className="w-5 h-5 text-blue-700 dark:text-blue-400" />
-                  <span>انتخاب تصویر (JPG, PNG, WebP تا ۸ مگابایت)</span>
+                  {preparingImage ? (
+                    <>
+                      <Loader2 className="w-5 h-5 animate-spin text-blue-700 dark:text-blue-400" />
+                      <span>در حال بهینه‌سازی و آماده‌سازی تصویر...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-5 h-5 text-blue-700 dark:text-blue-400" />
+                      <span>انتخاب تصویر (JPG, PNG, WebP تا ۸ مگابایت)</span>
+                    </>
+                  )}
                   <input
                     id="studio-source-image"
                     type="file"
                     accept="image/jpeg,image/png,image/webp"
                     className="sr-only"
                     onChange={(e) => {
-                      handleImageUpload(e.target.files?.[0]);
+                      void handleImageUpload(e.target.files?.[0]);
                       e.target.value = '';
                     }}
                   />

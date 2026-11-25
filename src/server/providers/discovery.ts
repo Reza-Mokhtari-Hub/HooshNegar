@@ -60,6 +60,20 @@ export const CLOUDFLARE_WORKERS_AI_CURATED_MODELS: DiscoveredModelSpec[] = [
     outputPricePerMillion: 0,
     modelParameters: {},
   },
+  // Image Editing / Image-to-Image
+  {
+    name: 'Stable Diffusion v1.5 Img2Img',
+    modelIdentifier: '@cf/runwayml/stable-diffusion-v1-5-img2img',
+    category: 'image',
+    capabilities: ['image_editing', 'image_variation'],
+    description: 'ویرایش تصویر و تولید نسخه مشابه بر اساس تصویر مرجع و دستور متنی.',
+    maxInputSize: 4096,
+    maxOutputSize: 4096,
+    creditCost: 2,
+    inputPricePerMillion: 0,
+    outputPricePerMillion: 0,
+    modelParameters: {},
+  },
   // Text & Chat LLMs
   {
     name: 'Llama 3.3 70B Fast',
@@ -635,7 +649,7 @@ function classifyModelMetadata(params: {
     };
   }
 
-  // Image Generation (Imagen / Gemini Image / DALL-E / Flux / SD)
+  // Image Generation & Editing (Imagen / Gemini Image / DALL-E / GPT Image / Flux / SD)
   if (
     tag === 'text-to-image' ||
     tag === 'image-to-image' ||
@@ -650,9 +664,22 @@ function classifyModelMetadata(params: {
     lower.includes('sdxl') ||
     lower.includes('qwen-image')
   ) {
-    const caps: CapabilityType[] = lower.includes('imagen')
-      ? ['image_generation']
-      : ['image_generation', 'image_editing', 'image_variation'];
+    const isEditCapableId =
+      /edit|inpaint|img2img|kontext|instruct|variation|qwen-image/i.test(lower);
+    let caps: CapabilityType[];
+    if (lower.includes('imagen') || lower.includes('dall-e-3')) {
+      caps = ['image_generation'];
+    } else if (tag === 'image-to-image') {
+      caps = isEditCapableId
+        ? ['image_generation', 'image_editing', 'image_variation']
+        : ['image_editing', 'image_variation'];
+    } else if (tag === 'text-to-image') {
+      caps = isEditCapableId
+        ? ['image_generation', 'image_editing', 'image_variation']
+        : ['image_generation'];
+    } else {
+      caps = ['image_generation', 'image_editing', 'image_variation'];
+    }
     return {
       name,
       modelIdentifier: cleanId,
@@ -932,31 +959,40 @@ export async function discoverProviderModels(
         )
         .filter((x): x is DiscoveredModelSpec => Boolean(x));
 
-      // Also discover warm text-to-image inference models so Hugging Face Router supports image generation out-of-the-box
-      try {
-        const imgListUrl =
-          'https://huggingface.co/api/models?pipeline_tag=text-to-image&inference=warm&sort=likes&direction=-1&limit=10';
-        const imgRes = await fetchJsonSafe(imgListUrl, headers, apiKey, fetchImpl, 10000);
-        if (imgRes.ok && Array.isArray(imgRes.data)) {
-          const seen = new Set(discovered.map((d) => d.modelIdentifier.toLowerCase()));
-          for (const rawItem of imgRes.data) {
-            if (!rawItem || typeof rawItem !== 'object') continue;
-            const item = rawItem as { id?: string; pipeline_tag?: string; tags?: string[] };
-            if (!item.id || seen.has(item.id.toLowerCase())) continue;
-            const imgSpec = classifyModelMetadata({
-              id: item.id,
-              displayName: item.id.split('/').pop() || item.id,
-              pipelineTag: item.pipeline_tag || 'text-to-image',
-              description: Array.isArray(item.tags) ? item.tags.slice(0, 4).join(', ') : '',
-            });
-            if (imgSpec) {
-              seen.add(imgSpec.modelIdentifier.toLowerCase());
-              discovered.push(imgSpec);
+      // Also discover warm text-to-image & image-to-image inference models so Hugging Face Router supports image generation & editing
+      const seenImgIds = new Set(discovered.map((d) => d.modelIdentifier.toLowerCase()));
+      for (const hubQuery of [
+        {
+          url: 'https://huggingface.co/api/models?pipeline_tag=text-to-image&inference=warm&sort=likes&direction=-1&limit=10',
+          fallbackTag: 'text-to-image',
+        },
+        {
+          url: 'https://huggingface.co/api/models?pipeline_tag=image-to-image&inference=warm&sort=likes&direction=-1&limit=5',
+          fallbackTag: 'image-to-image',
+        },
+      ]) {
+        try {
+          const imgRes = await fetchJsonSafe(hubQuery.url, headers, apiKey, fetchImpl, 10000);
+          if (imgRes.ok && Array.isArray(imgRes.data)) {
+            for (const rawItem of imgRes.data) {
+              if (!rawItem || typeof rawItem !== 'object') continue;
+              const item = rawItem as { id?: string; pipeline_tag?: string; tags?: string[] };
+              if (!item.id || seenImgIds.has(item.id.toLowerCase())) continue;
+              const imgSpec = classifyModelMetadata({
+                id: item.id,
+                displayName: item.id.split('/').pop() || item.id,
+                pipelineTag: item.pipeline_tag || hubQuery.fallbackTag,
+                description: Array.isArray(item.tags) ? item.tags.slice(0, 4).join(', ') : '',
+              });
+              if (imgSpec) {
+                seenImgIds.add(imgSpec.modelIdentifier.toLowerCase());
+                discovered.push(imgSpec);
+              }
             }
           }
+        } catch {
+          // Non-fatal: continue with /v1/models discovery results
         }
-      } catch {
-        // Non-fatal: continue with /v1/models discovery results
       }
 
       return {
@@ -1082,16 +1118,33 @@ export async function discoverProviderModels(
             r.includes('imageeditor'),
         );
         const hasAudioOutput = returnSummary.some((r) => r.includes('audio'));
-        const hasImageInput = inputSummary.some(
-          (i) =>
-            i.includes('image') ||
-            i.includes('paint') ||
-            i.includes('sketch') ||
-            i.includes('inpaint') ||
-            i.includes('gallery') ||
-            i.includes('multimodal') ||
-            i.includes('file'),
-        );
+        const hasImageInput = paramsList.some((p) => {
+          const comp = (p.component || '').toLowerCase();
+          const schemaType = (p.type?.type || '').toLowerCase();
+          const pyType = (p.python_type?.type || '').toLowerCase();
+          const nameLabel = `${p.label || ''} ${p.parameter_name || ''}`.toLowerCase();
+          if (
+            comp.includes('image') ||
+            comp.includes('paint') ||
+            comp.includes('sketch') ||
+            comp.includes('inpaint') ||
+            comp.includes('gallery') ||
+            comp.includes('multimodal') ||
+            comp.includes('file') ||
+            pyType.includes('image') ||
+            pyType.includes('filedata')
+          ) {
+            return true;
+          }
+          if (
+            (comp === 'api' || comp === '' || schemaType === 'string') &&
+            /\b(image|img|image_b64|img_b64|photo|frame)\b/i.test(nameLabel) &&
+            !/negative|prompt/i.test(nameLabel)
+          ) {
+            return true;
+          }
+          return false;
+        });
         const hasAudioInput = inputSummary.some((i) => i.includes('audio'));
         const hasTextInput = inputSummary.some(
           (i) => i.includes('textbox') || i.includes('text') || i.includes('prompt') || i.includes('multimodal'),
@@ -1147,7 +1200,7 @@ export async function discoverProviderModels(
         if (!lower || lower.startsWith('gradio_') || lower.startsWith('_')) return true;
         if (paramsLen === 0 && returnsLen === 0) return true;
         if (
-          /^(update|change|toggle|show|hide|switch|select|on_|handle_|reset|clear|refresh|load_preset|set_|check_login|lambda|get_example|populate|sync_ui|preview_)/i.test(
+          /^(update|change|toggle|show|hide|switch|select|on_|handle_|reset|clear|refresh|load_preset|load_profile|save_profile|delete_profile|refresh_profiles|export_settings|import_settings|pick_loras|refresh_cpu_loras|add_to_queue|join_queued_clips|clear_queue|auto_queue|match_existing_video_colors|remove_existing_video_final_frame|add_sound|add_uploaded_sound|maybe_sound|extract_frame|generation_failed|set_|check_login|lambda|get_example|populate|sync_ui|preview_)/i.test(
             lower,
           )
         ) {
@@ -1463,6 +1516,21 @@ export async function discoverProviderModels(
           ?.replace(/[-_]+/g, ' ')
           .replace(/\b\w/g, (c) => c.toUpperCase()) || id;
 
+        if (taskName === 'image-to-image' || /img2img|inpaint/i.test(id)) {
+          return {
+            name: prettyName,
+            modelIdentifier: id,
+            category: 'image',
+            capabilities: ['image_editing', 'image_variation'],
+            description: (item.description ?? '').slice(0, 400),
+            maxInputSize: 4096,
+            maxOutputSize: 4096,
+            creditCost: 2,
+            inputPricePerMillion: 0,
+            outputPricePerMillion: 0,
+            modelParameters: {},
+          };
+        }
         if (taskName === 'text-to-image') {
           return {
             name: prettyName,
@@ -1746,14 +1814,23 @@ export async function syncProviderModelsToDatabase(params: {
         continue;
       }
       if (existingNormalizedSet.has(cleanId.toLowerCase())) {
-        // Refresh Space parameter schema metadata on resync so existing HF Space models get latest parameter enums/defaults
-        if (isHfSpaceSync && item.modelParameters && Object.keys(item.modelParameters).length > 0) {
+        // Refresh Space parameter schema metadata and capabilities on resync
+        if (isHfSpaceSync) {
           const matchedExisting = existingByNorm.get(cleanId.toLowerCase());
           if (matchedExisting) {
-            await tx
-              .update(aiModels)
-              .set({ modelParameters: item.modelParameters, updatedAt: new Date() })
-              .where(eq(aiModels.id, matchedExisting.id));
+            if (item.modelParameters && Object.keys(item.modelParameters).length > 0) {
+              await tx
+                .update(aiModels)
+                .set({ modelParameters: item.modelParameters, updatedAt: new Date() })
+                .where(eq(aiModels.id, matchedExisting.id));
+            }
+            const uniqueCaps = Array.from(new Set(item.capabilities));
+            if (uniqueCaps.length > 0) {
+              await tx
+                .insert(modelCapabilities)
+                .values(uniqueCaps.map((capability) => ({ modelId: matchedExisting.id, capability })))
+                .onConflictDoNothing();
+            }
           }
         }
         skippedCount++;

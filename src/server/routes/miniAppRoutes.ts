@@ -781,6 +781,7 @@ export function createMiniAppRouter(): Router {
           jobId: generationJobs.id,
           requestId: generationJobs.requestId,
           status: generationJobs.status,
+          payload: generationJobs.payload,
           promptPreview: aiRequests.promptPreview,
         })
         .from(generationJobs)
@@ -796,7 +797,18 @@ export function createMiniAppRouter(): Router {
         .orderBy(desc(generationJobs.createdAt))
         .limit(1);
 
-      if (recentActive && (recentActive.promptPreview ?? '') === promptPreview) {
+      const recentPayload = (recentActive?.payload ?? {}) as Record<string, unknown>;
+      const prevSourceImg =
+        typeof recentPayload.sourceImageBase64 === 'string' ? recentPayload.sourceImageBase64 : '';
+      const currSourceImg = d.sourceImageBase64 ?? '';
+      const sameSourceImage =
+        prevSourceImg.length === currSourceImg.length &&
+        (prevSourceImg.length === 0 ||
+          (prevSourceImg.slice(0, 64) === currSourceImg.slice(0, 64) &&
+            prevSourceImg.slice(-64) === currSourceImg.slice(-64) &&
+            prevSourceImg === currSourceImg));
+
+      if (recentActive && (recentActive.promptPreview ?? '') === promptPreview && sameSourceImage) {
         const [freshWallet] = await db
           .select({ balance: creditWallets.balance, reserved: creditWallets.reservedBalance })
           .from(creditWallets)
@@ -897,7 +909,7 @@ export function createMiniAppRouter(): Router {
           : d.capability === 'image_generation' ||
               d.capability === 'image_editing' ||
               d.capability === 'image_variation'
-            ? 10_000
+            ? 15_000
             : undefined;
 
       const execRes = await executeQueuedGenerationJob(

@@ -830,7 +830,11 @@ export async function executeQueuedGenerationJob(
       let sourceImageBase64 =
         typeof payload.sourceImageBase64 === 'string' ? payload.sourceImageBase64 : undefined;
       const sourceImageMimeType =
-        typeof payload.sourceImageMimeType === 'string' ? payload.sourceImageMimeType : 'image/jpeg';
+        typeof payload.sourceImageMimeType === 'string'
+          ? payload.sourceImageMimeType
+          : typeof payload.sourceMimeType === 'string'
+            ? payload.sourceMimeType
+            : 'image/jpeg';
 
       if (!sourceImageBase64 && typeof payload.sourceFileId === 'string' && tgClient) {
         const dl = await downloadTelegramFile({
@@ -1102,10 +1106,10 @@ export async function executeMediaPollJob(
       pollRes.status === 'failed' &&
       pollRes.sessionExpired &&
       Number(meta.hfResubmitCount ?? 0) < 1 &&
-      typeof payload.prompt === 'string' &&
-      payload.prompt.trim().length > 0
+      ((typeof payload.prompt === 'string' && payload.prompt.trim().length > 0) ||
+        job.capability === 'image_variation')
     ) {
-      const prompt = payload.prompt.trim();
+      const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
       const aspectRatio = typeof payload.aspectRatio === 'string' ? payload.aspectRatio : '1:1';
       const resolution = typeof payload.resolution === 'string' ? payload.resolution : '1K';
       const countNum = Number(payload.count ?? 1);
@@ -1117,23 +1121,93 @@ export async function executeMediaPollJob(
             { prompt, aspectRatio, resolution, count: countNum },
             { syncWaitCapMs: 5_000 },
           );
-        } else if (
-          (job.capability === 'image_editing' || job.capability === 'image_variation') &&
-          typeof payload.sourceImageBase64 === 'string'
-        ) {
-          retryOutcome = await startImageEditWithRoute(
-            route,
-            {
-              prompt,
-              sourceImageBuffer: Buffer.from(payload.sourceImageBase64, 'base64'),
-              sourceMimeType:
-                typeof payload.sourceMimeType === 'string' ? payload.sourceMimeType : 'image/jpeg',
-              mode: job.capability === 'image_variation' ? 'variation' : 'edit',
-              aspectRatio,
-              resolution,
-            },
-            { syncWaitCapMs: 5_000 },
-          );
+        } else if (job.capability === 'image_editing' || job.capability === 'image_variation') {
+          let sourceBuffer: Buffer | null = null;
+          if (typeof payload.sourceImageBase64 === 'string' && payload.sourceImageBase64.length > 0) {
+            sourceBuffer = Buffer.from(payload.sourceImageBase64, 'base64');
+          } else if (typeof payload.sourceFileId === 'string' && tgClient) {
+            const activePlanForLimit = await getUserActivePlan(job.userId);
+            const maxFileSizeMb = Number(
+              payload.maxFileSizeMb ?? activePlanForLimit?.plan.maxFileSizeMb ?? 10,
+            );
+            const dl = await downloadTelegramFile({
+              api: tgClient.api,
+              botToken: tgClient.botToken,
+              fileId: payload.sourceFileId,
+              maxSizeMb: maxFileSizeMb,
+            });
+            sourceBuffer = dl.buffer;
+          }
+
+          if (sourceBuffer) {
+            retryOutcome = await startImageEditWithRoute(
+              route,
+              {
+                prompt,
+                sourceImageBuffer: sourceBuffer,
+                sourceMimeType:
+                  typeof payload.sourceMimeType === 'string' ? payload.sourceMimeType : 'image/jpeg',
+                mode: job.capability === 'image_variation' ? 'variation' : 'edit',
+                aspectRatio,
+                resolution,
+              },
+              { syncWaitCapMs: 5_000 },
+            );
+          }
+        }
+
+        if (retryOutcome?.kind === 'complete') {
+          const storage = getStorageAdapter();
+          let firstKey: string | null = null;
+          const storedKeys: string[] = [];
+          for (let i = 0; i < retryOutcome.result.images.length; i++) {
+            const img = retryOutcome.result.images[i]!;
+            const canDeliverToTelegram = Boolean(api && job.telegramChatId);
+            try {
+              const stored = await storage.putObject({
+                buffer: img.buffer,
+                mimeType: img.mimeType,
+                extension: img.extension,
+                prefix: 'generated-images',
+                userId: job.userId,
+                requestId: reqRow.id,
+                jobId: job.id,
+              });
+              if (!firstKey) firstKey = stored.objectKey;
+              storedKeys.push(stored.objectKey);
+            } catch (storageErr) {
+              if (!canDeliverToTelegram) throw storageErr;
+            }
+            if (api && job.telegramChatId) {
+              await deliverImageToTelegram({
+                api,
+                chatId: job.telegramChatId,
+                buffer: img.buffer,
+                fileName: `hooshnegar-${i + 1}.${img.extension}`,
+                caption: `🎨 تصویر ویرایش‌شده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`,
+              });
+            }
+          }
+          if (api && job.telegramChatId && job.statusMessageId) {
+            try {
+              await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+            } catch {
+              // ignore
+            }
+          }
+          const latencyMs = job.startedAt ? Date.now() - job.startedAt.getTime() : 0;
+          await reconcileRequestSuccess({
+            requestId: reqRow.id,
+            jobId: job.id,
+            providerId: retryOutcome.providerId,
+            costUsd: retryOutcome.result.costUsd ?? 0,
+            latencyMs,
+            responsePreview: `تولید ${retryOutcome.result.images.length} تصویر با موفقیت انجام شد.`,
+            usedFallback: retryOutcome.usedFallback,
+            storageObjectKey: firstKey,
+            resultMetadata: { imageCount: retryOutcome.result.images.length, objectKeys: storedKeys },
+          });
+          return { ok: true, status: 'succeeded', storageObjectKey: firstKey };
         }
 
         if (retryOutcome?.kind === 'pending') {
@@ -1262,7 +1336,7 @@ export async function executeMediaPollJob(
 
 export async function executeVideoPollJob(
   jobId: string,
-  options?: { scheduleNextPoll?: boolean },
+  options?: { maxWaitMs?: number; scheduleNextPoll?: boolean },
 ): Promise<{
   ok: boolean;
   status: string;
@@ -1309,7 +1383,9 @@ export async function executeVideoPollJob(
         basePoolCtx.credentialPool?.find((c) => c.credentialId === targetCredentialId)) ||
       basePoolCtx;
 
-    const pollRes = await pollVideoGenerationJob(pollCtx, job.providerJobId, meta);
+    const pollRes = await pollVideoGenerationJob(pollCtx, job.providerJobId, meta, {
+      maxWaitMs: options?.maxWaitMs,
+    });
 
     if (pollRes.status === 'succeeded') {
       let videoBuffer = pollRes.videoBuffer;
@@ -1361,6 +1437,136 @@ export async function executeVideoPollJob(
       });
 
       return { ok: true, status: 'succeeded', storageObjectKey: stored.objectKey };
+    }
+
+    if (
+      pollRes.status === 'failed' &&
+      pollRes.sessionExpired &&
+      Number(meta.hfResubmitCount ?? 0) < 1 &&
+      typeof payload.prompt === 'string' &&
+      payload.prompt.trim().length > 0
+    ) {
+      try {
+        let sourceImageBase64 =
+          typeof payload.sourceImageBase64 === 'string' ? payload.sourceImageBase64 : undefined;
+        const sourceImageMimeType =
+          typeof payload.sourceImageMimeType === 'string'
+            ? payload.sourceImageMimeType
+            : typeof payload.sourceMimeType === 'string'
+              ? payload.sourceMimeType
+              : 'image/jpeg';
+
+        if (!sourceImageBase64 && typeof payload.sourceFileId === 'string' && tgClient) {
+          const activePlanForLimit = await getUserActivePlan(job.userId);
+          const maxFileSizeMb = Number(
+            payload.maxFileSizeMb ?? activePlanForLimit?.plan.maxFileSizeMb ?? 10,
+          );
+          const dl = await downloadTelegramFile({
+            api: tgClient.api,
+            botToken: tgClient.botToken,
+            fileId: payload.sourceFileId,
+            maxSizeMb: maxFileSizeMb,
+          });
+          sourceImageBase64 = dl.buffer.toString('base64');
+        }
+
+        const retryStart = await startVideoGenerationWithRoute(
+          route,
+          {
+            prompt: payload.prompt.trim(),
+            sourceImageBase64,
+            sourceImageMimeType,
+            durationSeconds: Number(payload.durationSeconds ?? 5),
+            aspectRatio: typeof payload.aspectRatio === 'string' ? payload.aspectRatio : '16:9',
+            quality: typeof payload.quality === 'string' ? payload.quality : '720p',
+          },
+          { syncWaitCapMs: 5_000 },
+        );
+
+        if (retryStart.result.status === 'succeeded' && retryStart.result.videoBuffer) {
+          const storage = getStorageAdapter();
+          const stored = await storage.putObject({
+            buffer: retryStart.result.videoBuffer,
+            mimeType: retryStart.result.mimeType ?? 'video/mp4',
+            extension: 'mp4',
+            prefix: 'generated-videos',
+            userId: job.userId,
+            requestId: reqRow.id,
+            jobId: job.id,
+          });
+
+          if (api && job.telegramChatId) {
+            await api.sendVideo(
+              job.telegramChatId,
+              new InputFile(new Uint8Array(retryStart.result.videoBuffer), 'hooshnegar-video.mp4'),
+              { caption: `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد.` },
+            );
+            if (job.statusMessageId) {
+              try {
+                await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+              } catch {
+                // ignore
+              }
+            }
+          }
+
+          const latencyMs = job.startedAt ? Date.now() - job.startedAt.getTime() : 0;
+          await reconcileRequestSuccess({
+            requestId: reqRow.id,
+            jobId: job.id,
+            providerId: retryStart.providerId,
+            costUsd: retryStart.result.costUsd ?? 0.2,
+            latencyMs,
+            responsePreview: 'ویدیو با موفقیت تولید شد.',
+            usedFallback: retryStart.usedFallback,
+            storageObjectKey: stored.objectKey,
+          });
+
+          return { ok: true, status: 'succeeded', storageObjectKey: stored.objectKey };
+        }
+
+        if (retryStart.result.providerJobId) {
+          await db
+            .update(generationJobs)
+            .set({
+              providerJobId: retryStart.result.providerJobId,
+              status: 'running',
+              progressPercent: Math.max(25, retryStart.result.progressPercent),
+              resultMetadata: {
+                ...meta,
+                ...(retryStart.result.metadata ?? {}),
+                providerId: retryStart.providerId,
+                usedFallback: retryStart.usedFallback,
+                pollCount,
+                hfResubmitCount: Number(meta.hfResubmitCount ?? 0) + 1,
+                lastPolledAtMs: Date.now(),
+              },
+              updatedAt: new Date(),
+            })
+            .where(eq(generationJobs.id, job.id));
+
+          const shouldScheduleRetry =
+            options?.scheduleNextPoll !== undefined
+              ? options.scheduleNextPoll
+              : hasDurableAsyncQueue() || !silentDelivery;
+
+          if (shouldScheduleRetry) {
+            await enqueueBackgroundJob(
+              {
+                kind: 'video_poll_job',
+                idempotencyKey: `vidpoll:${job.id}:${pollCount + 1}`,
+                jobId: job.id,
+                requestId: reqRow.id,
+              },
+              { delaySeconds: 18, retries: 3 },
+            );
+          }
+
+          return { ok: true, status: 'running' };
+        }
+      } catch {
+        // Fall through to failure handler
+      }
     }
 
     if (pollRes.status === 'failed' || pollCount >= 24) {

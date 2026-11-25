@@ -398,5 +398,60 @@ describe('Telegram Mini App End-to-End API Integration', () => {
     expect(polledJob.errorMessage).toContain('محدودیت ترافیک');
     expect(polledJob.errorMessage).not.toContain('#1 [');
     expect(polledJob.errorMessage).not.toContain('key-a');
+
+    // 10) Large (>5MB) JSON payload for image_editing succeeds instead of failing Express 5MB limit with HTTP 500
+    const largeImageBase64 = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(4_500_000, 0x41),
+    ]).toString('base64');
+    expect(largeImageBase64.length).toBeGreaterThan(5_500_000);
+
+    const largeEditRes = await httpRequest('/api/miniapp/generate', {
+      method: 'POST',
+      headers: authHeaders,
+      body: {
+        capability: 'image_editing',
+        prompt: 'نورپردازی سینمایی اضافه کن',
+        sourceImageBase64: largeImageBase64,
+        sourceMimeType: 'image/png',
+        aspectRatio: '1:1',
+        clientRequestId: 'req-large-6mb-edit-1',
+      },
+    });
+    expect(largeEditRes.status).toBe(200);
+    expect(largeEditRes.json.ok).toBe(true);
+
+    // 11) Two rapid image_editing requests with identical prompt and DIFFERENT source images create distinct jobs
+    const [modelRow] = await db
+      .select({ id: aiModels.id })
+      .from(aiModels)
+      .where(eq(aiModels.modelIdentifier, 'imagen-3.0-fast-generate-001'))
+      .limit(1);
+    const imgA = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 1, 1, 1]).toString('base64');
+    const imgB = Buffer.from([0x89, 0x50, 0x4e, 0x47, 2, 2, 2, 2]).toString('base64');
+    const firstActive = await reserveCreditsAndCreateRequest({
+      userId: String(userObj.id),
+      modelId: modelRow!.id,
+      capability: 'image_editing',
+      idempotencyKey: `miniapp:distinct-a:${Date.now()}`,
+      promptPreview: 'پس‌زمینه را آبی کن',
+      jobPayload: { prompt: 'پس‌زمینه را آبی کن', sourceImageBase64: imgA, silentDelivery: true },
+    });
+    const secondEdit = await httpRequest('/api/miniapp/generate', {
+      method: 'POST',
+      headers: authHeaders,
+      body: {
+        capability: 'image_editing',
+        prompt: 'پس‌زمینه را آبی کن',
+        sourceImageBase64: imgB,
+        sourceMimeType: 'image/png',
+        aspectRatio: '1:1',
+        clientRequestId: `req-distinct-b-${Date.now()}`,
+      },
+    });
+    expect(secondEdit.status).toBe(200);
+    expect(secondEdit.json.deduplicated).not.toBe(true);
+    expect(secondEdit.json.jobId).not.toBe(firstActive.jobId);
   });
 });
+

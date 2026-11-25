@@ -77,7 +77,7 @@ export function createApiApp(): Express {
   app.use(cookieParser());
   app.use(
     express.json({
-      limit: '5mb',
+      limit: '16mb',
       verify: (req, _res, buf) => {
         (req as RawBodyRequest).rawBody = buf.toString('utf8');
       },
@@ -165,6 +165,16 @@ export function createApiApp(): Express {
 
   // Safe error boundary with secret redaction
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const errObj = err as { type?: unknown; status?: unknown; statusCode?: unknown };
+    if (errObj?.type === 'entity.too.large' || errObj?.status === 413 || errObj?.statusCode === 413) {
+      if (!res.headersSent) {
+        res.status(413).json({
+          error: 'حجم فایل یا تصویر ارسالی بیش از حد مجاز است. لطفاً تصویر کم‌حجم‌تری انتخاب کنید.',
+          code: 'PAYLOAD_TOO_LARGE',
+        });
+      }
+      return;
+    }
     const rawMsg = err instanceof Error ? err.message : 'Unexpected server error';
     console.error('[api:error]', redactSecrets(rawMsg));
     if (!res.headersSent) {

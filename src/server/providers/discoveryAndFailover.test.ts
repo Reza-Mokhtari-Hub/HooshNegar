@@ -1663,6 +1663,126 @@ describe('Provider Auto-Discovery, Telegram Visibility & Multi-Key Failover', ()
     const smallBase64 = 'SGVsbG8=';
     expect(splitBlobBase64(smallBase64)).toEqual([smallBase64]);
   });
+
+  it('accurately separates text-to-image vs edit-capable image models and enriches existing HF Space capabilities on resync', async () => {
+    const db = getDb();
+    const oaiDisc = await discoverProviderModels(
+      {
+        providerType: 'openai_compatible',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKey: 'sk-test-oai',
+      },
+      (async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              { id: 'dall-e-3' },
+              { id: 'gpt-image-1' },
+            ],
+          }),
+          { status: 200 },
+        )) as unknown as typeof fetch,
+    );
+    expect(oaiDisc.ok).toBe(true);
+    const d3 = oaiDisc.models.find((m) => m.modelIdentifier === 'dall-e-3');
+    const gptImg = oaiDisc.models.find((m) => m.modelIdentifier === 'gpt-image-1');
+    expect(d3?.capabilities).toEqual(['image_generation']);
+    expect(gptImg?.capabilities).toContain('image_editing');
+
+    // Non-edit HF text-to-image model must NOT receive image_editing; image-to-image MUST receive image_editing
+    const hfDisc = await discoverProviderModels(
+      {
+        providerType: 'huggingface',
+        baseUrl: 'https://router.huggingface.co',
+        apiKey: 'hf_test_key',
+      },
+      (async (url: RequestInfo | URL) => {
+        const href = String(url);
+        if (href.includes('router.huggingface.co/v1/models')) {
+          return new Response(JSON.stringify({ data: [] }), { status: 200 });
+        }
+        if (href.includes('pipeline_tag=text-to-image')) {
+          return new Response(
+            JSON.stringify([
+              { id: 'black-forest-labs/FLUX.1-dev', pipeline_tag: 'text-to-image' },
+            ]),
+            { status: 200 },
+          );
+        }
+        if (href.includes('pipeline_tag=image-to-image')) {
+          return new Response(
+            JSON.stringify([
+              { id: 'black-forest-labs/FLUX.1-Kontext-dev', pipeline_tag: 'image-to-image' },
+            ]),
+            { status: 200 },
+          );
+        }
+        return new Response('not found', { status: 404 });
+      }) as unknown as typeof fetch,
+    );
+    const fluxDev = hfDisc.models.find((m) => m.modelIdentifier === 'black-forest-labs/FLUX.1-dev');
+    const fluxKontext = hfDisc.models.find((m) => m.modelIdentifier === 'black-forest-labs/FLUX.1-Kontext-dev');
+    expect(fluxDev?.capabilities).toEqual(['image_generation']);
+    expect(fluxKontext?.capabilities).toContain('image_editing');
+
+    // HF Space resync adds missing image_editing & image_variation capabilities onto existing model row
+    const [hfSpaceProv] = await db
+      .insert(aiProviders)
+      .values({
+        name: 'HF Resync Cap Test',
+        slug: `hf-resync-cap-${Date.now()}`,
+        providerType: 'huggingface_space',
+        baseUrl: 'https://resync-cap-test.hf.space',
+        isActive: true,
+      })
+      .returning();
+    const [existingModel] = await db
+      .insert(aiModels)
+      .values({
+        providerId: hfSpaceProv!.id,
+        name: 'Resync Space',
+        modelIdentifier: 'owner/resync-cap::generate',
+        category: 'image',
+        isActive: true,
+      })
+      .returning();
+    await db.insert(modelCapabilities).values({ modelId: existingModel!.id, capability: 'image_generation' });
+
+    await syncProviderModelsToDatabase({
+      providerId: hfSpaceProv!.id,
+      providerType: 'huggingface_space',
+      discoveredModels: [
+        {
+          name: 'Resync Space',
+          modelIdentifier: 'owner/resync-cap::generate',
+          category: 'image',
+          capabilities: ['image_generation', 'image_editing', 'image_variation'],
+          description: 'updated',
+          maxInputSize: 32000,
+          maxOutputSize: 4096,
+          creditCost: 4,
+          inputPricePerMillion: 0,
+          outputPricePerMillion: 0,
+          modelParameters: {
+            spaceHost: 'https://resync-cap-test.hf.space',
+            apiName: 'generate',
+            parameters: [{ index: 0, name: 'image', label: 'Ref', component: 'image', hasDefault: false }],
+          },
+        },
+      ],
+    });
+
+    const syncedCaps = await db
+      .select({ capability: modelCapabilities.capability })
+      .from(modelCapabilities)
+      .where(eq(modelCapabilities.modelId, existingModel!.id));
+    expect(syncedCaps.map((c) => c.capability).sort()).toEqual([
+      'image_editing',
+      'image_generation',
+      'image_variation',
+    ]);
+  });
 });
+
 
 
