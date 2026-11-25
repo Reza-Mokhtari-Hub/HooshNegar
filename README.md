@@ -1,94 +1,161 @@
-# هوش‌نگار (HooshNegar AI) — پلتفرم تجاری چندمدلی هوش مصنوعی متصل به ربات تلگرام (فاز ۱، ۲ و ۳)
+<div align="center">
 
-پلتفرم تولیدی (Production-Grade) چندارائه‌دهنده هوش مصنوعی متصل به ربات تلگرام (**Grammy + Webhook**) با پرداخت اختصاصی **Telegram Stars (`XTR`)**، موتور اشتراک و کیف‌پول اعتبار حسابرسی‌شده، سیستم معرفی دوستان و کوپن‌ها، داشبورد مالی و سودآوری، صف پس‌زمینه **Upstash QStash**، ذخیره‌سازی رسانه **Cloudflare R2** و پایگاه‌داده **PostgreSQL (Neon + Drizzle ORM)** با استقرار کامل روی **Cloudflare Workers**.
+# هوش‌نگار (HooshNegar)
 
----
+**پلتفرم یکپارچه ربات تلگرام، مینی‌اپ و پنل مدیریت مدل‌های متنی، تصویر، صدا و ویدیو**
 
-## قابلیت‌های پیاده‌سازی‌شده
+توسعه و پیاده‌سازی: **[Reza Mokhtari](https://github.com/Reza-Mokhtari-Hub)**
 
-### فاز ۱ — زیرساخت امن، پایگاه‌داده و پنل مدیریت
-- **احراز هویت امن مدیران**: ورود با ایمیل و رمز عبور، هش **Argon2id** (`hash-wasm`)، نشست‌های سمت سرور در PostgreSQL، کوکی‌های `HttpOnly` / `Secure` / `SameSite`، محافظت **CSRF**، محدودیت نرخ ورود و قفل ضد Brute-Force، کنترل دسترسی مبتنی بر نقش (**RBAC**: `super_admin`, `admin`, `operator`, `auditor`) و گزارش ممیزی امنیتی (`audit_logs`).
-- **پایگاه‌داده نرمال‌سازی‌شده (۳۷ جدول + ۳ Migration واقعی Drizzle ORM)**: شامل جداول هسته، ربات تلگرام، موتور AI، پرداخت‌های استارز، بسته‌های اعتبار، قوانین معرفی، کوپن‌ها، قالب‌ها و لاگ‌های اعلان، و محدودیت‌های سفارشی کاربر.
-- **رمزنگاری AES-256-GCM کلیدهای API و توکن‌های تلگرام**: کلیدها هرگز به‌صورت خام به فرانت‌اند یا لاگ‌ها ارسال نمی‌شوند و قابلیت چرخش کلید دارند.
+[![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-19-149ECA?style=flat-square&logo=react&logoColor=white)](https://react.dev/)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?style=flat-square&logo=cloudflareworkers&logoColor=white)](https://workers.cloudflare.com/)
+[![Drizzle ORM](https://img.shields.io/badge/PostgreSQL-Drizzle_ORM-336791?style=flat-square&logo=postgresql&logoColor=white)](https://orm.drizzle.team/)
+[![Grammy](https://img.shields.io/badge/Telegram-Grammy_%2B_Mini_App-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://grammy.dev/)
 
-### فاز ۲ — ربات کامل تلگرام (Grammy) و موتور چندوجهی هوش مصنوعی
-- **وب‌هوک امن و Idempotent تلگرام**: اعتبارسنجی زمان‌ثابت `X-Telegram-Bot-Api-Secret-Token`، پردازش سریع `pre_checkout_query` زیر ۱۰ ثانیه، و پردازش ناهمگام درخواست‌های AI از طریق **Upstash QStash** با تأیید امضای `Upstash-Signature`.
-- **تجربه کاربری کامل فارسی در تلگرام**: پشتیبانی کامل از `/start`, `/help`, `/models`, `/plan`, `/balance`, `/buy`, `/referral`, `/history`, `/settings`, `/cancel`, `/paysupport` و کیبوردهای اینلاین پویا.
-- **موتور چندارائه‌دهنده AI با Failover امن و حفاظت SSRF**: پشتیبانی بومی از OpenAI-compatible، Google Gemini، Anthropic، Replicate، fal.ai و Custom HTTPS با محافظ Failover که تغییر مسیر به مدل‌های غیرفعال، ناسازگار، غیرمجاز برای پلن کاربر یا گران‌تر را مسدود می‌کند.
-
-### فاز ۳ — اشتراک، پرداخت تلگرام استارز (XTR)، کیف‌پول اعتبار، معرفی، مالی و پشتیبانی
-- **موتور اشتراک کاملاً قابل پیکربندی (بدون مقادیر Hardcoded)**:
-  - پشتیبانی نامحدود از پلن‌های `Free`, `Basic`, `Pro`, `Premium`, `Enterprise` و `Custom` همراه با بسته‌های شارژ اعتبار (`credit_packages`).
-  - پیکربندی قیمت تلگرام استارز (`XTR`)، تمدید خودکار ۳۰ روزه تلگرام (`isRecurringStars` با اعتبارسنجی رسمی ۱ تا ۲۵۰۰ استارز و دقیقاً ۳۰ روز / `2592000` ثانیه)، سهمیه‌های روزانه/ماهانه برای متن، تصویر، صوت و ویدیو، حداکثر حجم فایل، طول زمینه، صف اولویت، ارائه‌دهندگان و مدل‌های مجاز.
-- **پرداخت اختصاصی Telegram Stars (`XTR`)**:
-  - انطباق کامل با قوانین محصولات دیجیتال تلگرام: exclusively `currency: 'XTR'` و `provider_token: ''` (بدون هیچ درگاه خارجی مانند Stripe/PayPal/Crypto درون ربات).
-  - امضای HMAC-SHA256 روی `invoice_payload`، اعتبارسنجی سریع `pre_checkout_query`، ثبت idempotent پرداخت با `telegram_payment_charge_id` (جلوگیری از شارژ تکراری)، پشتیبانی از تمدید دوره‌ای (`is_first_recurring` / `is_recurring`)، لغو تمدید خودکار (`editUserStarSubscription`) و بازپرداخت رسمی (`refundStarPayment`) از پنل مدیریت.
-- **کیف‌پول اعتبار حسابرسی‌شده**:
-  - قفل سطری اتمی (`SELECT ... FOR UPDATE`)، ثبت `balanceBefore` و `balanceAfter` در `credit_transactions`، جلوگیری پیش‌فرض از موجودی منفی (مگر فعال‌سازی صریح `allowNegativeBalance`)، رزرو و بازگشت ۱۰۰٪ اعتبار در خطای AI، و ارسال خودکار هشدار کمبود اعتبار.
-- **برنامه معرفی دوستان، ضدتقلب و کوپن‌ها**:
-  - لینک اختصاصی دعوت (`t.me/<bot>?start=REF_...`)، جلوگیری خودکار از معرفی به خود (Self-referral) و ثبت‌نام تکراری، امتیازدهی ریسک سرعت دعوت (`fraudVelocityLimitPerHour`)، پاداش مشروط به خرید (`requirePurchase`)، و کوپن‌های تخفیف درصدی/ثابت (اعتبارسنجی صرفاً سمت سرور) و کدهای هدیه اعتبار.
-- **داشبورد مالی، مدیریت کامل کاربران، پشتیبانی و اعلان‌ها**:
-  - گزارش درآمد استارز، درآمد/هزینه/سود برآوردی (با برچسب صریح برآوردی)، نرخ تبدیل، فیلتر چندبعدی، خروجی CSV ایمن در برابر Formula Injection، پنل جزئیات کامل کاربر (تنظیم حسابرسی‌شده اعتبار، تخصیص دستی پلن، محدودیت‌های سفارشی، حذف دائم داده برای `super_admin`)، تیکت‌های پشتیبانی دسته‌بندی‌شده با ارسال پاسخ به تلگرام، و ۱۰ قالب اعلان قابل ویرایش با جلوگیری از ارسال تکراری.
+</div>
 
 ---
 
-## متغیرهای محیطی (Environment Variables)
+## درباره پروژه
 
-فایل `.env.example` را کپی کرده و مقادیر واقعی را در `.env` یا بخش **Variables and Secrets** پروژه در **Cloudflare Workers** وارد کنید:
+این مخزن شامل سورس کامل **هوش‌نگار** است؛ سیستمی که برای مدیریت متمرکز سرویس‌های گفتگو، تولید و ویرایش تصویر، پردازش صوت و ساخت ویدیو روی **ربات تلگرام** و **مینی‌اپ تلگرام (Telegram Mini App)** نوشته‌ام.
 
-| متغیر | الزامی در تولید | توضیح |
-| --- | :---: | --- |
-| `DATABASE_URL` | بله | رشته اتصال PostgreSQL از Neon (`postgresql://...?sslmode=require`) |
-| `ENCRYPTION_MASTER_KEY` | بله | کلید اصلی رمزنگاری AES-256-GCM دقیقاً ۶۴ کاراکتر هگز (`openssl rand -hex 32`) |
-| `SESSION_SECRET` | بله | کلید تصادفی حداقل ۳۲ کاراکتر برای نشست‌ها (`openssl rand -base64 48`) |
-| `PAYMENT_PAYLOAD_SECRET` | توصیه‌شده | کلید اختصاصی HMAC-SHA256 برای امضای فاکتورهای استارز (در صورت نبود از `ENCRYPTION_MASTER_KEY` استفاده می‌کند) |
-| `CRON_SECRET` | اختیاری | کلید احراز هویت مسیر HTTP `/api/cron/maintenance` (علاوه بر اجرای بومی ساعتی توسط Cloudflare Cron Trigger) |
-| `APP_URL` | بله | نشانی عمومی HTTPS روی Cloudflare Workers (مثلاً `https://hooshnegar-ai.<subdomain>.workers.dev` یا دامنه اختصاصی) |
-| `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | توصیه‌شده | صف پایدار پس‌زمینه و Retry برای کارهای طولانی AI |
-| `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL` | اختیاری | ذخیره‌سازی رسانه Cloudflare R2 (یا اتصال مستقیم `MEDIA_BUCKET` در `wrangler.jsonc`) |
-| `INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, `INITIAL_ADMIN_NAME` | اختیاری | ایجاد خودکار مدیر ارشد در اولین اجرا (در غیر این صورت صفحه راه‌اندازی اولیه نمایش داده می‌شود) |
-| `AI_MOCK_MODE` | **فقط توسعه** | در محیط تولید (`NODE_ENV=production`) به‌صورت خودکار نادیده گرفته می‌شود |
+هدفم در طراحی این پروژه این بود که همه‌چیز در یک ساختار منظم TypeScript کنار هم باشد و بدون وابستگی به زیرساخت‌های پیچیده، هم به‌صورت محلی با Node.js و هم روی **Cloudflare Workers** مستقر شود. از مدیریت کلیدهای API و Failover بین ارائه‌دهنده‌ها گرفته تا پرداخت درون‌برنامه‌ای با **Telegram Stars** و پنل ادمین، همگی مستقیم در همین پروژه پیاده‌سازی شده‌اند.
 
 ---
 
-## اجرای محلی، Migration و تست‌ها
+## قابلیت‌ها
 
-```bash
-npm install
-npm run db:migrate   # اجرای هر ۳ migration پایگاه‌داده روی Neon یا PGlite محلی
-npm run dev          # اجرای سرور تمام‌پشته روی http://localhost:3000
-npm run lint         # بررسی TypeScript Strict Mode
-npm run build        # ساخت بسته تولیدی Vite
-npm test             # اجرای تمام تست‌های واحد و یکپارچه Vitest (فاز ۱، ۲ و ۳)
+### ربات تلگرام و مینی‌اپ (`/miniapp`)
+- **چت همگام‌سازی‌شده**: تاریخچه مکالمات بین ربات و مینی‌اپ یکسان است و کاربر می‌تواند مدل فعال یا دستورالعمل دلخواه خود را تغییر دهد.
+- **استودیوی چندرسانه‌ای در مینی‌اپ**:
+  - ساخت تصویر از روی متن، ویرایش تصویر با دستور متنی و تولید نسخه مشابه (Variation) همراه با بهینه‌سازی خودکار حجم و ابعاد تصویر پیش از ارسال.
+  - تبدیل متن به صوت (TTS) و تبدیل ویس یا فایل صوتی به متن (STT).
+  - ساخت ویدیو از متن یا تصویر با پیگیری خودکار وضعیت پردازش.
+  - دکمه ذخیره مستقیم فایل در دستگاه با نام و پسوند استاندارد و ارسال هم‌زمان تصویر و ویدیوی نهایی به گفتگوی ربات کاربر.
+- **دستورات و رابط ربات**: پشتیبانی از `/start`، `/help`، `/models`، `/plan`، `/balance`، `/buy`، `/referral`، `/history`، `/settings`، `/cancel` و `/paysupport` با منوهای شیشه‌ای.
+
+### مسیریابی مدل‌ها و مدیریت کلیدها (Key Pool & Failover)
+- اتصال به **OpenAI-compatible**، **Google Gemini**، **Anthropic**، **Cloudflare Workers AI**، **Hugging Face (Inference & Spaces / Gradio)**، **Replicate** و **fal.ai**.
+- پشتیبانی از چند کلید هم‌زمان برای هر ارائه‌دهنده، تست سلامت دقیق، فعال و غیرفعال‌سازی دستی یا خودکار کلیدهای دارای خطا و جابه‌جایی سریع به کلید یا مدل پشتیبان هنگام محدودیت سهمیه.
+- مدیریت کارهای طولانی و ناهمگام (تصویر و ویدیو) از طریق صف **Upstash QStash** و بازیابی خودکار سشن در صورت انقضا.
+
+### پرداخت، اشتراک و کیف‌پول
+- **پرداخت Telegram Stars (`XTR`)**: پیاده‌سازی مستقیم با امضای HMAC-SHA256 روی پیلود فاکتور، پاسخ سریع به `pre_checkout_query`، جلوگیری از ثبت تراکنش تکراری و امکان لغو تمدید دوره‌ای و بازپرداخت (Refund) از پنل ادمین.
+- **کیف‌پول اعتبار اتمی**: قفل سطری در دیتابیس برای جلوگیری از تداخل موجودی، رزرو اعتبار پیش از شروع پردازش و بازگشت خودکار ۱۰۰٪ اعتبار هنگام خطا یا لغو درخواست.
+- **پلن‌ها، معرفی دوستان و کوپن**: تعریف محدودیت‌های روزانه/ماهانه برای هر پلن، لینک دعوت اختصاصی با کنترل ضدتقلب و کدهای تخفیف یا هدیه.
+
+### امنیت و داشبورد مدیریت
+- ورود مدیران با هش **Argon2id** (و `scrypt` بومی در محیط Worker)، سشن‌های سمت سرور، کوکی‌های امن، محافظت **CSRF** و محدودیت تلاش ناموفق ورود.
+- رمزنگاری کلیدهای API و توکن ربات با **AES-256-GCM** و پنهان‌سازی کامل مقادیر محرمانه در خروجی‌ها و لاگ‌ها.
+- کنترل دسترسی بر اساس نقش (`super_admin`، `admin`، `operator`، `auditor`)، ثبت گزارش عملکرد (`audit_logs`) و محافظت **SSRF**.
+- گزارش‌گیری مالی و مصرف، مدیریت کاربران و تیکت‌های پشتیبانی با ارسال پاسخ مستقیم به ربات کاربر.
+
+---
+
+## تکنولوژی‌های استفاده‌شده
+
+| بخش | ابزارها و کتابخانه‌ها |
+| --- | --- |
+| **فرانت‌اند و مینی‌اپ** | React 19، TypeScript، Vite، Tailwind CSS v4، Recharts، Lucide Icons |
+| **بک‌اند و ربات** | Express، Grammy، Zod |
+| **اجرای لبه (Edge)** | Cloudflare Workers (`worker.ts`)، Durable Objects (`HooshNegarStore`)، Cron Triggers |
+| **دیتابیس** | Drizzle ORM، PostgreSQL (Neon در محیط تولید / PGlite در توسعه محلی) |
+| **صف و فایل** | Upstash QStash، Cloudflare R2 / S3 Storage |
+| **تست و بررسی کد** | Vitest، Node Test Runner (`node:test`)، `tsc --noEmit` |
+
+---
+
+## ساختار پروژه
+
+```text
+├── src/
+│   ├── components/         # بخش‌های پنل مدیریت و نمودارهای وضعیت
+│   ├── miniapp/            # رابط کاربری و منطق مینی‌اپ تلگرام (چت، استودیو، فروشگاه، پروفایل)
+│   ├── db/                 # اسکیماهای Drizzle، میگریشن‌ها و آداپتور Neon / PGlite / Durable Object
+│   ├── server/
+│   │   ├── providers/      # موتور اتصال به مدل‌ها، کشف خودکار و مدیریت کلیدها
+│   │   ├── routes/         # مسیرهای API پنل مدیریت، مینی‌اپ، کرون و QStash
+│   │   ├── security/       # رمزنگاری AES-256-GCM، احراز هویت، CSRF و SSRF
+│   │   ├── services/       # منطق کیف‌پول، اشتراک، پرداخت Stars، معرفی دوستان و نگهداری
+│   │   ├── storage/        # لایه ذخیره‌سازی رسانه (R2 / محلی)
+│   │   └── telegram/       # هسته ربات Grammy، اجرای صف کارها و کیبوردهای اینلاین
+│   └── shared/             # اسکیماهای اعتبارسنجی و تایپ‌های مشترک
+├── drizzle/                # فایل‌های Migration پایگاه‌داده
+├── server.ts               # نقطه ورود سرور Node.js و توسعه محلی
+├── worker.ts               # نقطه ورود Cloudflare Workers، Cron و Durable Object
+└── wrangler.jsonc          # تنظیمات استقرار روی کلودفلر
 ```
 
 ---
 
-## چک‌لیست استقرار کامل روی Cloudflare Workers (بدون نیاز به Vercel)
+## نصب و اجرا روی سیستم شخصی
 
-1. **پایگاه‌داده Neon PostgreSQL**:
-   - یک دیتابیس Neon بسازید و `DATABASE_URL` را به‌عنوان Secret در Cloudflare Workers ثبت کنید.
-   - یک‌بار دستور `DATABASE_URL="..." npm run db:migrate` را اجرا کنید تا هر ۳ migration روی Neon اعمال شود.
-2. **استقرار مستقیم از GitHub روی Cloudflare Workers**:
-   - در داشبورد Cloudflare بروید به **Workers & Pages → Create → Workers → Connect to Git** و ریپازیتوری گیت‌هاب خود را انتخاب کنید.
-   - **Build command**: `npm run build`
-   - **Deploy command**: `npx wrangler deploy`
-   - فایل `wrangler.jsonc` به‌صورت خودکار فرانت‌اند (`./dist`)، سرور API (`worker.ts` با `nodejs_compat`) و **Cron Trigger ساعتی رایگان (`0 * * * *`)** را مستقر می‌کند.
-   - *(یا از سیستم محلی با یک دستور: `npm run cf:deploy`)*
-3. **ساخت ربات در BotFather و فعال‌سازی Telegram Stars**:
-   - در `@BotFather` دستور `/newbot` را اجرا کنید و توکن را در پنل مدیریت → **تنظیمات ربات تلگرام** وارد کنید.
-   - یک **Webhook Secret** تصادفی تنظیم کنید، آدرس `https://<your-worker-domain>/api/telegram/webhook` را ذخیره کرده و دکمه **همگام‌سازی وب‌هوک** را بزنید.
-   - پرداخت‌های Telegram Stars (`XTR`) بدون نیاز به `provider_token` خارجی و با API رسمی تلگرام فعال هستند؛ دستور `/paysupport` نیز به‌صورت بومی پیاده‌سازی شده است.
-4. **ارائه‌دهندگان هوش مصنوعی، پلن‌ها و بسته‌های اعتبار**:
-   - از بخش **ارائه‌دهندگان هوش مصنوعی** و **مدل‌های هوش مصنوعی**، کلیدهای واقعی (OpenAI, Gemini, Anthropic, Replicate, fal.ai) را ثبت کنید و `creditCost` / `minCreditCost` / `providerCostPerOpUsd` را تنظیم نمایید.
-   - از بخش **پلن‌ها و بسته‌های اعتبار**، پلن‌های اشتراک (قیمت `XTR`) و بسته‌های اعتبار را ایجاد کنید و پلن رایگان پیش‌فرض را در **تنظیمات سیستم** انتخاب نمایید.
-5. **کار زمان‌بندی‌شده بومی (Cloudflare Cron Triggers — رایگان و ساعتی)**:
-   - فایل `wrangler.jsonc` هر ساعت (`0 * * * *`) رویداد `scheduled` در `worker.ts` را به‌صورت مستقیم و رایگان اجرا می‌کند (انقضای خودکار اشتراک‌ها، یادآور تمدید، پاک‌سازی فایل‌های منقضی و بازیابی کارهای معوق).
+### پیش‌نیازها
+- Node.js 20+
+- npm
+
+### اجرای محلی
+
+```bash
+git clone https://github.com/Reza-Mokhtari-Hub/hooshnegar.git
+cd hooshnegar
+
+npm install
+cp .env.example .env
+
+# اجرای میگریشن‌ها (بدون DATABASE_URL به‌صورت خودکار از PGlite محلی استفاده می‌شود)
+npm run db:migrate
+
+# اجرای هم‌زمان بک‌اند و فرانت‌اند روی پورت 3000
+npm run dev
+```
+
+### تست و ساخت خروجی
+
+```bash
+npm run lint    # بررسی تایپ‌های TypeScript
+npm test        # اجرای مجموعه تست‌های واحد و یکپارچه
+npm run build   # ساخت باندل نهایی کلاینت
+```
 
 ---
 
-## عیب‌یابی سریع (Troubleshooting)
+## متغیرهای محیطی
 
-- **خطای `ENCRYPTION_KEY_MISSING`**: مقدار ۶۴ کاراکتر هگز برای `ENCRYPTION_MASTER_KEY` در متغیرهای محیطی تنظیم کنید.
-- **وب‌هوک تلگرام پیام دریافت نمی‌کند**: وضعیت وب‌هوک را در بخش **پایش ربات تلگرام** بررسی کنید و مطمئن شوید `APP_URL` با `https://` شروع می‌شود و کلید `webhookSecret` با Bot API همگام‌سازی شده است.
-- **بازپرداخت استارز خطا می‌دهد**: مطمئن شوید توکن ربات در تنظیمات تلگرام ذخیره شده و پرداخت انتخاب‌شده دارای `telegramPaymentChargeId` معتبر و ارز `XTR` است.
+پیش از اجرا یا استقرار در محیط واقعی، متغیرهای `.env.example` را مقداردهی کنید:
+
+| متغیر | کاربرد |
+| --- | --- |
+| `DATABASE_URL` | رشته اتصال PostgreSQL (در محیط محلی می‌تواند خالی بماند) |
+| `ENCRYPTION_MASTER_KEY` | کلید ۶۴ کاراکتری هگز برای رمزنگاری AES-256-GCM (`openssl rand -hex 32`) |
+| `SESSION_SECRET` | کلید تصادفی حداقل ۳۲ کاراکتری برای نشست‌ها (`openssl rand -base64 48`) |
+| `PAYMENT_PAYLOAD_SECRET` | کلید HMAC-SHA256 برای امضای پیلود فاکتورهای Telegram Stars |
+| `APP_URL` | آدرس عمومی HTTPS برنامه برای تنظیم وب‌هوک و مینی‌اپ |
+| `QSTASH_TOKEN` / `QSTASH_*_SIGNING_KEY` | مشخصات Upstash QStash برای صف پس‌زمینه و Retry |
+| `R2_*` | مشخصات باکت Cloudflare R2 جهت ذخیره‌سازی فایل‌ها |
+| `CRON_SECRET` | توکن Bearer برای فراخوانی مسیر نگهداری `/api/cron/maintenance` |
+
+---
+
+## استقرار روی Cloudflare Workers
+
+تنظیمات استقرار کامل در فایل `wrangler.jsonc` قرار دارد:
+
+1. یک دیتابیس PostgreSQL در **Neon** بسازید و میگریشن‌ها را اعمال کنید:
+   ```bash
+   DATABASE_URL="postgresql://..." npm run db:migrate
+   ```
+2. متغیرها و Secretهای مورد نیاز را در تنظیمات Worker ثبت کنید.
+3. پروژه را بسازید و مستقر کنید:
+   ```bash
+   npm run cf:deploy
+   ```
+4. پس از استقرار، وارد پنل مدیریت شوید، توکن دریافتی از `@BotFather` را وارد کنید و گزینه **همگام‌سازی وب‌هوک** را بزنید.
+5. کرون ساعتی (`0 * * * *`) به‌صورت خودکار در `wrangler.jsonc` فعال است و وظایفی مثل بررسی اشتراک‌های منقضی‌شده و پاک‌سازی فایل‌های موقت را انجام می‌دهد.
+
+---
+
+## سازنده
+
+توسعه‌یافته توسط **[Reza Mokhtari (Reza-Mokhtari-Hub)](https://github.com/Reza-Mokhtari-Hub)**
