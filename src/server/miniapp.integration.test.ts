@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { getDb } from '../db/index.ts';
 import {
@@ -132,6 +132,23 @@ beforeAll(async () => {
     { modelId: imgModel!.id, capability: 'image_generation' },
     { modelId: imgModel!.id, capability: 'image_editing' },
     { modelId: imgModel!.id, capability: 'image_variation' },
+  ]);
+
+  const [vidModel] = await db
+    .insert(aiModels)
+    .values({
+      providerId: provider!.id,
+      name: 'Veo Fast MiniApp',
+      modelIdentifier: 'veo-2.0-generate-001',
+      category: 'video',
+      creditCost: '15',
+      isDefault: true,
+      isActive: true,
+    })
+    .returning();
+
+  await db.insert(modelCapabilities).values([
+    { modelId: vidModel!.id, capability: 'video_generation' },
   ]);
 
   await db.insert(coupons).values({
@@ -452,6 +469,137 @@ describe('Telegram Mini App End-to-End API Integration', () => {
     expect(secondEdit.status).toBe(200);
     expect(secondEdit.json.deduplicated).not.toBe(true);
     expect(secondEdit.json.jobId).not.toBe(firstActive.jobId);
+  });
+
+  it('serves /api/miniapp/media with attachment Content-Disposition on ?download=1, supports Range 206, and auto-forwards Mini App images & videos to Telegram bot chat', async () => {
+    const initData = signTelegramWebAppInitDataForTests(
+      {
+        auth_date: Math.floor(Date.now() / 1000),
+        user: { id: 883003, first_name: 'آرش', username: 'arash_tg' },
+      },
+      BOT_TOKEN,
+    );
+    const authRes = await httpRequest('/api/miniapp/auth', {
+      method: 'POST',
+      body: { initData },
+    });
+    expect(authRes.status).toBe(200);
+    const sessionToken = String(authRes.json.sessionToken ?? '');
+    const authHeaders = { Authorization: `Bearer ${sessionToken}` };
+
+    const telegramCalls: Array<{ method: string; url: string }> = [];
+    const realFetch = globalThis.fetch;
+    let simulateTelegramFailure = false;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('api.telegram.org')) {
+        const method = url.split('/').pop() ?? '';
+        telegramCalls.push({ method, url });
+        if (simulateTelegramFailure) {
+          return new Response(
+            JSON.stringify({ ok: false, error_code: 403, description: 'Forbidden: bot was blocked by the user' }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ ok: true, result: { message_id: 100 + telegramCalls.length } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return realFetch(input as RequestInfo | URL, init);
+    });
+
+    try {
+      // 1) Image generation in Mini App -> returns mediaUrl AND forwards photo to Telegram bot
+      const imgGenRes = await httpRequest('/api/miniapp/generate', {
+        method: 'POST',
+        headers: authHeaders,
+        body: {
+          capability: 'image_generation',
+          prompt: 'یک کوه برفی در طلوع خورشید',
+          aspectRatio: '1:1',
+          clientRequestId: 'req-tg-auto-img-1',
+        },
+      });
+      expect(imgGenRes.status).toBe(200);
+      expect(imgGenRes.json.ok).toBe(true);
+      const imgMediaUrl = String(imgGenRes.json.mediaUrl ?? '');
+      expect(imgMediaUrl).toContain('/api/miniapp/media?key=');
+      expect(telegramCalls.some((c) => c.method === 'sendPhoto')).toBe(true);
+
+      // Verify ?download=1 sets Content-Disposition: attachment with file extension & Accept-Ranges
+      const dlRes = await realFetch(`${baseUrl}${imgMediaUrl}&download=1`);
+      expect(dlRes.status).toBe(200);
+      expect(dlRes.headers.get('content-disposition')).toMatch(/^attachment; filename="hooshnegar-.*\.(png|jpg|webp)"$/);
+      expect(dlRes.headers.get('accept-ranges')).toBe('bytes');
+      const fullBytes = Buffer.from(await dlRes.arrayBuffer());
+      expect(fullBytes.byteLength).toBeGreaterThan(4);
+
+      // Verify HTTP Range 206 partial content
+      const rangeRes = await realFetch(`${baseUrl}${imgMediaUrl}`, {
+        headers: { Range: 'bytes=0-3' },
+      });
+      expect(rangeRes.status).toBe(206);
+      expect(rangeRes.headers.get('content-range')).toBe(`bytes 0-3/${fullBytes.byteLength}`);
+      const partialBytes = Buffer.from(await rangeRes.arrayBuffer());
+      expect(partialBytes.equals(fullBytes.subarray(0, 4))).toBe(true);
+
+      // 2) Video generation in Mini App -> polls until succeeded AND forwards video to Telegram bot
+      const vidGenRes = await httpRequest('/api/miniapp/generate', {
+        method: 'POST',
+        headers: authHeaders,
+        body: {
+          capability: 'video_generation',
+          prompt: 'پرواز پرنده بر فراز دریاچه آرام',
+          aspectRatio: '16:9',
+          durationSeconds: 5,
+          clientRequestId: 'req-tg-auto-vid-1',
+        },
+      });
+      expect(vidGenRes.status).toBe(200);
+      expect(vidGenRes.json.ok).toBe(true);
+      let vidMediaUrl = String(vidGenRes.json.mediaUrl ?? '');
+      const vidJobId = String(vidGenRes.json.jobId ?? '');
+      if (!vidMediaUrl && vidJobId) {
+        for (let attempt = 0; attempt < 3 && !vidMediaUrl; attempt++) {
+          await new Promise((r) => setTimeout(r, 2300));
+          const pollRes = await httpRequest(`/api/miniapp/jobs/${vidJobId}`, { headers: authHeaders });
+          expect(pollRes.status).toBe(200);
+          const jobObj = pollRes.json.job as { status: string; mediaUrl: string | null };
+          if (jobObj.status === 'succeeded') {
+            vidMediaUrl = String(jobObj.mediaUrl ?? '');
+            break;
+          }
+          expect(jobObj.status).toBe('running');
+        }
+      }
+      expect(vidMediaUrl).toContain('/api/miniapp/media?key=');
+      expect(telegramCalls.some((c) => c.method === 'sendVideo')).toBe(true);
+      // Confirm no error/status messages leaked to Telegram chat
+      expect(telegramCalls.some((c) => c.method === 'sendMessage' || c.method === 'editMessageText')).toBe(false);
+
+      const vidDlRes = await realFetch(`${baseUrl}${vidMediaUrl}&download=1`);
+      expect(vidDlRes.status).toBe(200);
+      expect(vidDlRes.headers.get('content-disposition')).toMatch(/^attachment; filename="hooshnegar-.*\.mp4"$/);
+
+      // 3) If Telegram Bot API rejects forwarding (e.g. user blocked bot), Mini App generation still succeeds
+      simulateTelegramFailure = true;
+      const resilientImgRes = await httpRequest('/api/miniapp/generate', {
+        method: 'POST',
+        headers: authHeaders,
+        body: {
+          capability: 'image_generation',
+          prompt: 'درخت پاییزی کنار رودخانه',
+          aspectRatio: '1:1',
+          clientRequestId: 'req-tg-resilient-1',
+        },
+      });
+      expect(resilientImgRes.status).toBe(200);
+      expect(resilientImgRes.json.ok).toBe(true);
+      expect(String(resilientImgRes.json.mediaUrl ?? '')).toContain('/api/miniapp/media?key=');
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 

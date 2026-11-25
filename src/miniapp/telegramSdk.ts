@@ -21,6 +21,11 @@ export interface TelegramWebAppInstance {
   expand: () => void;
   close: () => void;
   openTelegramLink?: (url: string) => void;
+  openLink?: (url: string, options?: { try_instant_view?: boolean }) => void;
+  downloadFile?: (
+    params: { url: string; file_name: string },
+    callback?: (accepted: boolean) => void,
+  ) => void;
   openInvoice?: (url: string, callback?: (status: string) => void) => void;
   showAlert?: (message: string) => void;
   HapticFeedback?: {

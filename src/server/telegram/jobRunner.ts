@@ -170,6 +170,67 @@ async function deliverImageToTelegram(params: {
   }
 }
 
+async function deliverVideoToTelegram(params: {
+  api: Api;
+  chatId: number;
+  buffer: Buffer;
+  fileName: string;
+  caption: string;
+}): Promise<void> {
+  if (!params.buffer || params.buffer.byteLength === 0) {
+    throw new AIProviderError({
+      code: 'PROVIDER_ERROR',
+      message: 'Generated video buffer is empty.',
+      userMessageFa: 'فایل ویدیوی تولیدشده خالی بود. لطفاً دوباره تلاش کنید.',
+    });
+  }
+  const safeCaption = params.caption.slice(0, 1000);
+  try {
+    await params.api.sendVideo(
+      params.chatId,
+      new InputFile(new Uint8Array(params.buffer), params.fileName),
+      { caption: safeCaption },
+    );
+  } catch (videoErr) {
+    const errMsg = videoErr instanceof Error ? videoErr.message : String(videoErr ?? '');
+    const shouldFallbackToDocument =
+      /Bad Request|VOICE_MESSAGES_FORBIDDEN|FILE_PARTS|wrong type|VIDEO_/i.test(errMsg);
+    if (!shouldFallbackToDocument) {
+      throw videoErr;
+    }
+    await params.api.sendDocument(
+      params.chatId,
+      new InputFile(new Uint8Array(params.buffer), params.fileName),
+      { caption: safeCaption },
+    );
+  }
+}
+
+function buildImageTelegramCaption(params: {
+  capability: string;
+  modelName: string;
+  aspectRatio: string;
+  fromMiniApp?: boolean;
+}): string {
+  const actionLabel =
+    params.capability === 'image_editing'
+      ? 'ویرایش‌شده'
+      : params.capability === 'image_variation'
+        ? 'بازآفرینی‌شده'
+        : 'تولیدشده';
+  const sourceNote = params.fromMiniApp ? ' (ارسال خودکار از مینی‌اپ)' : '';
+  return `🎨 تصویر ${actionLabel} با مدل ${params.modelName}${sourceNote}\nنسبت تصویر: ${params.aspectRatio}`;
+}
+
+function isMediaTelegramDeliveryCapability(capability: string): boolean {
+  return (
+    capability === 'image_generation' ||
+    capability === 'image_editing' ||
+    capability === 'image_variation' ||
+    capability === 'video_generation'
+  );
+}
+
 export async function executeQueuedGenerationJob(
   jobId: string,
   options?: { maxSyncWaitMs?: number },
@@ -234,8 +295,17 @@ export async function executeQueuedGenerationJob(
 
   const payload = (job.payload ?? {}) as Record<string, unknown>;
   const silentDelivery = payload.silentDelivery === true;
-  const tgClient = !silentDelivery && job.telegramChatId ? await getConfiguredTelegramApi() : null;
+  const deliverMediaToTelegram =
+    payload.deliverMediaToTelegram === true && isMediaTelegramDeliveryCapability(job.capability);
+  const shouldDeliverMediaToTelegram = Boolean(
+    job.telegramChatId && (!silentDelivery || deliverMediaToTelegram),
+  );
+  const tgClient =
+    job.telegramChatId && (!silentDelivery || deliverMediaToTelegram)
+      ? await getConfiguredTelegramApi()
+      : null;
   const api = tgClient?.api ?? null;
+  const statusApi = !silentDelivery ? api : null;
 
   try {
     if (await isJobCanceled(job.id)) {
@@ -514,10 +584,10 @@ export async function executeQueuedGenerationJob(
           })
           .where(eq(generationJobs.id, job.id));
 
-        if (api && job.telegramChatId && job.statusMessageId) {
+        if (statusApi && job.telegramChatId && job.statusMessageId) {
           const verb = job.capability === 'image_generation' ? 'ساخت تصویر' : 'ویرایش تصویر';
           try {
-            await api.editMessageText(
+            await statusApi.editMessageText(
               job.telegramChatId,
               job.statusMessageId,
               `🎨 درخواست ${verb} در صف پردازش قرار گرفت (${nextProgress}٪)...\nپس از آماده شدن به‌صورت خودکار ارسال می‌شود.`,
@@ -552,7 +622,7 @@ export async function executeQueuedGenerationJob(
 
       for (let i = 0; i < outcome.result.images.length; i++) {
         const img = outcome.result.images[i]!;
-        const canDeliverToTelegram = Boolean(api && job.telegramChatId);
+        const canFallbackWithoutStorage = Boolean(statusApi && job.telegramChatId);
 
         try {
           const stored = await storage.putObject({
@@ -567,7 +637,7 @@ export async function executeQueuedGenerationJob(
           if (!firstKey) firstKey = stored.objectKey;
           storedKeys.push(stored.objectKey);
         } catch (storageErr) {
-          if (!canDeliverToTelegram) {
+          if (!canFallbackWithoutStorage) {
             throw storageErr;
           }
           console.error(
@@ -576,21 +646,39 @@ export async function executeQueuedGenerationJob(
           );
         }
 
-        if (api && job.telegramChatId) {
-          const caption = `🎨 تصویر تولیدشده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`;
-          await deliverImageToTelegram({
-            api,
-            chatId: job.telegramChatId,
-            buffer: img.buffer,
-            fileName: `hooshnegar-${i + 1}.${img.extension}`,
-            caption,
+        if (api && job.telegramChatId && shouldDeliverMediaToTelegram) {
+          const caption = buildImageTelegramCaption({
+            capability: job.capability,
+            modelName: route.primary.modelName,
+            aspectRatio,
+            fromMiniApp: silentDelivery,
           });
+          const deliver = () =>
+            deliverImageToTelegram({
+              api,
+              chatId: job.telegramChatId!,
+              buffer: img.buffer,
+              fileName: `hooshnegar-${i + 1}.${img.extension}`,
+              caption,
+            });
+          if (silentDelivery) {
+            try {
+              await deliver();
+            } catch (tgErr) {
+              console.error(
+                '[jobRunner] non-fatal Mini App image delivery to Telegram failed:',
+                redactSecrets(tgErr instanceof Error ? tgErr.message : 'unknown'),
+              );
+            }
+          } else {
+            await deliver();
+          }
         }
       }
 
-      if (api && job.telegramChatId && job.statusMessageId) {
+      if (statusApi && job.telegramChatId && job.statusMessageId) {
         try {
-          await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+          await statusApi.deleteMessage(job.telegramChatId, job.statusMessageId);
         } catch {
           // ignore
         }
@@ -867,15 +955,33 @@ export async function executeQueuedGenerationJob(
           jobId: job.id,
         });
 
-        if (api && job.telegramChatId) {
-          await api.sendVideo(
-            job.telegramChatId,
-            new InputFile(new Uint8Array(result.videoBuffer), 'hooshnegar-video.mp4'),
-            { caption: `🎬 ویدیو با مدل ${route.primary.modelName} آماده شد.` },
-          );
-          if (job.statusMessageId) {
+        if (api && job.telegramChatId && shouldDeliverMediaToTelegram) {
+          const videoCaption = silentDelivery
+            ? `🎬 ویدیو با مدل ${route.primary.modelName} آماده شد (ارسال خودکار از مینی‌اپ).`
+            : `🎬 ویدیو با مدل ${route.primary.modelName} آماده شد.`;
+          const deliverVid = () =>
+            deliverVideoToTelegram({
+              api,
+              chatId: job.telegramChatId!,
+              buffer: result.videoBuffer!,
+              fileName: 'hooshnegar-video.mp4',
+              caption: videoCaption,
+            });
+          if (silentDelivery) {
             try {
-              await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+              await deliverVid();
+            } catch (tgErr) {
+              console.error(
+                '[jobRunner] non-fatal Mini App video delivery to Telegram failed:',
+                redactSecrets(tgErr instanceof Error ? tgErr.message : 'unknown'),
+              );
+            }
+          } else {
+            await deliverVid();
+          }
+          if (statusApi && job.statusMessageId) {
+            try {
+              await statusApi.deleteMessage(job.telegramChatId, job.statusMessageId);
             } catch {
               // ignore
             }
@@ -912,9 +1018,9 @@ export async function executeQueuedGenerationJob(
         })
         .where(eq(generationJobs.id, job.id));
 
-      if (api && job.telegramChatId && job.statusMessageId) {
+      if (statusApi && job.telegramChatId && job.statusMessageId) {
         try {
-          await api.editMessageText(
+          await statusApi.editMessageText(
             job.telegramChatId,
             job.statusMessageId,
             `🎬 درخواست ساخت ویدیو در صف پردازش قرار گرفت (${Math.max(25, result.progressPercent)}٪)...\nلطفاً صبر کنید، پس از آماده شدن به‌صورت خودکار ارسال می‌شود.`,
@@ -965,7 +1071,7 @@ export async function executeQueuedGenerationJob(
     });
 
     await sendSafeErrorToChat(
-      api,
+      statusApi,
       job.telegramChatId,
       job.statusMessageId,
       aiErr.userMessageFa,
@@ -1015,8 +1121,17 @@ export async function executeMediaPollJob(
 
   const payload = (job.payload ?? {}) as Record<string, unknown>;
   const silentDelivery = payload.silentDelivery === true;
-  const tgClient = !silentDelivery && job.telegramChatId ? await getConfiguredTelegramApi() : null;
+  const deliverMediaToTelegram =
+    payload.deliverMediaToTelegram === true && isMediaTelegramDeliveryCapability(job.capability);
+  const shouldDeliverMediaToTelegram = Boolean(
+    job.telegramChatId && (!silentDelivery || deliverMediaToTelegram),
+  );
+  const tgClient =
+    job.telegramChatId && (!silentDelivery || deliverMediaToTelegram)
+      ? await getConfiguredTelegramApi()
+      : null;
   const api = tgClient?.api ?? null;
+  const statusApi = !silentDelivery ? api : null;
 
   try {
     const route = await loadModelExecutionRoute(reqRow.modelId);
@@ -1050,7 +1165,7 @@ export async function executeMediaPollJob(
 
       for (let i = 0; i < pollRes.images.length; i++) {
         const img = pollRes.images[i]!;
-        const canDeliverToTelegram = Boolean(api && job.telegramChatId);
+        const canFallbackWithoutStorage = Boolean(statusApi && job.telegramChatId);
         try {
           const stored = await storage.putObject({
             buffer: img.buffer,
@@ -1064,23 +1179,42 @@ export async function executeMediaPollJob(
           if (!firstKey) firstKey = stored.objectKey;
           storedKeys.push(stored.objectKey);
         } catch (storageErr) {
-          if (!canDeliverToTelegram) throw storageErr;
+          if (!canFallbackWithoutStorage) throw storageErr;
         }
 
-        if (api && job.telegramChatId) {
-          await deliverImageToTelegram({
-            api,
-            chatId: job.telegramChatId,
-            buffer: img.buffer,
-            fileName: `hooshnegar-${i + 1}.${img.extension}`,
-            caption: `🎨 تصویر تولیدشده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`,
+        if (api && job.telegramChatId && shouldDeliverMediaToTelegram) {
+          const caption = buildImageTelegramCaption({
+            capability: job.capability,
+            modelName: route.primary.modelName,
+            aspectRatio,
+            fromMiniApp: silentDelivery,
           });
+          const deliver = () =>
+            deliverImageToTelegram({
+              api,
+              chatId: job.telegramChatId!,
+              buffer: img.buffer,
+              fileName: `hooshnegar-${i + 1}.${img.extension}`,
+              caption,
+            });
+          if (silentDelivery) {
+            try {
+              await deliver();
+            } catch (tgErr) {
+              console.error(
+                '[jobRunner] non-fatal Mini App polled image delivery to Telegram failed:',
+                redactSecrets(tgErr instanceof Error ? tgErr.message : 'unknown'),
+              );
+            }
+          } else {
+            await deliver();
+          }
         }
       }
 
-      if (api && job.telegramChatId && job.statusMessageId) {
+      if (statusApi && job.telegramChatId && job.statusMessageId) {
         try {
-          await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+          await statusApi.deleteMessage(job.telegramChatId, job.statusMessageId);
         } catch {
           // ignore
         }
@@ -1162,7 +1296,7 @@ export async function executeMediaPollJob(
           const storedKeys: string[] = [];
           for (let i = 0; i < retryOutcome.result.images.length; i++) {
             const img = retryOutcome.result.images[i]!;
-            const canDeliverToTelegram = Boolean(api && job.telegramChatId);
+            const canFallbackWithoutStorage = Boolean(statusApi && job.telegramChatId);
             try {
               const stored = await storage.putObject({
                 buffer: img.buffer,
@@ -1176,21 +1310,40 @@ export async function executeMediaPollJob(
               if (!firstKey) firstKey = stored.objectKey;
               storedKeys.push(stored.objectKey);
             } catch (storageErr) {
-              if (!canDeliverToTelegram) throw storageErr;
+              if (!canFallbackWithoutStorage) throw storageErr;
             }
-            if (api && job.telegramChatId) {
-              await deliverImageToTelegram({
-                api,
-                chatId: job.telegramChatId,
-                buffer: img.buffer,
-                fileName: `hooshnegar-${i + 1}.${img.extension}`,
-                caption: `🎨 تصویر ویرایش‌شده با مدل ${route.primary.modelName}\nنسبت تصویر: ${aspectRatio}`,
+            if (api && job.telegramChatId && shouldDeliverMediaToTelegram) {
+              const caption = buildImageTelegramCaption({
+                capability: job.capability,
+                modelName: route.primary.modelName,
+                aspectRatio,
+                fromMiniApp: silentDelivery,
               });
+              const deliver = () =>
+                deliverImageToTelegram({
+                  api,
+                  chatId: job.telegramChatId!,
+                  buffer: img.buffer,
+                  fileName: `hooshnegar-${i + 1}.${img.extension}`,
+                  caption,
+                });
+              if (silentDelivery) {
+                try {
+                  await deliver();
+                } catch (tgErr) {
+                  console.error(
+                    '[jobRunner] non-fatal Mini App retried image delivery to Telegram failed:',
+                    redactSecrets(tgErr instanceof Error ? tgErr.message : 'unknown'),
+                  );
+                }
+              } else {
+                await deliver();
+              }
             }
           }
-          if (api && job.telegramChatId && job.statusMessageId) {
+          if (statusApi && job.telegramChatId && job.statusMessageId) {
             try {
-              await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+              await statusApi.deleteMessage(job.telegramChatId, job.statusMessageId);
             } catch {
               // ignore
             }
@@ -1261,7 +1414,7 @@ export async function executeMediaPollJob(
         errorMessage: reason,
       });
       await sendSafeErrorToChat(
-        api,
+        statusApi,
         job.telegramChatId,
         job.statusMessageId,
         'در حال حاضر امکان تکمیل تصویر با این مدل وجود نداشت. لطفاً دوباره تلاش کنید یا مدل دیگری انتخاب نمایید.',
@@ -1285,9 +1438,9 @@ export async function executeMediaPollJob(
       })
       .where(eq(generationJobs.id, job.id));
 
-    if (api && job.telegramChatId && job.statusMessageId) {
+    if (statusApi && job.telegramChatId && job.statusMessageId) {
       try {
-        await api.editMessageText(
+        await statusApi.editMessageText(
           job.telegramChatId,
           job.statusMessageId,
           `🎨 در حال پردازش تصویر (${nextProgress}٪)...\nلطفاً لحظاتی دیگر صبر کنید.`,
@@ -1325,7 +1478,7 @@ export async function executeMediaPollJob(
       errorMessage: msg,
     });
     await sendSafeErrorToChat(
-      api,
+      statusApi,
       job.telegramChatId,
       job.statusMessageId,
       'خطا در بررسی وضعیت تولید تصویر. اعتبار شما بازگردانده شد.',
@@ -1365,8 +1518,17 @@ export async function executeVideoPollJob(
 
   const payload = (job.payload ?? {}) as Record<string, unknown>;
   const silentDelivery = payload.silentDelivery === true;
-  const tgClient = !silentDelivery && job.telegramChatId ? await getConfiguredTelegramApi() : null;
+  const deliverMediaToTelegram =
+    payload.deliverMediaToTelegram === true && isMediaTelegramDeliveryCapability(job.capability);
+  const shouldDeliverMediaToTelegram = Boolean(
+    job.telegramChatId && (!silentDelivery || deliverMediaToTelegram),
+  );
+  const tgClient =
+    job.telegramChatId && (!silentDelivery || deliverMediaToTelegram)
+      ? await getConfiguredTelegramApi()
+      : null;
   const api = tgClient?.api ?? null;
+  const statusApi = !silentDelivery ? api : null;
 
   try {
     const route = await loadModelExecutionRoute(reqRow.modelId);
@@ -1409,15 +1571,33 @@ export async function executeVideoPollJob(
         jobId: job.id,
       });
 
-      if (api && job.telegramChatId) {
-        await api.sendVideo(
-          job.telegramChatId,
-          new InputFile(new Uint8Array(videoBuffer), 'hooshnegar-video.mp4'),
-          { caption: `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد.` },
-        );
-        if (job.statusMessageId) {
+      if (api && job.telegramChatId && shouldDeliverMediaToTelegram) {
+        const videoCaption = silentDelivery
+          ? `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد (ارسال خودکار از مینی‌اپ).`
+          : `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد.`;
+        const deliverVid = () =>
+          deliverVideoToTelegram({
+            api,
+            chatId: job.telegramChatId!,
+            buffer: videoBuffer!,
+            fileName: 'hooshnegar-video.mp4',
+            caption: videoCaption,
+          });
+        if (silentDelivery) {
           try {
-            await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+            await deliverVid();
+          } catch (tgErr) {
+            console.error(
+              '[jobRunner] non-fatal Mini App polled video delivery to Telegram failed:',
+              redactSecrets(tgErr instanceof Error ? tgErr.message : 'unknown'),
+            );
+          }
+        } else {
+          await deliverVid();
+        }
+        if (statusApi && job.statusMessageId) {
+          try {
+            await statusApi.deleteMessage(job.telegramChatId, job.statusMessageId);
           } catch {
             // ignore
           }
@@ -1495,15 +1675,33 @@ export async function executeVideoPollJob(
             jobId: job.id,
           });
 
-          if (api && job.telegramChatId) {
-            await api.sendVideo(
-              job.telegramChatId,
-              new InputFile(new Uint8Array(retryStart.result.videoBuffer), 'hooshnegar-video.mp4'),
-              { caption: `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد.` },
-            );
-            if (job.statusMessageId) {
+          if (api && job.telegramChatId && shouldDeliverMediaToTelegram) {
+            const videoCaption = silentDelivery
+              ? `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد (ارسال خودکار از مینی‌اپ).`
+              : `🎬 ویدیوی شما با مدل ${route.primary.modelName} آماده شد.`;
+            const deliverVid = () =>
+              deliverVideoToTelegram({
+                api,
+                chatId: job.telegramChatId!,
+                buffer: retryStart.result.videoBuffer!,
+                fileName: 'hooshnegar-video.mp4',
+                caption: videoCaption,
+              });
+            if (silentDelivery) {
               try {
-                await api.deleteMessage(job.telegramChatId, job.statusMessageId);
+                await deliverVid();
+              } catch (tgErr) {
+                console.error(
+                  '[jobRunner] non-fatal Mini App retried video delivery to Telegram failed:',
+                  redactSecrets(tgErr instanceof Error ? tgErr.message : 'unknown'),
+                );
+              }
+            } else {
+              await deliverVid();
+            }
+            if (statusApi && job.statusMessageId) {
+              try {
+                await statusApi.deleteMessage(job.telegramChatId, job.statusMessageId);
               } catch {
                 // ignore
               }
@@ -1578,7 +1776,7 @@ export async function executeVideoPollJob(
         errorCode: 'VIDEO_FAILED',
         errorMessage: reason,
       });
-      await sendSafeErrorToChat(api, job.telegramChatId, job.statusMessageId, reason);
+      await sendSafeErrorToChat(statusApi, job.telegramChatId, job.statusMessageId, reason);
       return { ok: false, status: 'failed' };
     }
 
@@ -1594,9 +1792,9 @@ export async function executeVideoPollJob(
       })
       .where(eq(generationJobs.id, job.id));
 
-    if (api && job.telegramChatId && job.statusMessageId) {
+    if (statusApi && job.telegramChatId && job.statusMessageId) {
       try {
-        await api.editMessageText(
+        await statusApi.editMessageText(
           job.telegramChatId,
           job.statusMessageId,
           `🎬 در حال رندر ویدیو (${nextProgress}٪)...\nلطفاً چند لحظه دیگر صبر کنید.`,
@@ -1633,7 +1831,7 @@ export async function executeVideoPollJob(
       errorMessage: msg,
     });
     await sendSafeErrorToChat(
-      api,
+      statusApi,
       job.telegramChatId,
       job.statusMessageId,
       'خطا در بررسی وضعیت تولید ویدیو. اعتبار شما بازگردانده شد.',

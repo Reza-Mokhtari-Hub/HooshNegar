@@ -285,6 +285,33 @@ function buildMediaUrl(objectKey: string | null | undefined, sessionToken: strin
   return `/api/miniapp/media?key=${encodedKey}&token=${encodedToken}`;
 }
 
+function buildSafeMediaDownloadFilename(objectKey: string, mimeType: string): string {
+  const mimeMap: Record<string, string> = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+    'video/quicktime': 'mov',
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/ogg': 'ogg',
+  };
+  const baseMime = mimeType.split(';')[0]?.trim().toLowerCase() ?? '';
+  const mimeExt = mimeMap[baseMime] ?? null;
+
+  const rawSegment = objectKey.split('/').pop() ?? '';
+  const rawMatch = /^([a-zA-Z0-9_-]+?)(?:\.([a-zA-Z0-9]{2,5}))?$/.exec(rawSegment);
+  const keyExt = rawMatch?.[2]?.toLowerCase() === 'jpeg' ? 'jpg' : rawMatch?.[2]?.toLowerCase();
+  const ext = keyExt || mimeExt || 'bin';
+  const cleanStem = (rawMatch?.[1] ?? 'media').replace(/[^a-zA-Z0-9_-]/g, '').slice(-24) || 'media';
+  return cleanStem.startsWith('hooshnegar-') ? `${cleanStem}.${ext}` : `hooshnegar-${cleanStem}.${ext}`;
+}
+
 function mapMiniAppJobErrorMessage(errorCode?: string | null, status?: string): string | null {
   if (status === 'canceled' || errorCode === 'CANCELED' || errorCode === 'ADMIN_CANCELED') {
     return 'پردازش لغو شد و اعتبار رزروشده به کیف‌پول شما بازگردانده شد.';
@@ -410,8 +437,41 @@ export function createMiniAppRouter(): Router {
         return;
       }
 
-      res.setHeader('Content-Type', fileRow.mimeType || data.mimeType || 'application/octet-stream');
+      const resolvedMime = fileRow.mimeType || data.mimeType || 'application/octet-stream';
+      const downloadMode = req.query.download === '1' || req.query.download === 'true';
+      const safeFileName = buildSafeMediaDownloadFilename(objectKey, resolvedMime);
+      const totalSize = data.buffer.byteLength;
+
+      res.setHeader('Content-Type', resolvedMime);
       res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader(
+        'Content-Disposition',
+        `${downloadMode ? 'attachment' : 'inline'}; filename="${safeFileName}"`,
+      );
+
+      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
+      if (rangeHeader && totalSize > 0) {
+        const rangeMatch = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader);
+        if (rangeMatch) {
+          const start = rangeMatch[1] ? Number.parseInt(rangeMatch[1], 10) : 0;
+          const rawEnd = rangeMatch[2] ? Number.parseInt(rangeMatch[2], 10) : totalSize - 1;
+          const end = Math.min(totalSize - 1, Number.isFinite(rawEnd) ? rawEnd : totalSize - 1);
+          if (!Number.isFinite(start) || start < 0 || start >= totalSize || end < start) {
+            res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+            return;
+          }
+          const chunk = data.buffer.subarray(start, end + 1);
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+          res.setHeader('Content-Length', String(chunk.byteLength));
+          res.send(chunk);
+          return;
+        }
+      }
+
+      res.setHeader('Content-Length', String(totalSize));
       res.send(data.buffer);
     } catch (err) {
       console.error('[miniapp/media]', err instanceof Error ? err.message : 'unknown');
@@ -750,6 +810,12 @@ export function createMiniAppRouter(): Router {
         modelId = resolved.id;
       }
 
+      const deliverMediaToTelegram =
+        d.capability === 'image_generation' ||
+        d.capability === 'image_editing' ||
+        d.capability === 'image_variation' ||
+        d.capability === 'video_generation';
+
       const jobPayload: Record<string, unknown> = {
         prompt: d.prompt,
         aspectRatio: d.aspectRatio ?? (d.capability === 'video_generation' ? '16:9' : '1:1'),
@@ -759,6 +825,7 @@ export function createMiniAppRouter(): Router {
         durationSeconds: d.durationSeconds ?? 5,
         quality: d.quality ?? '720p',
         silentDelivery: true,
+        deliverMediaToTelegram,
       };
       if (d.audioBase64) {
         jobPayload.audioBase64 = d.audioBase64;
